@@ -121,6 +121,23 @@ The wrapper requires `huggingface_hub` to be installed in the selected Python
 environment. Use `--python /path/to/python` if the default `python3` is not the
 right interpreter.
 
+## HF Model Loading
+
+`cverl` can inspect a downloaded Hugging Face model directory from C++ and load
+individual safetensors weights into LibTorch tensors:
+
+```sh
+./build/inspect_hf_model ./models/Qwen3.5-0.8B
+./build/inspect_hf_model ./models/Qwen3.5-0.8B --find embed
+./build/inspect_hf_model ./models/Qwen3.5-0.8B --load-tensor model.language_model.embed_tokens.weight
+./build/inspect_hf_model ./models/Qwen3.5-0.8B --load-all
+```
+
+This currently covers config parsing, safetensors metadata, tensor indexing, and
+single-tensor or full-weight loading into LibTorch tensors. Full Qwen forward
+execution is the next larger step because Qwen3.5 includes Qwen-specific linear
+attention and vision config.
+
 ## API Example
 
 ```c

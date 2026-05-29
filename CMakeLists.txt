@@ -13,6 +13,7 @@ find_package(Torch REQUIRED)
 add_library(cverl STATIC
   src/status.cc
   src/hf_downloader.cc
+  src/model/hf_model_loader.cc
   src/core_algos_c_api.cc
   src/torch/core_algos_torch.cc
   src/torch/simple_grpo_trainer.cc
@@ -41,6 +42,9 @@ if (CVERL_BUILD_TESTS)
   add_executable(hf_download tools/hf_download.cc)
   target_link_libraries(hf_download PRIVATE cverl)
 
+  add_executable(inspect_hf_model tools/model/inspect_hf_model.cc)
+  target_link_libraries(inspect_hf_model PRIVATE cverl)
+
   add_executable(test_torch_backend tests/torch/test_torch_backend.cc)
   target_link_libraries(test_torch_backend PRIVATE cverl)
   target_compile_options(test_torch_backend PRIVATE ${TORCH_CXX_FLAGS})
@@ -48,6 +52,10 @@ if (CVERL_BUILD_TESTS)
   add_executable(test_simple_grpo_trainer tests/torch/test_simple_grpo_trainer.cc)
   target_link_libraries(test_simple_grpo_trainer PRIVATE cverl)
   target_compile_options(test_simple_grpo_trainer PRIVATE ${TORCH_CXX_FLAGS})
+
+  add_executable(test_hf_model_loader tests/model/test_hf_model_loader.cc)
+  target_link_libraries(test_hf_model_loader PRIVATE cverl)
+  target_compile_options(test_hf_model_loader PRIVATE ${TORCH_CXX_FLAGS})
 
   add_executable(minimal_ppo_step examples/torch/minimal_ppo_step.cc)
   target_link_libraries(minimal_ppo_step PRIVATE cverl)
