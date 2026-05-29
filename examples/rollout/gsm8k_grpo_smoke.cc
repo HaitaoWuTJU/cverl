@@ -55,6 +55,8 @@ struct Args {
   double top_p = 1.0;
   double clip_ratio = 0.2;
   double learning_rate = 3.0e-3;
+  double kl_coef = 0.0;
+  cverl_kl_penalty_t kl_penalty_mode = CVERL_KL_K1;
   uint64_t seed = 17;
   cverl::reward::Gsm8kExtractionMethod reward_method = cverl::reward::Gsm8kExtractionMethod::Strict;
 };
@@ -110,6 +112,21 @@ Args parse_args(int argc, char** argv) {
       args.clip_ratio = std::strtod(require_value(i, argc, argv, "--clip-ratio"), nullptr);
     } else if (a == "--lr") {
       args.learning_rate = std::strtod(require_value(i, argc, argv, "--lr"), nullptr);
+    } else if (a == "--kl-coef") {
+      args.kl_coef = std::strtod(require_value(i, argc, argv, "--kl-coef"), nullptr);
+    } else if (a == "--kl-penalty") {
+      std::string m = require_value(i, argc, argv, "--kl-penalty");
+      if (m == "k1") {
+        args.kl_penalty_mode = CVERL_KL_K1;
+      } else if (m == "abs") {
+        args.kl_penalty_mode = CVERL_KL_ABS;
+      } else if (m == "k2") {
+        args.kl_penalty_mode = CVERL_KL_K2;
+      } else if (m == "k3") {
+        args.kl_penalty_mode = CVERL_KL_K3;
+      } else {
+        throw std::invalid_argument("--kl-penalty must be k1|abs|k2|k3");
+      }
     } else if (a == "--seed") {
       args.seed = static_cast<uint64_t>(std::strtoull(require_value(i, argc, argv, "--seed"), nullptr, 10));
     } else if (a == "--reward-method") {
@@ -180,7 +197,12 @@ int main(int argc, char** argv) {
         cverl::text::ByteTokenizer::pad_id());
     torch::optim::AdamW optimizer(policy->parameters(), torch::optim::AdamWOptions(args.learning_rate));
 
-    std::cout << "step,transport,total_seq,mean_reward,success_rate,no_answer,loss,ppo_kl,clipfrac,seconds\n";
+    // Snapshot the initial policy as the frozen reference for KL penalty.
+    // For real RLHF runs this is typically the SFT model loaded separately,
+    // but for the smoke loop the initial policy is fine.
+    auto ref_policy = cverl::torch_backend::clone_as_reference(policy);
+
+    std::cout << "step,transport,total_seq,mean_reward,success_rate,no_answer,loss,pg_loss,kl_loss,ppo_kl,clipfrac,seconds\n";
 
     for (int64_t step = 1; step <= args.steps; ++step) {
       // Build the per-step batch from the dataset.
@@ -219,15 +241,23 @@ int main(int argc, char** argv) {
       torch::Tensor advantages = cverl::torch_backend::grpo_outcome_advantage(
           batch.token_rewards, batch.response_mask, batch.group_ids, 1.0e-6, true, &returns);
 
-      // Old log probs under the current policy (frozen for this step).
+      // Old log probs under the current policy (frozen for this step) and
+      // reference log probs (frozen forever) for KL penalty.
       torch::Tensor old_log_probs;
+      torch::Tensor ref_log_probs;
       {
         torch::NoGradGuard no_grad;
         torch::Tensor logits = policy->forward(batch.prompt_ids, batch.response_ids);
         old_log_probs = cverl::torch_backend::response_log_probs(logits, batch.response_ids).detach();
+        if (args.kl_coef > 0.0) {
+          torch::Tensor ref_logits = ref_policy->forward(batch.prompt_ids, batch.response_ids);
+          ref_log_probs = cverl::torch_backend::response_log_probs(ref_logits, batch.response_ids).detach();
+        }
       }
 
       double last_loss = 0.0;
+      double last_pg_loss = 0.0;
+      double last_kl_loss = 0.0;
       double last_kl = 0.0;
       double last_clipfrac = 0.0;
       for (int64_t epoch = 0; epoch < args.ppo_epochs; ++epoch) {
@@ -236,11 +266,21 @@ int main(int argc, char** argv) {
         auto loss = cverl::torch_backend::ppo_clipped_loss(
             old_log_probs, log_probs, advantages, batch.response_mask,
             args.clip_ratio, -1.0, -1.0, 3.0, CVERL_LOSS_AGG_TOKEN_MEAN);
+        torch::Tensor total_loss = loss.pg_loss;
+        torch::Tensor kl_loss_value = torch::zeros({}, total_loss.options());
+        if (args.kl_coef > 0.0) {
+          torch::Tensor kl_token = cverl::torch_backend::kl_penalty(
+              log_probs, ref_log_probs, args.kl_penalty_mode);
+          kl_loss_value = cverl::torch_backend::masked_mean(kl_token, batch.response_mask);
+          total_loss = total_loss + args.kl_coef * kl_loss_value;
+        }
         optimizer.zero_grad();
-        loss.pg_loss.backward();
+        total_loss.backward();
         optimizer.step();
 
-        last_loss = loss.pg_loss.item<double>();
+        last_loss = total_loss.item<double>();
+        last_pg_loss = loss.pg_loss.item<double>();
+        last_kl_loss = kl_loss_value.item<double>();
         last_kl = loss.ppo_kl.item<double>();
         last_clipfrac = loss.pg_clipfrac.item<double>();
       }
@@ -263,6 +303,8 @@ int main(int argc, char** argv) {
                 << success_rate << ","
                 << no_answer << ","
                 << last_loss << ","
+                << last_pg_loss << ","
+                << last_kl_loss << ","
                 << last_kl << ","
                 << last_clipfrac << ","
                 << seconds << "\n";

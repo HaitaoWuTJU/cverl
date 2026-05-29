@@ -96,6 +96,7 @@ add_library(cverl STATIC
   src/rollout/http_transport.cc
   src/rollout/rollout_batch.cc
   src/rollout/shared_memory.cc
+  src/rollout/shared_memory_transport.cc
   src/rollout/transport.cc
   src/text/byte_tokenizer.cc
   src/core_algos_c_api.cc
@@ -123,6 +124,9 @@ if (nlohmann_json_FOUND)
   target_link_libraries(cverl PUBLIC nlohmann_json::nlohmann_json)
 endif()
 target_link_libraries(cverl PUBLIC CURL::libcurl)
+target_link_libraries(cverl PUBLIC Threads::Threads)
+# librt provides POSIX shared memory + named semaphores on Linux.
+target_link_libraries(cverl PUBLIC rt)
 target_compile_options(cverl PRIVATE ${TORCH_CXX_FLAGS})
 target_compile_definitions(cverl PRIVATE
   CVERL_HF_DOWNLOAD_SCRIPT="${CMAKE_CURRENT_SOURCE_DIR}/tools/hf_snapshot_download.py"
@@ -183,6 +187,9 @@ if (CVERL_BUILD_TESTS)
   add_executable(test_rollout_shared_memory tests/rollout/test_shared_memory.cc)
   target_link_libraries(test_rollout_shared_memory PRIVATE cverl)
 
+  add_executable(test_rollout_shared_memory_transport tests/rollout/test_shared_memory_transport.cc)
+  target_link_libraries(test_rollout_shared_memory_transport PRIVATE cverl)
+
   add_executable(test_rollout_transport tests/rollout/test_transport.cc)
   target_link_libraries(test_rollout_transport PRIVATE cverl)
 
@@ -202,6 +209,10 @@ if (CVERL_BUILD_TESTS)
   add_executable(test_gsm8k_grpo_smoke tests/rollout/test_gsm8k_grpo_smoke.cc)
   target_link_libraries(test_gsm8k_grpo_smoke PRIVATE cverl)
   target_compile_options(test_gsm8k_grpo_smoke PRIVATE ${TORCH_CXX_FLAGS})
+
+  add_executable(test_reference_policy_kl tests/torch/test_reference_policy_kl.cc)
+  target_link_libraries(test_reference_policy_kl PRIVATE cverl)
+  target_compile_options(test_reference_policy_kl PRIVATE ${TORCH_CXX_FLAGS})
 
   add_executable(test_distributed_topology tests/distributed/test_topology.cc)
   target_link_libraries(test_distributed_topology PRIVATE cverl)

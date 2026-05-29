@@ -48,4 +48,12 @@ TORCH_MODULE(TinyCausalPolicy);
 //   log_probs     float [B, R]
 torch::Tensor response_log_probs(const torch::Tensor& logits, const torch::Tensor& response_ids);
 
+// Build a frozen reference policy from the given source policy.
+//
+// The result has the same architecture and weights as `source` at call time
+// but every parameter has requires_grad=false. Use this to capture the
+// initial policy as the reference for KL-penalized PPO. Subsequent updates
+// to `source` do not affect the reference.
+TinyCausalPolicy clone_as_reference(const TinyCausalPolicy& source);
+
 }  // namespace cverl::torch_backend

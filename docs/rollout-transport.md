@@ -31,6 +31,11 @@ All transports implement `cverl::rollout::RolloutTransport`:
   client for OpenAI-compatible `/v1/completions` and `/v1/chat/completions`.
 - `include/cverl/rollout/shared_memory.h` — POSIX shared-memory primitive for
   local sidecars (CPU-side payloads).
+- `include/cverl/rollout/shared_memory_transport.h` —
+  `SharedMemoryRolloutTransport`, packs `RolloutRequest` / `RolloutResponse`
+  into a shm region and signals round-trips via two named POSIX semaphores.
+  `create_client()` is the trainer side; `attach_server()` + `serve_one()` /
+  `serve_loop()` is the rollout sidecar side.
 
 Trainer code talks to the abstract base class. Replacing HTTP with
 shared-memory or CUDA IPC later does not require touching trainer logic.
@@ -50,7 +55,9 @@ gsm8k_rollout_pipeline \
 
 `examples/rollout/gsm8k_grpo_smoke.cc` runs the full closed loop on CPU:
 GSM8K -> RolloutTransport -> rule reward -> ByteTokenizer -> TinyCausalPolicy
-logprobs -> GRPO advantages -> PPO clipped step.
+logprobs -> GRPO advantages -> PPO clipped step. KL penalty against a frozen
+reference policy is enabled with `--kl-coef > 0` and `--kl-penalty
+{k1,abs,k2,k3}`.
 
 ```
 gsm8k_grpo_smoke \
@@ -58,7 +65,8 @@ gsm8k_grpo_smoke \
   --transport loopback \
   --prompts 4 --n 4 --steps 4 \
   --max-prompt-tokens 96 --max-response-tokens 64 \
-  --hidden-dim 16
+  --hidden-dim 16 \
+  --kl-coef 0.05 --kl-penalty k2
 ```
 
 Both binaries accept `--transport http --base-url http://host:8000 --model
@@ -68,6 +76,10 @@ computation, PPO loss, optimizer step) does not change between transports.
 ## Tests
 
 - `tests/rollout/test_shared_memory.cc` — cross-process POSIX shm round-trip.
+- `tests/rollout/test_shared_memory_transport.cc` — fork()-based round trip
+  through `SharedMemoryRolloutTransport`: parent is the client, child is an
+  echo server, both ends serialize and round-trip a full `RolloutRequest` /
+  `RolloutResponse`.
 - `tests/rollout/test_transport.cc` — abstract interface + loopback transport.
 - `tests/rollout/test_http_transport.cc` — drives `HttpRolloutTransport`
   against a tiny in-process loopback HTTP server that emulates the
@@ -82,6 +94,9 @@ computation, PPO loss, optimizer step) does not change between transports.
 - `tests/rollout/test_gsm8k_grpo_smoke.cc` — fake rollout response ->
   TinyCausalPolicy logprobs -> one PPO step; asserts finite loss and that
   parameters actually moved.
+- `tests/torch/test_reference_policy_kl.cc` — `clone_as_reference` produces
+  a frozen detached copy, KL is ~0 when policy==ref, ref stays put after
+  policy updates, KL gradient flows back to the policy parameters.
 
 All tests are wired into `make test` and run on CPU only.
 

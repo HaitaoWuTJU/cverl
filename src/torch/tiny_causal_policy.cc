@@ -67,4 +67,33 @@ torch::Tensor response_log_probs(const torch::Tensor& logits, const torch::Tenso
   return torch::log_softmax(logits, -1).gather(-1, response_ids.unsqueeze(-1)).squeeze(-1);
 }
 
+TinyCausalPolicy clone_as_reference(const TinyCausalPolicy& source) {
+  TinyCausalPolicy ref(source->vocab_size_, source->hidden_dim_, source->pad_id_);
+  // Copy parameters in their current state, then freeze.
+  torch::NoGradGuard no_grad;
+  auto src_params = source->named_parameters(/*recurse=*/true);
+  auto ref_params = ref->named_parameters(/*recurse=*/true);
+  for (const auto& kv : src_params) {
+    auto& dst = ref_params[kv.key()];
+    TORCH_CHECK(dst.defined(), "missing parameter in reference: " + kv.key());
+    TORCH_CHECK(dst.sizes() == kv.value().sizes(),
+                "parameter shape mismatch: " + kv.key());
+    dst.copy_(kv.value());
+  }
+  // Buffers (none today, but be defensive against future additions).
+  auto src_buffers = source->named_buffers(/*recurse=*/true);
+  auto ref_buffers = ref->named_buffers(/*recurse=*/true);
+  for (const auto& kv : src_buffers) {
+    auto& dst = ref_buffers[kv.key()];
+    if (dst.defined()) {
+      dst.copy_(kv.value());
+    }
+  }
+  for (auto& p : ref->parameters()) {
+    p.set_requires_grad(false);
+  }
+  ref->eval();
+  return ref;
+}
+
 }  // namespace cverl::torch_backend
