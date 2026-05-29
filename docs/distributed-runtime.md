@@ -45,8 +45,8 @@ Expected collectives by parallel axis:
   - schedule with enough micro-batches to keep stages occupied
 
 `include/cverl/distributed/collectives.h` is intentionally an interface. CPU
-tests use `SingleProcessCollectives`; GPU builds should provide an NCCL-backed
-implementation behind the same methods.
+tests use `SingleProcessCollectives`; CUDA/NCCL builds can enable
+`NcclCollectives` with `-DCVERL_ENABLE_NCCL=ON`.
 
 ## Memory Policy
 
@@ -83,6 +83,11 @@ Launcher responsibilities:
 
 `Topology::nccl_env()` generates baseline NCCL environment values from
 `NetworkPolicy`; production launchers can add cluster-specific tuning.
+
+On the H20 test node, NCCL needed `NCCL_SOCKET_IFNAME=eth1`; without it,
+bootstrap failed with `no socket interface found`. The CMake path also needs to
+prefer the NCCL package bundled with the CUDA-enabled PyTorch wheel over older
+system NCCL libraries.
 
 ## Integration Order
 

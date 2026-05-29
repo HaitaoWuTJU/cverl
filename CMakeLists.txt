@@ -3,12 +3,40 @@ project(cverl LANGUAGES CXX)
 
 option(CVERL_BUILD_TESTS "Build cverl tests" ON)
 option(CVERL_ENABLE_CUDA "Build CUDA kernels" OFF)
+option(CVERL_ENABLE_NCCL "Build NCCL collectives" OFF)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(Torch REQUIRED)
+
+if (CVERL_ENABLE_NCCL)
+  find_package(Python COMPONENTS Interpreter REQUIRED)
+  execute_process(
+    COMMAND "${Python_EXECUTABLE}" -c
+            "import site; print(';'.join(site.getsitepackages() + [site.getusersitepackages()]))"
+    OUTPUT_VARIABLE CVERL_PYTHON_SITE_DIRS
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+  )
+  set(CVERL_NCCL_HINT_DIRS)
+  foreach(site_dir IN LISTS CVERL_PYTHON_SITE_DIRS)
+    list(APPEND CVERL_NCCL_HINT_DIRS
+      "${site_dir}/nvidia/nccl/include"
+      "${site_dir}/nvidia/nccl/lib"
+    )
+  endforeach()
+  find_path(NCCL_INCLUDE_DIR nccl.h HINTS ${CVERL_NCCL_HINT_DIRS} NO_DEFAULT_PATH)
+  find_library(NCCL_LIBRARY NAMES nccl libnccl.so.2 HINTS ${CVERL_NCCL_HINT_DIRS} NO_DEFAULT_PATH)
+  if (NOT NCCL_INCLUDE_DIR OR NOT NCCL_LIBRARY)
+    find_path(NCCL_INCLUDE_DIR nccl.h)
+    find_library(NCCL_LIBRARY nccl)
+  endif()
+  if (NOT NCCL_INCLUDE_DIR OR NOT NCCL_LIBRARY)
+    message(FATAL_ERROR "CVERL_ENABLE_NCCL=ON requires nccl.h and libnccl")
+  endif()
+  message(STATUS "Found NCCL: ${NCCL_LIBRARY}")
+endif()
 
 add_library(cverl STATIC
   src/status.cc
@@ -33,6 +61,15 @@ if (CVERL_ENABLE_CUDA)
   target_sources(cverl PRIVATE
     cuda/core_algos_cuda.cu
   )
+endif()
+
+if (CVERL_ENABLE_NCCL)
+  target_sources(cverl PRIVATE
+    src/distributed/nccl_collectives.cc
+  )
+  target_include_directories(cverl PUBLIC ${NCCL_INCLUDE_DIR})
+  target_link_libraries(cverl PUBLIC ${NCCL_LIBRARY})
+  target_compile_definitions(cverl PUBLIC CVERL_ENABLE_NCCL=1)
 endif()
 
 if (CVERL_BUILD_TESTS)
@@ -67,6 +104,12 @@ if (CVERL_BUILD_TESTS)
   add_executable(test_distributed_topology tests/distributed/test_topology.cc)
   target_link_libraries(test_distributed_topology PRIVATE cverl)
   target_compile_options(test_distributed_topology PRIVATE ${TORCH_CXX_FLAGS})
+
+  if (CVERL_ENABLE_NCCL)
+    add_executable(test_nccl_collectives tests/distributed/test_nccl_collectives.cc)
+    target_link_libraries(test_nccl_collectives PRIVATE cverl)
+    target_compile_options(test_nccl_collectives PRIVATE ${TORCH_CXX_FLAGS})
+  endif()
 
   add_executable(minimal_ppo_step examples/torch/minimal_ppo_step.cc)
   target_link_libraries(minimal_ppo_step PRIVATE cverl)

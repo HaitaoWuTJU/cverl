@@ -38,6 +38,7 @@ Current distributed support:
 - DP/TP/PP topology config and rank-group planning
 - GPU/NIC/NCCL environment policy generation
 - Memory policy for BF16/FP32 reduction, activation checkpointing, and sharding
+- Optional NCCL collectives backend for CUDA builds
 - Single-process collectives for CPU tests
 
 The C ABI wraps raw pointers into `torch::Tensor` views and delegates math to
@@ -116,7 +117,21 @@ The current CPU-buildable layer lives in:
 - `docs/distributed-runtime.md`
 
 GPU builds should add an NCCL implementation behind the `Collectives` interface
-instead of hand-writing communication primitives.
+instead of hand-writing communication primitives. A 4-GPU local smoke can be run
+on a CUDA/NCCL node with:
+
+```sh
+cmake -S . -B build-h20-nccl \
+  -DCMAKE_PREFIX_PATH="$(python -c 'import torch; print(torch.utils.cmake_prefix_path)')" \
+  -DCVERL_ENABLE_CUDA=ON \
+  -DCVERL_ENABLE_NCCL=ON
+cmake --build build-h20-nccl
+
+NCCL_SOCKET_IFNAME=eth1 \
+NCCL_LIB_DIR=/path/to/python/site-packages/nvidia/nccl/lib \
+WORLD_SIZE=4 \
+tools/distributed/run_nccl_smoke.sh build-h20-nccl
+```
 
 The `minimal_ppo_step` executable shows a native C++ PPO-style training step
 using a LibTorch model, optimizer, and `cverl` RL losses:
