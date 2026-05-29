@@ -9,7 +9,11 @@
 #include <string>
 #include <sys/wait.h>
 
+#ifdef CVERL_HAS_SIMDJSON
+#include <simdjson.h>
+#else
 #include <nlohmann/json.hpp>
+#endif
 
 #ifndef CVERL_HF_DATASET_SCRIPT
 #define CVERL_HF_DATASET_SCRIPT "tools/hf_dataset_download.py"
@@ -18,9 +22,64 @@
 namespace cverl::data {
 namespace {
 
+#ifdef CVERL_HAS_SIMDJSON
+std::string simdjson_value_to_string(simdjson::dom::element value) {
+  using simdjson::dom::element_type;
+  switch (value.type()) {
+    case element_type::NULL_VALUE:
+      return {};
+    case element_type::STRING: {
+      std::string_view view;
+      auto error = value.get_string().get(view);
+      if (error) {
+        throw std::runtime_error(std::string("failed to read JSON string: ") + simdjson::error_message(error));
+      }
+      return std::string(view);
+    }
+    case element_type::INT64: {
+      int64_t out = 0;
+      auto error = value.get_int64().get(out);
+      if (error) {
+        throw std::runtime_error(std::string("failed to read JSON int64: ") + simdjson::error_message(error));
+      }
+      return std::to_string(out);
+    }
+    case element_type::UINT64: {
+      uint64_t out = 0;
+      auto error = value.get_uint64().get(out);
+      if (error) {
+        throw std::runtime_error(std::string("failed to read JSON uint64: ") + simdjson::error_message(error));
+      }
+      return std::to_string(out);
+    }
+    case element_type::DOUBLE: {
+      double out = 0.0;
+      auto error = value.get_double().get(out);
+      if (error) {
+        throw std::runtime_error(std::string("failed to read JSON double: ") + simdjson::error_message(error));
+      }
+      std::ostringstream stream;
+      stream << out;
+      return stream.str();
+    }
+    case element_type::BOOL: {
+      bool out = false;
+      auto error = value.get_bool().get(out);
+      if (error) {
+        throw std::runtime_error(std::string("failed to read JSON bool: ") + simdjson::error_message(error));
+      }
+      return out ? "true" : "false";
+    }
+    case element_type::ARRAY:
+    case element_type::OBJECT:
+      throw std::runtime_error("dataset prompt/answer fields must be scalar JSON values");
+  }
+  throw std::runtime_error("unknown JSON value type");
+}
+#else
 using Json = nlohmann::json;
 
-std::string json_value_to_string(const Json& value) {
+std::string nlohmann_value_to_string(const Json& value) {
   if (value.is_null()) {
     return {};
   }
@@ -29,6 +88,7 @@ std::string json_value_to_string(const Json& value) {
   }
   return value.dump();
 }
+#endif
 
 std::string shell_quote(const std::string& value) {
   std::string out = "'";
@@ -98,11 +158,38 @@ std::vector<PromptAnswerExample> load_prompt_answer_jsonl(const JsonlDatasetOpti
   std::vector<PromptAnswerExample> examples;
   std::string line;
   int64_t line_no = 0;
+#ifdef CVERL_HAS_SIMDJSON
+  simdjson::dom::parser parser;
+#endif
   while (std::getline(in, line)) {
     ++line_no;
     if (line.empty()) {
       continue;
     }
+#ifdef CVERL_HAS_SIMDJSON
+    simdjson::padded_string padded(line);
+    simdjson::dom::element object;
+    auto parse_error = parser.parse(padded).get(object);
+    if (parse_error) {
+      throw std::runtime_error(
+          "failed to parse dataset JSONL at line " + std::to_string(line_no) + ": " +
+          simdjson::error_message(parse_error));
+    }
+    if (!object.is_object()) {
+      throw std::runtime_error("dataset JSONL row is not an object at line " + std::to_string(line_no));
+    }
+    simdjson::dom::element prompt;
+    simdjson::dom::element answer;
+    auto prompt_error = object[options.prompt_field].get(prompt);
+    auto answer_error = object[options.answer_field].get(answer);
+    if (prompt_error || answer_error) {
+      throw std::runtime_error("dataset JSONL missing required field at line " + std::to_string(line_no));
+    }
+    examples.push_back(PromptAnswerExample{
+        simdjson_value_to_string(prompt),
+        simdjson_value_to_string(answer),
+    });
+#else
     Json object = Json::parse(line);
     if (!object.is_object()) {
       throw std::runtime_error("dataset JSONL row is not an object at line " + std::to_string(line_no));
@@ -111,9 +198,10 @@ std::vector<PromptAnswerExample> load_prompt_answer_jsonl(const JsonlDatasetOpti
       throw std::runtime_error("dataset JSONL missing required field at line " + std::to_string(line_no));
     }
     examples.push_back(PromptAnswerExample{
-        json_value_to_string(object.at(options.prompt_field)),
-        json_value_to_string(object.at(options.answer_field)),
+        nlohmann_value_to_string(object.at(options.prompt_field)),
+        nlohmann_value_to_string(object.at(options.answer_field)),
     });
+#endif
     if (options.max_examples >= 0 && static_cast<int64_t>(examples.size()) >= options.max_examples) {
       break;
     }

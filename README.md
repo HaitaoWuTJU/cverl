@@ -37,7 +37,8 @@ Current data support:
 
 - Hugging Face datasets download bridge through Python `datasets`
 - Prompt/answer JSONL materialization for C++ training loops
-- Pure C++ JSONL reader for prompt/answer examples
+- Pure C++ JSONL reader for prompt/answer examples, using `simdjson` when
+  available and falling back to `nlohmann/json`
 
 Current distributed support:
 

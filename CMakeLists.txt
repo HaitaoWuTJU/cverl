@@ -10,8 +10,36 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(Torch REQUIRED)
-find_package(nlohmann_json QUIET)
-if (NOT nlohmann_json_FOUND)
+
+find_package(simdjson CONFIG QUIET
+  HINTS
+    "$ENV{CONDA_PREFIX}"
+    "$ENV{HOME}/miniconda3"
+    "$ENV{HOME}/miniconda3/envs/verl-cpu"
+)
+if (NOT simdjson_FOUND)
+  find_path(SIMDJSON_INCLUDE_DIR simdjson.h
+    HINTS
+      "$ENV{CONDA_PREFIX}/include"
+      "$ENV{HOME}/miniconda3/include"
+      "$ENV{HOME}/miniconda3/envs/verl-cpu/include"
+  )
+  find_library(SIMDJSON_LIBRARY simdjson
+    HINTS
+      "$ENV{CONDA_PREFIX}/lib"
+      "$ENV{HOME}/miniconda3/lib"
+      "$ENV{HOME}/miniconda3/envs/verl-cpu/lib"
+  )
+endif()
+set(CVERL_HAS_SIMDJSON OFF)
+if (simdjson_FOUND OR (SIMDJSON_INCLUDE_DIR AND SIMDJSON_LIBRARY))
+  set(CVERL_HAS_SIMDJSON ON)
+endif()
+
+if (NOT CVERL_HAS_SIMDJSON)
+  find_package(nlohmann_json QUIET)
+endif()
+if (NOT CVERL_HAS_SIMDJSON AND NOT nlohmann_json_FOUND)
   find_path(NLOHMANN_JSON_INCLUDE_DIR nlohmann/json.hpp
     HINTS
       "$ENV{CONDA_PREFIX}/include"
@@ -19,7 +47,7 @@ if (NOT nlohmann_json_FOUND)
       "$ENV{HOME}/miniconda3/envs/verl-cpu/include"
   )
   if (NOT NLOHMANN_JSON_INCLUDE_DIR)
-    message(FATAL_ERROR "nlohmann/json.hpp is required. Install nlohmann-json or add it to CMAKE_PREFIX_PATH.")
+    message(FATAL_ERROR "simdjson or nlohmann/json.hpp is required for JSONL dataset loading.")
   endif()
 endif()
 
@@ -64,11 +92,21 @@ add_library(cverl STATIC
   src/torch/simple_grpo_trainer.cc
 )
 target_include_directories(cverl PUBLIC include)
-if (NOT nlohmann_json_FOUND)
+if (CVERL_HAS_SIMDJSON AND NOT simdjson_FOUND)
+  target_include_directories(cverl PUBLIC ${SIMDJSON_INCLUDE_DIR})
+endif()
+if (NOT CVERL_HAS_SIMDJSON AND NOT nlohmann_json_FOUND)
   target_include_directories(cverl PUBLIC ${NLOHMANN_JSON_INCLUDE_DIR})
 endif()
 target_link_libraries(cverl PUBLIC "${TORCH_LIBRARIES}")
-if (nlohmann_json_FOUND)
+if (CVERL_HAS_SIMDJSON)
+  target_compile_definitions(cverl PUBLIC CVERL_HAS_SIMDJSON=1)
+  if (simdjson_FOUND)
+    target_link_libraries(cverl PUBLIC simdjson::simdjson)
+  else()
+    target_link_libraries(cverl PUBLIC ${SIMDJSON_LIBRARY})
+  endif()
+elseif (nlohmann_json_FOUND)
   target_link_libraries(cverl PUBLIC nlohmann_json::nlohmann_json)
 endif()
 target_compile_options(cverl PRIVATE ${TORCH_CXX_FLAGS})
