@@ -4,6 +4,7 @@
 
 #include <memory>
 #include <stdexcept>
+#include <string>
 
 #include "cverl/torch/core_algos_torch.h"
 
@@ -138,6 +139,41 @@ std::vector<SimpleGrpoTrainerMetrics> SimpleGrpoTrainer::train() {
     metrics.push_back(train_step());
   }
   return metrics;
+}
+
+void SimpleGrpoTrainer::save_checkpoint(const std::string& prefix) const {
+  torch::serialize::OutputArchive model_archive;
+  impl_->policy->save(model_archive);
+  model_archive.save_to(prefix + ".model.pt");
+
+  torch::serialize::OutputArchive optim_archive;
+  impl_->optimizer.save(optim_archive);
+  optim_archive.save_to(prefix + ".optim.pt");
+
+  torch::serialize::OutputArchive meta_archive;
+  meta_archive.write("step", torch::tensor(impl_->step, torch::kInt64));
+  meta_archive.write("seed", torch::tensor(static_cast<int64_t>(config_.seed), torch::kInt64));
+  meta_archive.save_to(prefix + ".meta.pt");
+}
+
+void SimpleGrpoTrainer::load_checkpoint(const std::string& prefix) {
+  torch::serialize::InputArchive model_archive;
+  model_archive.load_from(prefix + ".model.pt");
+  impl_->policy->load(model_archive);
+
+  torch::serialize::InputArchive optim_archive;
+  optim_archive.load_from(prefix + ".optim.pt");
+  impl_->optimizer.load(optim_archive);
+
+  torch::serialize::InputArchive meta_archive;
+  meta_archive.load_from(prefix + ".meta.pt");
+  torch::Tensor step;
+  meta_archive.read("step", step);
+  impl_->step = step.item<int64_t>();
+}
+
+int64_t SimpleGrpoTrainer::current_step() const {
+  return impl_->step;
 }
 
 }  // namespace cverl::torch_backend

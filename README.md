@@ -99,6 +99,13 @@ It creates toy prompts, samples responses from a LibTorch policy, computes an
 accuracy reward, builds GRPO advantages, applies PPO updates, and prints CSV
 metrics.
 
+Checkpointing is available through the trainer API and CLI:
+
+```sh
+./build/toy_grpo_trainer 8 4 4 --save-prefix /tmp/cverl-toy
+./build/toy_grpo_trainer 8 4 4 --load-prefix /tmp/cverl-toy
+```
+
 ## API Example
 
 ```c

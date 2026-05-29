@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace cverl::torch_backend {
@@ -41,6 +42,10 @@ class SimpleGrpoTrainer {
 
   SimpleGrpoTrainerMetrics train_step();
   std::vector<SimpleGrpoTrainerMetrics> train();
+
+  void save_checkpoint(const std::string& prefix) const;
+  void load_checkpoint(const std::string& prefix);
+  int64_t current_step() const;
 
   const SimpleGrpoTrainerConfig& config() const { return config_; }
 

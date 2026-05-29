@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <filesystem>
 #include <iostream>
 
 int main() {
@@ -33,6 +34,26 @@ int main() {
       return 1;
     }
   }
+
+  const std::filesystem::path ckpt_prefix =
+      std::filesystem::temp_directory_path() / "cverl_simple_grpo_trainer_test_ckpt";
+  trainer.save_checkpoint(ckpt_prefix.string());
+
+  cverl::torch_backend::SimpleGrpoTrainer restored(config);
+  restored.load_checkpoint(ckpt_prefix.string());
+  if (restored.current_step() != config.steps) {
+    std::cerr << "restored checkpoint step mismatch\n";
+    return 1;
+  }
+  auto resumed = restored.train_step();
+  if (resumed.step != config.steps + 1 || !std::isfinite(resumed.loss)) {
+    std::cerr << "failed to resume from checkpoint\n";
+    return 1;
+  }
+
+  std::filesystem::remove(ckpt_prefix.string() + ".model.pt");
+  std::filesystem::remove(ckpt_prefix.string() + ".optim.pt");
+  std::filesystem::remove(ckpt_prefix.string() + ".meta.pt");
 
   std::cout << "simple GRPO trainer smoke test passed\n";
   return 0;
