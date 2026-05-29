@@ -147,6 +147,19 @@ LAYERS=4 \
 tools/distributed/run_qwen_tp_smoke.sh ./models/Qwen3.5-0.8B
 ```
 
+The 4-GPU H20 smoke uses `DP=2,TP=2`: each data-parallel replica runs a
+2-rank tensor-parallel Qwen forward check, and matching tensor ranks synchronize
+gradients through a DP NCCL communicator:
+
+```sh
+NCCL_SOCKET_IFNAME=eth1 \
+NCCL_LIB_DIR=/path/to/python/site-packages/nvidia/nccl/lib \
+DP_SIZE=2 \
+TP_SIZE=2 \
+LAYERS=4 \
+tools/distributed/run_qwen_dp_tp_smoke.sh ./models/Qwen3.5-0.8B
+```
+
 The `minimal_ppo_step` executable shows a native C++ PPO-style training step
 using a LibTorch model, optimizer, and `cverl` RL losses:
 

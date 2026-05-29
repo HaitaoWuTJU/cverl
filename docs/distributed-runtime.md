@@ -74,6 +74,13 @@ Qwen3.5 has TP entry points for:
 These entry points are separate from the dense forward path so correctness can
 be preserved while the trainer is migrated stage by stage.
 
+The current 4-GPU validation target is `DP=2,TP=2` on H20:
+
+- TP groups run Qwen3.5 dense-vs-TP hidden-state comparison through the first
+  full-attention layer.
+- DP groups synchronize gradients for matching TP ranks.
+- `NCCL_SOCKET_IFNAME=eth1` is required on the tested container.
+
 ## Memory Policy
 
 The runtime config separates memory decisions from model code:
