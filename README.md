@@ -5,9 +5,11 @@ inspired by `verl`. The first milestone is intentionally small: implement the
 core RL math kernels in a standalone native library with a stable C ABI, then
 grow toward a pure C++/CUDA training backend.
 
-The current code does not depend on Python, PyTorch, Ray, TensorDict, or other
-runtime frameworks. CPU reference kernels are implemented first so correctness
-can be locked down before CUDA kernels and distributed runtime work are added.
+The default core library does not depend on Python, PyTorch, Ray, TensorDict, or
+other runtime frameworks. CPU reference kernels are implemented first so
+correctness can be locked down before CUDA kernels and distributed runtime work
+are added. Optional backends, such as LibTorch, can be enabled explicitly for
+C++ trainer prototyping.
 
 ## Current Scope
 
@@ -30,6 +32,12 @@ Current tensor support:
 CUDA support is scaffolded in the build system but the CUDA kernels are not
 implemented yet.
 
+Optional LibTorch backend:
+
+- `torch::Tensor` implementations of the same core algorithms
+- autograd support through LibTorch for C++ trainer prototyping
+- cross-checks against the C ABI kernels
+
 ## Layout
 
 ```text
@@ -39,6 +47,7 @@ cverl/
   cuda/                 CUDA implementation placeholder
   tests/                Native C++ tests
   tools/                Future golden-data and comparison tools
+  docs/                 Design notes
   CMakeLists.txt        CMake build
   Makefile              Minimal build for CPU-only environments
 ```
@@ -72,6 +81,20 @@ cmake --build build-cuda
 
 At the moment this only validates the CUDA build path. Kernel implementations
 will be added after the CPU reference behavior is covered by golden tests.
+
+### Optional LibTorch Backend
+
+`cverl` can also build an optional C++ backend on top of LibTorch. This is for
+native C++ trainer prototyping without Python, and avoids rewriting mature
+tensor/autograd/model infrastructure too early.
+
+```sh
+cmake -S . -B build-torch \
+  -DCVERL_ENABLE_TORCH=ON \
+  -DCMAKE_PREFIX_PATH="$(python -c 'import torch; print(torch.utils.cmake_prefix_path)')"
+cmake --build build-torch
+./build-torch/test_torch_backend
+```
 
 ## API Example
 
