@@ -24,9 +24,9 @@ int main() {
   try {
     torch::manual_seed(7);
     const int64_t hidden = 8;
-    const int32_t pad_id = cverl::text::ByteTokenizer::pad_id();
+    const int32_t pad_id = cverl::text::ByteTokenizer::kPadId;
     cverl::torch_backend::TinyCausalPolicy policy(
-        cverl::text::ByteTokenizer::vocab_size(), hidden, pad_id);
+        cverl::text::ByteTokenizer::kVocabSize, hidden, pad_id);
 
     // Build a tiny dummy batch.
     torch::Tensor prompt_ids = torch::tensor({{4, 5, 6, 7, pad_id, pad_id},

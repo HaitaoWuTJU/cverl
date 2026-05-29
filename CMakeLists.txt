@@ -56,6 +56,26 @@ endif()
 # libcurl powers the HTTP rollout transport.
 find_package(CURL REQUIRED)
 
+# PCRE2 powers the byte-level BPE pre-tokenizer regex (Unicode property
+# classes \p{L}/\p{N} required by GPT-2 / Qwen3 patterns; std::regex does
+# not support them and is also linear-time slow on these inputs).
+find_path(PCRE2_INCLUDE_DIR pcre2.h
+  HINTS
+    "$ENV{CONDA_PREFIX}/include"
+    "$ENV{HOME}/miniconda3/include"
+    /usr/include
+)
+find_library(PCRE2_LIBRARY NAMES pcre2-8 libpcre2-8
+  HINTS
+    "$ENV{CONDA_PREFIX}/lib"
+    "$ENV{HOME}/miniconda3/lib"
+    /usr/lib64 /usr/lib
+)
+if (NOT PCRE2_INCLUDE_DIR OR NOT PCRE2_LIBRARY)
+  message(FATAL_ERROR "PCRE2 (libpcre2-8) is required for HfBpeTokenizer")
+endif()
+message(STATUS "Found PCRE2: ${PCRE2_LIBRARY}")
+
 if (CVERL_ENABLE_NCCL)
   find_package(Python COMPONENTS Interpreter REQUIRED)
   execute_process(
@@ -99,6 +119,7 @@ add_library(cverl STATIC
   src/rollout/shared_memory_transport.cc
   src/rollout/transport.cc
   src/text/byte_tokenizer.cc
+  src/text/hf_bpe_tokenizer.cc
   src/core_algos_c_api.cc
   src/torch/core_algos_torch.cc
   src/torch/simple_grpo_trainer.cc
@@ -127,6 +148,8 @@ target_link_libraries(cverl PUBLIC CURL::libcurl)
 target_link_libraries(cverl PUBLIC Threads::Threads)
 # librt provides POSIX shared memory + named semaphores on Linux.
 target_link_libraries(cverl PUBLIC rt)
+target_include_directories(cverl PUBLIC ${PCRE2_INCLUDE_DIR})
+target_link_libraries(cverl PUBLIC ${PCRE2_LIBRARY})
 target_compile_options(cverl PRIVATE ${TORCH_CXX_FLAGS})
 target_compile_definitions(cverl PRIVATE
   CVERL_HF_DOWNLOAD_SCRIPT="${CMAKE_CURRENT_SOURCE_DIR}/tools/hf_snapshot_download.py"
@@ -201,6 +224,11 @@ if (CVERL_BUILD_TESTS)
 
   add_executable(test_byte_tokenizer tests/text/test_byte_tokenizer.cc)
   target_link_libraries(test_byte_tokenizer PRIVATE cverl)
+
+  add_executable(test_hf_bpe_tokenizer tests/text/test_hf_bpe_tokenizer.cc)
+  target_link_libraries(test_hf_bpe_tokenizer PRIVATE cverl)
+  target_compile_definitions(test_hf_bpe_tokenizer PRIVATE
+    CVERL_PROJECT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 
   add_executable(test_rollout_batch tests/rollout/test_rollout_batch.cc)
   target_link_libraries(test_rollout_batch PRIVATE cverl)

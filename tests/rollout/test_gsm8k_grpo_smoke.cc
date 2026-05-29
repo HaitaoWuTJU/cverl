@@ -74,9 +74,9 @@ int main() {
 
     const int64_t hidden_dim = 16;
     cverl::torch_backend::TinyCausalPolicy policy(
-        cverl::text::ByteTokenizer::vocab_size(),
+        cverl::text::ByteTokenizer::kVocabSize,
         hidden_dim,
-        cverl::text::ByteTokenizer::pad_id());
+        cverl::text::ByteTokenizer::kPadId);
     torch::optim::AdamW optimizer(policy->parameters(), torch::optim::AdamWOptions(1e-2));
 
     // Capture initial weights for the parameter-update check.

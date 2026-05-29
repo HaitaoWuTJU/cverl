@@ -43,7 +43,7 @@ RolloutBatch build_gsm8k_rollout_batch(const RolloutResponse& response,
                                        const std::vector<std::string>& prompts,
                                        const std::vector<std::string>& ground_truths,
                                        const cverl::reward::Gsm8kRewardOptions& reward_options,
-                                       const cverl::text::ByteTokenizer& tokenizer,
+                                       const cverl::text::Tokenizer& tokenizer,
                                        const RolloutBatchOptions& options) {
   if (prompts.size() != ground_truths.size()) {
     throw std::invalid_argument("prompts and ground_truths size mismatch");
@@ -56,7 +56,7 @@ RolloutBatch build_gsm8k_rollout_batch(const RolloutResponse& response,
   if (batch == 0) {
     throw std::invalid_argument("rollout response has no sequences");
   }
-  const int32_t pad_id = cverl::text::ByteTokenizer::pad_id();
+  const int32_t pad_id = tokenizer.pad_id();
 
   RolloutBatch out;
   auto long_options = torch::TensorOptions().dtype(torch::kInt64);
@@ -77,12 +77,12 @@ RolloutBatch build_gsm8k_rollout_batch(const RolloutResponse& response,
   auto* scalar_ptr = out.scalar_rewards.data_ptr<float>();
   auto* token_reward_ptr = out.token_rewards.data_ptr<float>();
 
-  cverl::text::ByteTokenizer::EncodeOptions prompt_encode;
+  cverl::text::EncodeOptions prompt_encode;
   prompt_encode.add_bos = options.add_bos;
   prompt_encode.add_eos = false;
   prompt_encode.max_tokens = static_cast<int32_t>(options.max_prompt_tokens);
 
-  cverl::text::ByteTokenizer::EncodeOptions response_encode;
+  cverl::text::EncodeOptions response_encode;
   response_encode.add_bos = false;
   response_encode.add_eos = options.add_eos;
   response_encode.max_tokens = static_cast<int32_t>(options.max_response_tokens);

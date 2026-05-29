@@ -54,20 +54,39 @@ gsm8k_rollout_pipeline \
 ```
 
 `examples/rollout/gsm8k_grpo_smoke.cc` runs the full closed loop on CPU:
-GSM8K -> RolloutTransport -> rule reward -> ByteTokenizer -> TinyCausalPolicy
+GSM8K -> RolloutTransport -> rule reward -> Tokenizer -> TinyCausalPolicy
 logprobs -> GRPO advantages -> PPO clipped step. KL penalty against a frozen
 reference policy is enabled with `--kl-coef > 0` and `--kl-penalty
-{k1,abs,k2,k3}`.
+{k1,abs,k2,k3}`. The tokenizer is selected via `--tokenizer {byte,hf}`;
+`hf` requires `--tokenizer-path /path/to/tokenizer.json` and uses
+HfBpeTokenizer (pure C++ HF byte-level BPE).
 
 ```
 gsm8k_grpo_smoke \
   --dataset path/to/gsm8k.jsonl \
   --transport loopback \
+  --tokenizer hf --tokenizer-path /path/to/Qwen3.5/tokenizer.json \
   --prompts 4 --n 4 --steps 4 \
   --max-prompt-tokens 96 --max-response-tokens 64 \
   --hidden-dim 16 \
   --kl-coef 0.05 --kl-penalty k2
 ```
+
+## Tokenizer backends
+
+All tokenizer-aware code (rollout batch builder, smoke loop) takes a
+`const cverl::text::Tokenizer&`. Two backends ship today:
+
+- `cverl::text::ByteTokenizer` — vocab=260, byte-per-id, dependency-free.
+  CPU smokes / CI only.
+- `cverl::text::HfBpeTokenizer` — pure C++, loads HF `tokenizer.json`,
+  byte-level BPE matching Qwen / Llama-3 / GPT-2 family bit-for-bit.
+  Cross-validated against HF Python via
+  `tools/text/dump_hf_tokenizer_fixtures.py` + `tests/text/fixtures/...`.
+
+A future Rust-backed `HfTokenizersCpp` wrapper (mlc-ai/tokenizers-cpp) can
+plug into the same interface for parity verification on GPU machines that
+have the Rust toolchain.
 
 Both binaries accept `--transport http --base-url http://host:8000 --model
 <model-id>` to drive a real vLLM/SGLang server. The trainer code (advantage
@@ -97,6 +116,9 @@ computation, PPO loss, optimizer step) does not change between transports.
 - `tests/torch/test_reference_policy_kl.cc` — `clone_as_reference` produces
   a frozen detached copy, KL is ~0 when policy==ref, ref stays put after
   policy updates, KL gradient flows back to the policy parameters.
+- `tests/text/test_hf_bpe_tokenizer.cc` — round-trips a synthetic HF
+  tokenizer.json + cross-validates encode/decode against fixtures generated
+  by Python `tokenizers`.
 
 All tests are wired into `make test` and run on CPU only.
 

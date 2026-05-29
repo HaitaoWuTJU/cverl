@@ -22,6 +22,7 @@ test: all
 	./$(BUILD_DIR)/test_rollout_http_transport
 	./$(BUILD_DIR)/test_gsm8k_reward
 	./$(BUILD_DIR)/test_byte_tokenizer
+	./$(BUILD_DIR)/test_hf_bpe_tokenizer
 	./$(BUILD_DIR)/test_rollout_batch
 	./$(BUILD_DIR)/test_gsm8k_grpo_smoke
 	./$(BUILD_DIR)/test_reference_policy_kl

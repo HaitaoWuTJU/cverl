@@ -16,6 +16,8 @@
 #include "cverl/rollout/rollout_batch.h"
 #include "cverl/rollout/transport.h"
 #include "cverl/text/byte_tokenizer.h"
+#include "cverl/text/hf_bpe_tokenizer.h"
+#include "cverl/text/tokenizer.h"
 #include "cverl/torch/core_algos_torch.h"
 #include "cverl/torch/tiny_causal_policy.h"
 
@@ -59,6 +61,8 @@ struct Args {
   cverl_kl_penalty_t kl_penalty_mode = CVERL_KL_K1;
   uint64_t seed = 17;
   cverl::reward::Gsm8kExtractionMethod reward_method = cverl::reward::Gsm8kExtractionMethod::Strict;
+  std::string tokenizer_kind = "byte";
+  std::string tokenizer_path;
 };
 
 const char* require_value(int& i, int argc, char** argv, const char* name) {
@@ -138,6 +142,10 @@ Args parse_args(int argc, char** argv) {
       } else {
         throw std::invalid_argument("--reward-method must be strict|flexible");
       }
+    } else if (a == "--tokenizer") {
+      args.tokenizer_kind = require_value(i, argc, argv, "--tokenizer");
+    } else if (a == "--tokenizer-path") {
+      args.tokenizer_path = require_value(i, argc, argv, "--tokenizer-path");
     } else {
       throw std::invalid_argument("unknown argument: " + a);
     }
@@ -187,14 +195,30 @@ int main(int argc, char** argv) {
     }
 
     auto transport = build_transport(args);
-    cverl::text::ByteTokenizer tokenizer;
+
+    std::unique_ptr<cverl::text::Tokenizer> tokenizer;
+    if (args.tokenizer_kind == "byte") {
+      tokenizer = std::make_unique<cverl::text::ByteTokenizer>();
+    } else if (args.tokenizer_kind == "hf") {
+      if (args.tokenizer_path.empty()) {
+        throw std::invalid_argument("--tokenizer hf requires --tokenizer-path");
+      }
+      cverl::text::HfBpeTokenizerOptions opts;
+      opts.tokenizer_json_path = args.tokenizer_path;
+      tokenizer = std::make_unique<cverl::text::HfBpeTokenizer>(opts);
+    } else {
+      throw std::invalid_argument("--tokenizer must be byte|hf");
+    }
+    int32_t vocab_size = tokenizer->vocab_size();
+    int32_t pad_id = tokenizer->pad_id() >= 0 ? tokenizer->pad_id() : 0;
+
     cverl::reward::Gsm8kRewardOptions reward_opts;
     reward_opts.method = args.reward_method;
 
     cverl::torch_backend::TinyCausalPolicy policy(
-        cverl::text::ByteTokenizer::vocab_size(),
+        vocab_size,
         args.hidden_dim,
-        cverl::text::ByteTokenizer::pad_id());
+        pad_id);
     torch::optim::AdamW optimizer(policy->parameters(), torch::optim::AdamWOptions(args.learning_rate));
 
     // Snapshot the initial policy as the frozen reference for KL penalty.
@@ -234,7 +258,7 @@ int main(int argc, char** argv) {
       batch_opts.max_prompt_tokens = args.max_prompt_tokens;
       batch_opts.max_response_tokens = args.max_response_tokens;
       auto batch = cverl::rollout::build_gsm8k_rollout_batch(
-          resp, prompts, ground_truths, reward_opts, tokenizer, batch_opts);
+          resp, prompts, ground_truths, reward_opts, *tokenizer, batch_opts);
 
       // GRPO advantages from the rule reward.
       torch::Tensor returns;

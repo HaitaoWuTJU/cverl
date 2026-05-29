@@ -8,7 +8,7 @@
 
 #include "cverl/reward/gsm8k.h"
 #include "cverl/rollout/transport.h"
-#include "cverl/text/byte_tokenizer.h"
+#include "cverl/text/tokenizer.h"
 
 namespace cverl::rollout {
 
@@ -53,7 +53,7 @@ RolloutBatch build_gsm8k_rollout_batch(const RolloutResponse& response,
                                        const std::vector<std::string>& prompts,
                                        const std::vector<std::string>& ground_truths,
                                        const cverl::reward::Gsm8kRewardOptions& reward_options,
-                                       const cverl::text::ByteTokenizer& tokenizer,
+                                       const cverl::text::Tokenizer& tokenizer,
                                        const RolloutBatchOptions& options = {});
 
 }  // namespace cverl::rollout

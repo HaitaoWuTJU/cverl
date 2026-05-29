@@ -30,7 +30,7 @@ int main() {
 
     // Add BOS / EOS.
     {
-      ByteTokenizer::EncodeOptions opts;
+      cverl::text::EncodeOptions opts;
       opts.add_bos = true;
       opts.add_eos = true;
       auto ids = tok.encode("ok", opts);
@@ -47,7 +47,7 @@ int main() {
 
     // Truncation honors max_tokens.
     {
-      ByteTokenizer::EncodeOptions opts;
+      cverl::text::EncodeOptions opts;
       opts.max_tokens = 3;
       auto ids = tok.encode("abcdef", opts);
       require(ids.size() == 3, "max_tokens truncates");
@@ -56,7 +56,7 @@ int main() {
 
     // EOS only added when there's room.
     {
-      ByteTokenizer::EncodeOptions opts;
+      cverl::text::EncodeOptions opts;
       opts.add_eos = true;
       opts.max_tokens = 2;
       auto ids = tok.encode("abc", opts);

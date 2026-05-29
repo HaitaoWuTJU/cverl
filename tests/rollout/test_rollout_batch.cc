@@ -97,7 +97,7 @@ int main() {
 
     // Left-padded prompts: the last column is always a real token, not pad.
     auto last_col = batch.prompt_ids.select(1, opts.max_prompt_tokens - 1);
-    auto pad_id = cverl::text::ByteTokenizer::pad_id();
+    auto pad_id = cverl::text::ByteTokenizer::kPadId;
     for (int64_t i = 0; i < B; ++i) {
       require(last_col[i].item<int64_t>() != pad_id, "last prompt col is real token");
     }
