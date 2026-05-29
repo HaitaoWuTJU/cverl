@@ -308,6 +308,52 @@ extern "C" cverl_status_t cverl_kl_penalty_f32_cpu(
   return CVERL_OK;
 }
 
+extern "C" cverl_status_t cverl_kl_penalty_backward_f32_cpu(
+    cverl_const_tensor2d_t logprob,
+    cverl_const_tensor2d_t ref_logprob,
+    cverl_kl_penalty_t penalty,
+    cverl_tensor2d_t grad_logprob) {
+  cverl_status_t status = validate_binary(logprob, ref_logprob);
+  if (status != CVERL_OK) {
+    return status;
+  }
+  status = validate_out(logprob, grad_logprob);
+  if (status != CVERL_OK) {
+    return status;
+  }
+
+  const int64_t n = numel(logprob);
+  const float* lp = ptr(logprob);
+  const float* ref = ptr(ref_logprob);
+  float* grad = ptr(grad_logprob);
+  for (int64_t i = 0; i < n; ++i) {
+    const float diff = lp[i] - ref[i];
+    switch (penalty) {
+      case CVERL_KL_K1:
+        grad[i] = 1.0f;
+        break;
+      case CVERL_KL_ABS:
+        grad[i] = diff > 0.0f ? 1.0f : (diff < 0.0f ? -1.0f : 0.0f);
+        break;
+      case CVERL_KL_K2:
+        grad[i] = diff;
+        break;
+      case CVERL_KL_K3: {
+        const float unclamped_kl = ref[i] - lp[i];
+        const float kl = std::clamp(unclamped_kl, -20.0f, 20.0f);
+        const float unclamped_kld = std::exp(kl) - kl - 1.0f;
+        const bool kl_has_grad = unclamped_kl >= -20.0f && unclamped_kl <= 20.0f;
+        const bool kld_has_grad = unclamped_kld >= -10.0f && unclamped_kld <= 10.0f;
+        grad[i] = (kl_has_grad && kld_has_grad) ? -(std::exp(kl) - 1.0f) : 0.0f;
+        break;
+      }
+      default:
+        return CVERL_ERR_UNSUPPORTED;
+    }
+  }
+  return CVERL_OK;
+}
+
 extern "C" cverl_status_t cverl_gae_advantage_return_f32_cpu(
     cverl_const_tensor2d_t token_level_rewards,
     cverl_const_tensor2d_t values,

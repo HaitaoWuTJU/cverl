@@ -51,6 +51,12 @@ cverl_status_t cverl_kl_penalty_f32_cpu(
     cverl_kl_penalty_t penalty,
     cverl_tensor2d_t out);
 
+cverl_status_t cverl_kl_penalty_backward_f32_cpu(
+    cverl_const_tensor2d_t logprob,
+    cverl_const_tensor2d_t ref_logprob,
+    cverl_kl_penalty_t penalty,
+    cverl_tensor2d_t grad_logprob);
+
 cverl_status_t cverl_gae_advantage_return_f32_cpu(
     cverl_const_tensor2d_t token_level_rewards,
     cverl_const_tensor2d_t values,

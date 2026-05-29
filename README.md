@@ -15,6 +15,7 @@ Implemented CPU reference kernels:
 
 - Masked reductions: `masked_sum`, `masked_mean`, `masked_whiten`
 - KL penalty: `k1`, `abs`, `k2`, `k3`
+- KL penalty backward gradient for `logprob`
 - GAE advantage and returns
 - GRPO outcome advantage
 - PPO clipped policy loss
@@ -102,8 +103,9 @@ cverl_status_t status = cverl_gae_advantage_return_f32_cpu(
 
 The CPU reference implementation is the source of truth for native kernels.
 Golden-data tests can be generated from the Python `verl` implementation. The
-current golden format covers forward outputs for KL, GAE, GRPO, PPO loss, and
-the autograd reference gradient for PPO loss with respect to `log_prob`.
+current golden format covers forward outputs for KL, GAE, GRPO, PPO loss, plus
+autograd reference gradients for KL with respect to `logprob` and PPO loss with
+respect to `log_prob`.
 
 1. Generate random inputs and reference outputs from `verl`.
 2. Serialize them to a simple binary/JSON test format.

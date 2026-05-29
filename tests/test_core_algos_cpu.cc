@@ -74,6 +74,16 @@ void test_kl() {
 
   require_status(cverl_kl_penalty_f32_cpu(ct(logp, 2, 2), ct(ref, 2, 2), CVERL_KL_K2, mt(out, 2, 2)), "kl k2");
   require_vec_close(out, {0.125f, 0.125f, 0.5f, 2.0f}, 1.0e-6f, "kl k2");
+
+  require_status(
+      cverl_kl_penalty_backward_f32_cpu(ct(logp, 2, 2), ct(ref, 2, 2), CVERL_KL_K2, mt(out, 2, 2)),
+      "kl k2 backward");
+  require_vec_close(out, {0.5f, 0.5f, -1.0f, 2.0f}, 1.0e-6f, "kl k2 backward");
+
+  require_status(
+      cverl_kl_penalty_backward_f32_cpu(ct(logp, 2, 2), ct(ref, 2, 2), CVERL_KL_K3, mt(out, 2, 2)),
+      "kl k3 backward");
+  require_close(out[0], -(std::exp(-0.5f) - 1.0f), 1.0e-6f, "kl k3 backward");
 }
 
 void test_gae() {

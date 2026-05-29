@@ -24,7 +24,7 @@ import torch
 
 
 MAGIC = b"CVERLGD1"
-VERSION = 2
+VERSION = 3
 
 KIND_KL = 1
 KIND_GAE = 2
@@ -109,11 +109,13 @@ def make_records(seed: int):
     records = []
 
     rows, cols = 8, 16
-    logp = torch.randn(rows, cols, dtype=torch.float32) * 2.0
+    logp_base = torch.randn(rows, cols, dtype=torch.float32) * 2.0
     ref = torch.randn(rows, cols, dtype=torch.float32) * 2.0
     for penalty_id, name in [(KL_K1, "kl"), (KL_ABS, "abs"), (KL_K2, "k2"), (KL_K3, "k3")]:
+        logp = logp_base.detach().clone().requires_grad_(True)
         out = kl_penalty(logp, ref, name)
-        records.append((KIND_KL, penalty_id, logp, ref, out))
+        out.sum().backward()
+        records.append((KIND_KL, penalty_id, logp.detach(), ref, out.detach(), logp.grad.detach().clone()))
 
     rewards = torch.randn(rows, cols, dtype=torch.float32)
     values = torch.randn(rows, cols, dtype=torch.float32)
@@ -177,11 +179,12 @@ def write_records(path: pathlib.Path, records) -> None:
             kind = rec[0]
             _write_u32(f, kind)
             if kind == KIND_KL:
-                _, penalty, logp, ref, out = rec
+                _, penalty, logp, ref, out, grad_logp = rec
                 _write_u32(f, penalty)
                 _write_f32_tensor(f, logp)
                 _write_f32_tensor(f, ref)
                 _write_f32_tensor(f, out)
+                _write_f32_tensor(f, grad_logp)
             elif kind == KIND_GAE:
                 _, gamma, lam, rewards, values, mask, adv, ret = rec
                 f.write(struct.pack("<ff", gamma, lam))

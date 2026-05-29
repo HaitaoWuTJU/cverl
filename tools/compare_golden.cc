@@ -12,7 +12,7 @@ namespace {
 
 constexpr char kMagic[] = "CVERLGD1";
 constexpr uint32_t kMinVersion = 1;
-constexpr uint32_t kMaxVersion = 2;
+constexpr uint32_t kMaxVersion = 3;
 constexpr float kAtol = 1.0e-5f;
 constexpr float kRtol = 1.0e-5f;
 
@@ -124,7 +124,7 @@ void read_expect_tensor_shape(
   require_shape(actual_rows, actual_cols, rows, cols, name);
 }
 
-void compare_kl(std::ifstream& in) {
+void compare_kl(std::ifstream& in, uint32_t version) {
   uint32_t penalty = read_scalar<uint32_t>(in);
   int64_t rows = 0;
   int64_t cols = 0;
@@ -143,6 +143,20 @@ void compare_kl(std::ifstream& in) {
           mt(actual, rows, cols)),
       "kl");
   compare_tensor(actual, expected, "kl");
+
+  if (version >= 3) {
+    std::vector<float> expected_grad;
+    read_expect_tensor_shape(in, rows, cols, &expected_grad, "kl expected grad");
+    std::vector<float> actual_grad(expected_grad.size());
+    require_status(
+        cverl_kl_penalty_backward_f32_cpu(
+            ct(logp, rows, cols),
+            ct(ref, rows, cols),
+            static_cast<cverl_kl_penalty_t>(penalty),
+            mt(actual_grad, rows, cols)),
+        "kl backward");
+    compare_tensor(actual_grad, expected_grad, "kl grad_logprob");
+  }
 }
 
 void compare_gae(std::ifstream& in) {
@@ -303,7 +317,7 @@ int main(int argc, char** argv) {
     uint32_t kind = read_scalar<uint32_t>(in);
     switch (kind) {
       case kKindKl:
-        compare_kl(in);
+        compare_kl(in, version);
         break;
       case kKindGae:
         compare_gae(in);
