@@ -15,6 +15,7 @@ test: all
 	./$(BUILD_DIR)/test_core_algos_cpu
 	./$(BUILD_DIR)/test_torch_backend
 	./$(BUILD_DIR)/test_simple_grpo_trainer
+	./$(BUILD_DIR)/test_distributed_topology
 
 clean:
 	rm -rf $(BUILD_DIR)

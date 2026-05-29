@@ -28,6 +28,9 @@ mean every low-level component should be rewritten from scratch.
    and profiling proves a clear bottleneck.
 4. Runtime: native trainer, optimizer, checkpointing, rollout, and distributed
    execution.
+5. Distributed topology and collectives: plan DP/TP/PP with
+   `cverl::distributed::Topology`, then use NCCL-backed collectives in GPU
+   builds.
 
 The `minimal_ppo_step` example shows the intended near-term integration style:
 LibTorch owns model parameters, tensor operations, autograd, and optimizer state
@@ -47,3 +50,7 @@ uses synthetic prompts and rewards, but exercises the full C++ loop:
 
 This lets us avoid depending on Python while still reusing C++ APIs from mature
 ML systems.
+
+The distributed runtime starts with explicit topology planning rather than
+embedding rank arithmetic inside model code. See `docs/distributed-runtime.md`
+for the DP/TP/PP mapping, memory policy, and network/NCCL configuration plan.

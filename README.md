@@ -33,6 +33,13 @@ Current model support:
 - Qwen3.5 linear attention, full attention, MLP, RMSNorm, RoPE, and tied lm head
 - Native C++ CLI smoke for hidden states and logits
 
+Current distributed support:
+
+- DP/TP/PP topology config and rank-group planning
+- GPU/NIC/NCCL environment policy generation
+- Memory policy for BF16/FP32 reduction, activation checkpointing, and sharding
+- Single-process collectives for CPU tests
+
 The C ABI wraps raw pointers into `torch::Tensor` views and delegates math to
 LibTorch. Backward APIs use LibTorch autograd rather than manually derived
 gradient loops.
@@ -66,6 +73,7 @@ cmake --build build
 ./build/test_core_algos_cpu
 ./build/test_torch_backend
 ./build/test_simple_grpo_trainer
+./build/test_distributed_topology
 ```
 
 ### Make
@@ -87,6 +95,28 @@ cmake --build build-cuda
 
 At the moment this only validates the CUDA build path. Kernel implementations
 will be added after the LibTorch behavior is covered by golden tests.
+
+## Distributed Runtime
+
+The distributed runtime is being built around explicit DP/TP/PP topology:
+
+```text
+global_rank = ((data_rank * pipeline_parallel) + pipeline_rank) * tensor_parallel + tensor_rank
+```
+
+This keeps tensor-parallel groups contiguous so launchers can place them on
+NVLink/NVSwitch-connected GPUs. Data-parallel groups are intended for
+reduce-scatter/all-gather across replicas, and pipeline-parallel groups use
+send/recv between adjacent stages with micro-batching.
+
+The current CPU-buildable layer lives in:
+
+- `include/cverl/distributed/topology.h`
+- `include/cverl/distributed/collectives.h`
+- `docs/distributed-runtime.md`
+
+GPU builds should add an NCCL implementation behind the `Collectives` interface
+instead of hand-writing communication primitives.
 
 The `minimal_ppo_step` executable shows a native C++ PPO-style training step
 using a LibTorch model, optimizer, and `cverl` RL losses:
@@ -256,7 +286,8 @@ Planned tolerance for fp32 kernels:
 3. Add dtype support for `float16` and `bfloat16` where numerically appropriate.
 4. Add a native tensor/batch abstraction beyond simple 2D tensors.
 5. Connect the minimal trainer runtime to `Qwen35TextModel` log-prob generation.
-6. Add native model backend pieces using existing C++ APIs where possible:
+6. Add NCCL-backed collectives and shard Qwen3.5 with DP/TP/PP.
+7. Add native model backend pieces using existing C++ APIs where possible:
    optimizer/checkpointing via LibTorch, distributed collectives via NCCL, and
    attention/math via FlashAttention/cuBLAS/CUTLASS.
 
