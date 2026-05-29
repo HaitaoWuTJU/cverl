@@ -28,5 +28,10 @@ mean every low-level component should be rewritten from scratch.
 4. Runtime: native trainer, optimizer, checkpointing, rollout, and distributed
    execution.
 
+The `minimal_ppo_step` example shows the intended near-term integration style:
+LibTorch owns model parameters, autograd, and optimizer state while `cverl_torch`
+provides RL-specific losses and advantage computation. Once behavior is stable,
+hot kernels can be replaced by CUDA implementations behind the same tests.
+
 This lets us avoid depending on Python while still reusing C++ APIs from mature
 ML systems.

@@ -94,6 +94,7 @@ cmake -S . -B build-torch \
   -DCMAKE_PREFIX_PATH="$(python -c 'import torch; print(torch.utils.cmake_prefix_path)')"
 cmake --build build-torch
 ./build-torch/test_torch_backend
+./build-torch/minimal_ppo_step
 ```
 
 ## API Example
