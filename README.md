@@ -106,6 +106,21 @@ Checkpointing is available through the trainer API and CLI:
 ./build/toy_grpo_trainer 8 4 4 --load-prefix /tmp/cverl-toy
 ```
 
+## Hugging Face Downloads
+
+`cverl` provides a small C++ wrapper around the Python `huggingface_hub`
+download API. This keeps C++ training code in control while reusing Hugging
+Face's supported cache, auth, revision, and pattern filtering behavior.
+
+```sh
+./build/hf_download Qwen/Qwen3.5-0.8B --dry-run
+./build/hf_download Qwen/Qwen3.5-0.8B --local-dir ./models/Qwen3.5-0.8B
+```
+
+The wrapper requires `huggingface_hub` to be installed in the selected Python
+environment. Use `--python /path/to/python` if the default `python3` is not the
+right interpreter.
+
 ## API Example
 
 ```c

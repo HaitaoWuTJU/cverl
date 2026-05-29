@@ -12,6 +12,7 @@ find_package(Torch REQUIRED)
 
 add_library(cverl STATIC
   src/status.cc
+  src/hf_downloader.cc
   src/core_algos_c_api.cc
   src/torch/core_algos_torch.cc
   src/torch/simple_grpo_trainer.cc
@@ -19,6 +20,9 @@ add_library(cverl STATIC
 target_include_directories(cverl PUBLIC include)
 target_link_libraries(cverl PUBLIC "${TORCH_LIBRARIES}")
 target_compile_options(cverl PRIVATE ${TORCH_CXX_FLAGS})
+target_compile_definitions(cverl PRIVATE
+  CVERL_HF_DOWNLOAD_SCRIPT="${CMAKE_CURRENT_SOURCE_DIR}/tools/hf_snapshot_download.py"
+)
 
 if (CVERL_ENABLE_CUDA)
   enable_language(CUDA)
@@ -33,6 +37,9 @@ if (CVERL_BUILD_TESTS)
 
   add_executable(compare_golden tools/compare_golden.cc)
   target_link_libraries(compare_golden PRIVATE cverl)
+
+  add_executable(hf_download tools/hf_download.cc)
+  target_link_libraries(hf_download PRIVATE cverl)
 
   add_executable(test_torch_backend tests/torch/test_torch_backend.cc)
   target_link_libraries(test_torch_backend PRIVATE cverl)
