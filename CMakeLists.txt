@@ -199,4 +199,8 @@ if (CVERL_BUILD_TESTS)
   add_executable(hf_embedding_grpo_trainer examples/model/hf_embedding_grpo_trainer.cc)
   target_link_libraries(hf_embedding_grpo_trainer PRIVATE cverl)
   target_compile_options(hf_embedding_grpo_trainer PRIVATE ${TORCH_CXX_FLAGS})
+
+  add_executable(cverl_gsm8k_grpo_bench examples/bench/cverl_gsm8k_grpo_bench.cc)
+  target_link_libraries(cverl_gsm8k_grpo_bench PRIVATE cverl)
+  target_compile_options(cverl_gsm8k_grpo_bench PRIVATE ${TORCH_CXX_FLAGS})
 endif()

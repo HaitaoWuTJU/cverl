@@ -235,6 +235,33 @@ Use `--prompt-field` and `--answer-field` for datasets with different source
 column names. For compatibility with newer Hugging Face dataset repository
 names, the CLI maps `gsm8k` to `openai/gsm8k`.
 
+## GSM8K Speed Compare
+
+`tools/bench/compare_gsm8k_speed.sh` runs the same GSM8K GRPO/PPO micro-training
+workload through Python `verl` core algorithms and native `cverl` LibTorch code.
+Both sides use the same JSONL data, batch shape, seed, model dimensions, PPO
+epochs, and optimizer settings:
+
+```sh
+source /data/home/marvinhtwu/miniconda3/etc/profile.d/conda.sh
+conda activate verl-cpu
+
+PYTHON=$(which python) \
+VERL_DIR=../verl \
+STEPS=32 \
+PROMPTS=8 \
+RESPONSES=4 \
+SEQ_LEN=16 \
+ACTION_DIM=64 \
+HIDDEN_DIM=128 \
+PPO_EPOCHS=2 \
+tools/bench/compare_gsm8k_speed.sh
+```
+
+The script writes raw per-backend CSV metrics to `build/bench/` and prints
+`cverl_vs_verl_speedup`. Set `DEVICE=cuda:0` when both builds/environments
+support CUDA.
+
 ## HF Model Loading
 
 `cverl` can inspect a downloaded Hugging Face model directory from C++ and load
