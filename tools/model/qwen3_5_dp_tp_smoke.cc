@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
@@ -79,18 +80,28 @@ int main(int argc, char** argv) {
     auto dp_ranks = group_ranks(dp_size);
     cverl::distributed::ParallelGroup tp_group{tp_rank, tp_size, tp_ranks, &tp_comm};
 
-    bool qwen_ok = false;
+    bool qwen_ok = true;
     double max_abs = 0.0;
+    double mean_abs = 0.0;
+    int64_t qwen_cases = 0;
     {
       torch::NoGradGuard no_grad;
       cverl::HfModelLoader loader(model_dir);
       cverl::Qwen35TextModel model(std::move(loader));
       model.to(torch::Device(torch::kCUDA, static_cast<int>(device)));
-      auto ids = torch::tensor({1, 2}, torch::kLong).view({1, 2});
-      auto dense = model.forward_hidden(ids, layers);
-      auto tp = model.forward_hidden_tensor_parallel(ids, tp_group, layers);
-      qwen_ok = torch::allclose(dense, tp, 1.0e-4, 1.0e-4);
-      max_abs = (dense - tp).abs().max().item<double>();
+      std::vector<torch::Tensor> cases{
+          torch::tensor({1, 2}, torch::kLong).view({1, 2}),
+          torch::tensor({10, 11, 12, 13}, torch::kLong).view({1, 4}),
+      };
+      qwen_cases = static_cast<int64_t>(cases.size());
+      for (const auto& ids : cases) {
+        auto dense = model.forward_hidden(ids, layers);
+        auto tp = model.forward_hidden_tensor_parallel(ids, tp_group, layers);
+        auto diff = (dense - tp).abs();
+        qwen_ok = qwen_ok && torch::allclose(dense, tp, 1.0e-4, 1.0e-4);
+        max_abs = std::max(max_abs, diff.max().item<double>());
+        mean_abs = std::max(mean_abs, diff.mean().item<double>());
+      }
     }
 
     auto param = torch::ones({2, 3}, torch::TensorOptions()
@@ -114,7 +125,9 @@ int main(int argc, char** argv) {
         std::filesystem::remove(id_prefix + "_dp_" + std::to_string(t) + ".bin");
       }
       std::cout << "qwen3.5 dp/tp smoke dp=" << dp_size << " tp=" << tp_size << " layers=" << layers << "\n";
+      std::cout << "qwen_cases=" << qwen_cases << "\n";
       std::cout << "qwen_tp_max_abs=" << max_abs << "\n";
+      std::cout << "qwen_tp_mean_abs=" << mean_abs << "\n";
       std::cout << "qwen_tp_allclose=" << (qwen_ok ? "true" : "false") << "\n";
       std::cout << "dp_grad_allclose=" << (dp_ok ? "true" : "false") << "\n";
     }

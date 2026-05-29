@@ -48,6 +48,19 @@ void require_allclose(const torch::Tensor& actual, const torch::Tensor& expected
   }
 }
 
+template <typename Fn>
+void require_throws(Fn&& fn, const char* msg) {
+  bool failed = false;
+  try {
+    fn();
+  } catch (const std::invalid_argument&) {
+    failed = true;
+  }
+  if (!failed) {
+    throw std::runtime_error(msg);
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -75,6 +88,17 @@ int main(int argc, char** argv) {
     auto expected_mean = expected_sum / static_cast<double>(world);
     require_allclose(mean, expected_mean, "NCCL all_reduce mean mismatch");
 
+    auto maxed = comm.all_reduce(x, cverl::distributed::ReduceOp::Max, group);
+    auto expected_max = torch::full({4}, static_cast<float>(world),
+                                    torch::TensorOptions().device(torch::kCUDA, static_cast<int>(device)).dtype(torch::kFloat32));
+    require_allclose(maxed, expected_max, "NCCL all_reduce max mismatch");
+
+    auto matrix = torch::arange(8, torch::TensorOptions().device(torch::kCUDA, static_cast<int>(device)).dtype(torch::kFloat32))
+                      .reshape({2, 4});
+    require_throws(
+        [&]() { (void)comm.all_reduce(matrix.transpose(0, 1), cverl::distributed::ReduceOp::Sum, group); },
+        "NCCL all_reduce should reject non-contiguous tensors");
+
     auto gathered = comm.all_gather(torch::full({1, 2}, static_cast<float>(rank),
                                                 torch::TensorOptions().device(torch::kCUDA, static_cast<int>(device)).dtype(torch::kFloat32)),
                                     group, 0);
@@ -82,6 +106,8 @@ int main(int argc, char** argv) {
                                .view({world, 1})
                                .repeat({1, 2});
     require_allclose(gathered, expected_gather, "NCCL all_gather mismatch");
+    require_throws([&]() { (void)comm.all_gather(gathered.contiguous(), group, 1); },
+                   "NCCL all_gather should reject dim != 0");
 
     auto scatter_in = torch::full({world, 2}, static_cast<float>(rank + 1),
                                   torch::TensorOptions().device(torch::kCUDA, static_cast<int>(device)).dtype(torch::kFloat32));
@@ -89,6 +115,12 @@ int main(int argc, char** argv) {
     auto expected_scatter = torch::full({1, 2}, static_cast<float>(world * (world + 1) / 2),
                                         torch::TensorOptions().device(torch::kCUDA, static_cast<int>(device)).dtype(torch::kFloat32));
     require_allclose(scattered, expected_scatter, "NCCL reduce_scatter mismatch");
+
+    auto scattered_mean = comm.reduce_scatter(scatter_in, cverl::distributed::ReduceOp::Mean, group, 0);
+    auto expected_scatter_mean = expected_scatter / static_cast<double>(world);
+    require_allclose(scattered_mean, expected_scatter_mean, "NCCL reduce_scatter mean mismatch");
+    require_throws([&]() { (void)comm.reduce_scatter(scatter_in.contiguous(), cverl::distributed::ReduceOp::Sum, group, 1); },
+                   "NCCL reduce_scatter should reject dim != 0");
 
     torch::manual_seed(123);
     auto cpu_x = torch::randn({2, 3, 8});

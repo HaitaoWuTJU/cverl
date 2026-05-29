@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
@@ -68,17 +69,26 @@ int main(int argc, char** argv) {
     cverl::Qwen35TextModel model(std::move(loader));
     model.to(torch::Device(torch::kCUDA, static_cast<int>(device)));
 
-    auto ids = torch::tensor({1, 2}, torch::kLong).view({1, 2});
-    auto dense = model.forward_hidden(ids, layers);
-    auto tp = model.forward_hidden_tensor_parallel(ids, tp_group, layers);
-    auto diff = (dense - tp).abs();
-    double max_abs = diff.max().item<double>();
-    double mean_abs = diff.mean().item<double>();
-    bool ok = torch::allclose(dense, tp, 1.0e-4, 1.0e-4);
+    std::vector<torch::Tensor> cases{
+        torch::tensor({1, 2}, torch::kLong).view({1, 2}),
+        torch::tensor({10, 11, 12, 13}, torch::kLong).view({1, 4}),
+    };
+    double max_abs = 0.0;
+    double mean_abs = 0.0;
+    bool ok = true;
+    for (const auto& ids : cases) {
+      auto dense = model.forward_hidden(ids, layers);
+      auto tp = model.forward_hidden_tensor_parallel(ids, tp_group, layers);
+      auto diff = (dense - tp).abs();
+      max_abs = std::max(max_abs, diff.max().item<double>());
+      mean_abs = std::max(mean_abs, diff.mean().item<double>());
+      ok = ok && torch::allclose(dense, tp, 1.0e-4, 1.0e-4);
+    }
     comm.barrier();
     if (rank == 0) {
       std::filesystem::remove(id_path);
       std::cout << "qwen3.5 tp smoke layers=" << layers << " world=" << world << "\n";
+      std::cout << "cases=" << cases.size() << "\n";
       std::cout << "max_abs=" << max_abs << "\n";
       std::cout << "mean_abs=" << mean_abs << "\n";
       std::cout << "allclose=" << (ok ? "true" : "false") << "\n";
