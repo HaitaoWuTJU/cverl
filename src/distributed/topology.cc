@@ -114,6 +114,25 @@ ParallelRankInfo Topology::rank_info(int64_t rank) const {
   return info;
 }
 
+LayerRange Topology::pipeline_layer_range(int64_t num_layers, int64_t pipeline_rank) const {
+  if (num_layers < 0) {
+    throw std::invalid_argument("num_layers must be non-negative");
+  }
+  const int64_t pp = spec_.parallel.pipeline_parallel;
+  if (pipeline_rank < 0 || pipeline_rank >= pp) {
+    throw std::out_of_range("pipeline rank out of range");
+  }
+  int64_t base = num_layers / pp;
+  int64_t rem = num_layers % pp;
+  int64_t begin = pipeline_rank * base + std::min(pipeline_rank, rem);
+  int64_t count = base + (pipeline_rank < rem ? 1 : 0);
+  return LayerRange{begin, begin + count};
+}
+
+LayerRange Topology::local_pipeline_layer_range(int64_t num_layers) const {
+  return pipeline_layer_range(num_layers, local_rank_info().pipeline_rank);
+}
+
 std::map<std::string, std::string> Topology::nccl_env() const {
   std::map<std::string, std::string> env;
   env["NCCL_P2P_DISABLE"] = spec_.network.enable_p2p ? "0" : "1";

@@ -114,6 +114,18 @@ int main(int argc, char** argv) {
                                      torch::TensorOptions().device(mlp_x.device()).dtype(torch::kFloat32));
     require_allclose(param.grad(), expected_grad, "NCCL data-parallel gradient sync mismatch");
 
+    if (world >= 2) {
+      auto pipe_like = torch::empty({2, 2}, torch::TensorOptions().device(torch::kCUDA, static_cast<int>(device)).dtype(torch::kFloat32));
+      if (rank == 0) {
+        auto payload = torch::tensor({1.0f, 2.0f, 3.0f, 4.0f}, torch::TensorOptions().device(pipe_like.device())).reshape({2, 2});
+        comm.send(payload.contiguous(), 1);
+      } else if (rank == 1) {
+        auto received = comm.recv_like(pipe_like, 0);
+        auto expected = torch::tensor({1.0f, 2.0f, 3.0f, 4.0f}, torch::TensorOptions().device(pipe_like.device())).reshape({2, 2});
+        require_allclose(received, expected, "NCCL pipeline send/recv mismatch");
+      }
+    }
+
     comm.barrier();
     if (rank == 0) {
       std::filesystem::remove(id_path);

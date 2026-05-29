@@ -70,6 +70,19 @@ void test_nccl_env() {
   require(env.at("NCCL_ASYNC_ERROR_HANDLING") == "1", "async error handling");
 }
 
+void test_pipeline_layer_ranges() {
+  cverl::distributed::Topology topology(make_spec());
+  auto r0 = topology.pipeline_layer_range(24, 0);
+  auto r1 = topology.pipeline_layer_range(24, 1);
+  require(r0.begin == 0 && r0.end == 12, "pipeline range 0");
+  require(r1.begin == 12 && r1.end == 24, "pipeline range 1");
+
+  auto uneven0 = topology.pipeline_layer_range(25, 0);
+  auto uneven1 = topology.pipeline_layer_range(25, 1);
+  require(uneven0.begin == 0 && uneven0.end == 13, "pipeline uneven range 0");
+  require(uneven1.begin == 13 && uneven1.end == 25, "pipeline uneven range 1");
+}
+
 void test_invalid_configs() {
   auto spec = make_spec();
   spec.world_size = 15;
@@ -110,6 +123,7 @@ int main() {
   try {
     test_rank_mapping();
     test_nccl_env();
+    test_pipeline_layer_ranges();
     test_invalid_configs();
     test_single_process_collectives();
   } catch (const std::exception& e) {

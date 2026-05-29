@@ -65,6 +65,11 @@ struct ParallelRankInfo {
   std::vector<int64_t> pipeline_group;
 };
 
+struct LayerRange {
+  int64_t begin = 0;
+  int64_t end = 0;
+};
+
 class Topology {
  public:
   explicit Topology(ClusterSpec spec);
@@ -76,6 +81,8 @@ class Topology {
   ParallelRankInfo rank_info(int64_t rank) const;
   ParallelRankInfo local_rank_info() const { return rank_info(spec_.rank); }
   int64_t global_rank(int64_t data_rank, int64_t pipeline_rank, int64_t tensor_rank) const;
+  LayerRange pipeline_layer_range(int64_t num_layers, int64_t pipeline_rank) const;
+  LayerRange local_pipeline_layer_range(int64_t num_layers) const;
   std::map<std::string, std::string> nccl_env() const;
 
   void validate() const;
