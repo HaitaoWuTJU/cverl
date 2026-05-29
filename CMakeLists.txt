@@ -94,11 +94,14 @@ add_library(cverl STATIC
   src/model/qwen3_5_text.cc
   src/reward/gsm8k.cc
   src/rollout/http_transport.cc
+  src/rollout/rollout_batch.cc
   src/rollout/shared_memory.cc
   src/rollout/transport.cc
+  src/text/byte_tokenizer.cc
   src/core_algos_c_api.cc
   src/torch/core_algos_torch.cc
   src/torch/simple_grpo_trainer.cc
+  src/torch/tiny_causal_policy.cc
 )
 target_include_directories(cverl PUBLIC include)
 if (CVERL_HAS_SIMDJSON AND NOT simdjson_FOUND)
@@ -189,6 +192,17 @@ if (CVERL_BUILD_TESTS)
   add_executable(test_gsm8k_reward tests/reward/test_gsm8k_reward.cc)
   target_link_libraries(test_gsm8k_reward PRIVATE cverl)
 
+  add_executable(test_byte_tokenizer tests/text/test_byte_tokenizer.cc)
+  target_link_libraries(test_byte_tokenizer PRIVATE cverl)
+
+  add_executable(test_rollout_batch tests/rollout/test_rollout_batch.cc)
+  target_link_libraries(test_rollout_batch PRIVATE cverl)
+  target_compile_options(test_rollout_batch PRIVATE ${TORCH_CXX_FLAGS})
+
+  add_executable(test_gsm8k_grpo_smoke tests/rollout/test_gsm8k_grpo_smoke.cc)
+  target_link_libraries(test_gsm8k_grpo_smoke PRIVATE cverl)
+  target_compile_options(test_gsm8k_grpo_smoke PRIVATE ${TORCH_CXX_FLAGS})
+
   add_executable(test_distributed_topology tests/distributed/test_topology.cc)
   target_link_libraries(test_distributed_topology PRIVATE cverl)
   target_compile_options(test_distributed_topology PRIVATE ${TORCH_CXX_FLAGS})
@@ -229,4 +243,8 @@ if (CVERL_BUILD_TESTS)
 
   add_executable(gsm8k_rollout_pipeline examples/rollout/gsm8k_rollout_pipeline.cc)
   target_link_libraries(gsm8k_rollout_pipeline PRIVATE cverl)
+
+  add_executable(gsm8k_grpo_smoke examples/rollout/gsm8k_grpo_smoke.cc)
+  target_link_libraries(gsm8k_grpo_smoke PRIVATE cverl)
+  target_compile_options(gsm8k_grpo_smoke PRIVATE ${TORCH_CXX_FLAGS})
 endif()

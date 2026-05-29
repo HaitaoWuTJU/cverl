@@ -35,9 +35,10 @@ All transports implement `cverl::rollout::RolloutTransport`:
 Trainer code talks to the abstract base class. Replacing HTTP with
 shared-memory or CUDA IPC later does not require touching trainer logic.
 
-## Pipeline binary
+## Pipeline binaries
 
-`examples/rollout/gsm8k_rollout_pipeline.cc` exercises the boundary on CPU:
+`examples/rollout/gsm8k_rollout_pipeline.cc` exercises the upper half of the
+chain (rollout + reward, no trainer):
 
 ```
 gsm8k_rollout_pipeline \
@@ -47,10 +48,22 @@ gsm8k_rollout_pipeline \
   --reward-method strict
 ```
 
-The same binary can hit a real vLLM/SGLang server with
-`--transport http --base-url http://host:8000 --model <model-id>`. It loads the
-JSONL dataset, calls the transport, scores each generation with the GSM8K rule
-reward (`include/cverl/reward/gsm8k.h`), and prints throughput + reward stats.
+`examples/rollout/gsm8k_grpo_smoke.cc` runs the full closed loop on CPU:
+GSM8K -> RolloutTransport -> rule reward -> ByteTokenizer -> TinyCausalPolicy
+logprobs -> GRPO advantages -> PPO clipped step.
+
+```
+gsm8k_grpo_smoke \
+  --dataset path/to/gsm8k.jsonl \
+  --transport loopback \
+  --prompts 4 --n 4 --steps 4 \
+  --max-prompt-tokens 96 --max-response-tokens 64 \
+  --hidden-dim 16
+```
+
+Both binaries accept `--transport http --base-url http://host:8000 --model
+<model-id>` to drive a real vLLM/SGLang server. The trainer code (advantage
+computation, PPO loss, optimizer step) does not change between transports.
 
 ## Tests
 
@@ -62,6 +75,13 @@ reward (`include/cverl/reward/gsm8k.h`), and prints throughput + reward stats.
   parsing and per-prompt routing.
 - `tests/reward/test_gsm8k_reward.cc` — strict + flexible extraction, ground
   truth normalization, and end-to-end reward scoring.
+- `tests/text/test_byte_tokenizer.cc` — encode/decode round trip, BOS/EOS,
+  truncation, non-ASCII bytes.
+- `tests/rollout/test_rollout_batch.cc` — tokenized batch shape, left-padded
+  prompts, right-padded responses, mask alignment, reward routing.
+- `tests/rollout/test_gsm8k_grpo_smoke.cc` — fake rollout response ->
+  TinyCausalPolicy logprobs -> one PPO step; asserts finite loss and that
+  parameters actually moved.
 
 All tests are wired into `make test` and run on CPU only.
 

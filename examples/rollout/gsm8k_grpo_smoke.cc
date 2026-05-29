@@ -1,0 +1,275 @@
+// gsm8k_grpo_smoke
+//
+// End-to-end smoke for the rollout-driven GRPO loop on CPU:
+//   GSM8K JSONL  ->  RolloutTransport (loopback or HTTP)
+//                 ->  GSM8K rule reward
+//                 ->  ByteTokenizer (CPU fallback)
+//                 ->  TinyCausalPolicy logprobs
+//                 ->  GRPO advantages -> PPO clipped step
+//
+// On real GPU runs the transport switches to HTTP/shm, the tokenizer to the
+// HF tokenizer, and the policy to the production model. The trainer code in
+// between (advantages + PPO loss + step) is unchanged.
+#include "cverl/data/hf_dataset.h"
+#include "cverl/reward/gsm8k.h"
+#include "cverl/rollout/http_transport.h"
+#include "cverl/rollout/rollout_batch.h"
+#include "cverl/rollout/transport.h"
+#include "cverl/text/byte_tokenizer.h"
+#include "cverl/torch/core_algos_torch.h"
+#include "cverl/torch/tiny_causal_policy.h"
+
+#include <torch/torch.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <cstdlib>
+#include <iomanip>
+#include <iostream>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace {
+
+struct Args {
+  std::string dataset;
+  std::string transport = "loopback";
+  std::string base_url;
+  std::string endpoint = "completions";
+  std::string api_key;
+  std::string model;
+  std::string system_prompt;
+  std::string loopback_suffix = " #### 0";
+  int64_t prompts_per_batch = 4;
+  uint32_t n = 4;
+  int64_t steps = 4;
+  int64_t ppo_epochs = 2;
+  int64_t max_prompt_tokens = 128;
+  int64_t max_response_tokens = 128;
+  int64_t hidden_dim = 32;
+  uint32_t max_tokens = 128;
+  double temperature = 1.0;
+  double top_p = 1.0;
+  double clip_ratio = 0.2;
+  double learning_rate = 3.0e-3;
+  uint64_t seed = 17;
+  cverl::reward::Gsm8kExtractionMethod reward_method = cverl::reward::Gsm8kExtractionMethod::Strict;
+};
+
+const char* require_value(int& i, int argc, char** argv, const char* name) {
+  if (i + 1 >= argc) {
+    throw std::invalid_argument(std::string(name) + " requires a value");
+  }
+  return argv[++i];
+}
+
+Args parse_args(int argc, char** argv) {
+  Args args;
+  for (int i = 1; i < argc; ++i) {
+    std::string a = argv[i];
+    if (a == "--dataset") {
+      args.dataset = require_value(i, argc, argv, "--dataset");
+    } else if (a == "--transport") {
+      args.transport = require_value(i, argc, argv, "--transport");
+    } else if (a == "--base-url") {
+      args.base_url = require_value(i, argc, argv, "--base-url");
+    } else if (a == "--endpoint") {
+      args.endpoint = require_value(i, argc, argv, "--endpoint");
+    } else if (a == "--api-key") {
+      args.api_key = require_value(i, argc, argv, "--api-key");
+    } else if (a == "--model") {
+      args.model = require_value(i, argc, argv, "--model");
+    } else if (a == "--system-prompt") {
+      args.system_prompt = require_value(i, argc, argv, "--system-prompt");
+    } else if (a == "--loopback-suffix") {
+      args.loopback_suffix = require_value(i, argc, argv, "--loopback-suffix");
+    } else if (a == "--prompts") {
+      args.prompts_per_batch = std::strtoll(require_value(i, argc, argv, "--prompts"), nullptr, 10);
+    } else if (a == "--n") {
+      args.n = static_cast<uint32_t>(std::strtoul(require_value(i, argc, argv, "--n"), nullptr, 10));
+    } else if (a == "--steps") {
+      args.steps = std::strtoll(require_value(i, argc, argv, "--steps"), nullptr, 10);
+    } else if (a == "--ppo-epochs") {
+      args.ppo_epochs = std::strtoll(require_value(i, argc, argv, "--ppo-epochs"), nullptr, 10);
+    } else if (a == "--max-prompt-tokens") {
+      args.max_prompt_tokens = std::strtoll(require_value(i, argc, argv, "--max-prompt-tokens"), nullptr, 10);
+    } else if (a == "--max-response-tokens") {
+      args.max_response_tokens = std::strtoll(require_value(i, argc, argv, "--max-response-tokens"), nullptr, 10);
+    } else if (a == "--hidden-dim") {
+      args.hidden_dim = std::strtoll(require_value(i, argc, argv, "--hidden-dim"), nullptr, 10);
+    } else if (a == "--max-tokens") {
+      args.max_tokens = static_cast<uint32_t>(std::strtoul(require_value(i, argc, argv, "--max-tokens"), nullptr, 10));
+    } else if (a == "--temperature") {
+      args.temperature = std::strtod(require_value(i, argc, argv, "--temperature"), nullptr);
+    } else if (a == "--top-p") {
+      args.top_p = std::strtod(require_value(i, argc, argv, "--top-p"), nullptr);
+    } else if (a == "--clip-ratio") {
+      args.clip_ratio = std::strtod(require_value(i, argc, argv, "--clip-ratio"), nullptr);
+    } else if (a == "--lr") {
+      args.learning_rate = std::strtod(require_value(i, argc, argv, "--lr"), nullptr);
+    } else if (a == "--seed") {
+      args.seed = static_cast<uint64_t>(std::strtoull(require_value(i, argc, argv, "--seed"), nullptr, 10));
+    } else if (a == "--reward-method") {
+      std::string m = require_value(i, argc, argv, "--reward-method");
+      if (m == "strict") {
+        args.reward_method = cverl::reward::Gsm8kExtractionMethod::Strict;
+      } else if (m == "flexible") {
+        args.reward_method = cverl::reward::Gsm8kExtractionMethod::Flexible;
+      } else {
+        throw std::invalid_argument("--reward-method must be strict|flexible");
+      }
+    } else {
+      throw std::invalid_argument("unknown argument: " + a);
+    }
+  }
+  if (args.dataset.empty()) {
+    throw std::invalid_argument("--dataset is required");
+  }
+  if (args.prompts_per_batch <= 0 || args.n == 0 || args.steps <= 0 || args.ppo_epochs <= 0) {
+    throw std::invalid_argument("invalid batch shape");
+  }
+  if (args.transport == "http" && args.base_url.empty()) {
+    throw std::invalid_argument("--transport http requires --base-url");
+  }
+  return args;
+}
+
+std::unique_ptr<cverl::rollout::RolloutTransport> build_transport(const Args& args) {
+  if (args.transport == "loopback") {
+    cverl::rollout::LoopbackRolloutTransport::Options opts;
+    opts.completion_suffix = args.loopback_suffix;
+    return std::make_unique<cverl::rollout::LoopbackRolloutTransport>(opts);
+  }
+  if (args.transport == "http") {
+    cverl::rollout::HttpRolloutOptions opts;
+    opts.base_url = args.base_url;
+    opts.endpoint = args.endpoint;
+    opts.api_key = args.api_key;
+    opts.model = args.model;
+    opts.system_prompt = args.system_prompt;
+    return std::make_unique<cverl::rollout::HttpRolloutTransport>(std::move(opts));
+  }
+  throw std::invalid_argument("unsupported transport: " + args.transport);
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  try {
+    Args args = parse_args(argc, argv);
+    torch::manual_seed(static_cast<int64_t>(args.seed));
+
+    cverl::data::JsonlDatasetOptions dataset_opts;
+    dataset_opts.path = args.dataset;
+    auto data = cverl::data::load_prompt_answer_jsonl(dataset_opts);
+    if (data.empty()) {
+      throw std::runtime_error("dataset is empty");
+    }
+
+    auto transport = build_transport(args);
+    cverl::text::ByteTokenizer tokenizer;
+    cverl::reward::Gsm8kRewardOptions reward_opts;
+    reward_opts.method = args.reward_method;
+
+    cverl::torch_backend::TinyCausalPolicy policy(
+        cverl::text::ByteTokenizer::vocab_size(),
+        args.hidden_dim,
+        cverl::text::ByteTokenizer::pad_id());
+    torch::optim::AdamW optimizer(policy->parameters(), torch::optim::AdamWOptions(args.learning_rate));
+
+    std::cout << "step,transport,total_seq,mean_reward,success_rate,no_answer,loss,ppo_kl,clipfrac,seconds\n";
+
+    for (int64_t step = 1; step <= args.steps; ++step) {
+      // Build the per-step batch from the dataset.
+      int64_t take = std::min<int64_t>(args.prompts_per_batch, static_cast<int64_t>(data.size()));
+      std::vector<std::string> prompts;
+      std::vector<std::string> ground_truths;
+      prompts.reserve(take);
+      ground_truths.reserve(take);
+      for (int64_t i = 0; i < take; ++i) {
+        size_t idx = static_cast<size_t>(((step - 1) * args.prompts_per_batch + i) % data.size());
+        prompts.push_back(data[idx].prompt);
+        ground_truths.push_back(data[idx].answer);
+      }
+
+      cverl::rollout::RolloutRequest req;
+      req.prompts = prompts;
+      req.n = args.n;
+      req.max_tokens = args.max_tokens;
+      req.temperature = args.temperature;
+      req.top_p = args.top_p;
+      req.seed = args.seed + static_cast<uint64_t>(step);
+      req.model = args.model;
+
+      auto t0 = std::chrono::steady_clock::now();
+      auto resp = transport->generate(req);
+      auto t1 = std::chrono::steady_clock::now();
+
+      cverl::rollout::RolloutBatchOptions batch_opts;
+      batch_opts.max_prompt_tokens = args.max_prompt_tokens;
+      batch_opts.max_response_tokens = args.max_response_tokens;
+      auto batch = cverl::rollout::build_gsm8k_rollout_batch(
+          resp, prompts, ground_truths, reward_opts, tokenizer, batch_opts);
+
+      // GRPO advantages from the rule reward.
+      torch::Tensor returns;
+      torch::Tensor advantages = cverl::torch_backend::grpo_outcome_advantage(
+          batch.token_rewards, batch.response_mask, batch.group_ids, 1.0e-6, true, &returns);
+
+      // Old log probs under the current policy (frozen for this step).
+      torch::Tensor old_log_probs;
+      {
+        torch::NoGradGuard no_grad;
+        torch::Tensor logits = policy->forward(batch.prompt_ids, batch.response_ids);
+        old_log_probs = cverl::torch_backend::response_log_probs(logits, batch.response_ids).detach();
+      }
+
+      double last_loss = 0.0;
+      double last_kl = 0.0;
+      double last_clipfrac = 0.0;
+      for (int64_t epoch = 0; epoch < args.ppo_epochs; ++epoch) {
+        torch::Tensor logits = policy->forward(batch.prompt_ids, batch.response_ids);
+        torch::Tensor log_probs = cverl::torch_backend::response_log_probs(logits, batch.response_ids);
+        auto loss = cverl::torch_backend::ppo_clipped_loss(
+            old_log_probs, log_probs, advantages, batch.response_mask,
+            args.clip_ratio, -1.0, -1.0, 3.0, CVERL_LOSS_AGG_TOKEN_MEAN);
+        optimizer.zero_grad();
+        loss.pg_loss.backward();
+        optimizer.step();
+
+        last_loss = loss.pg_loss.item<double>();
+        last_kl = loss.ppo_kl.item<double>();
+        last_clipfrac = loss.pg_clipfrac.item<double>();
+      }
+
+      // Reporting.
+      double mean_reward = batch.scalar_rewards.mean().item<double>();
+      double success_rate = (batch.scalar_rewards >= reward_opts.correct_score - 1e-6).to(torch::kFloat32).mean().item<double>();
+      int64_t no_answer = 0;
+      for (const auto& text : batch.response_texts) {
+        if (!cverl::reward::extract_gsm8k_answer(text, reward_opts).has_value()) {
+          ++no_answer;
+        }
+      }
+      double seconds = std::chrono::duration<double>(t1 - t0).count();
+
+      std::cout << step << ","
+                << transport->name() << ","
+                << batch.scalar_rewards.size(0) << ","
+                << std::fixed << std::setprecision(6) << mean_reward << ","
+                << success_rate << ","
+                << no_answer << ","
+                << last_loss << ","
+                << last_kl << ","
+                << last_clipfrac << ","
+                << seconds << "\n";
+    }
+    return 0;
+  } catch (const std::exception& e) {
+    std::cerr << "gsm8k_grpo_smoke failed: " << e.what() << "\n";
+    return 1;
+  }
+}
