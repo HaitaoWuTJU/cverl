@@ -152,6 +152,17 @@ single-tensor or full-weight loading into LibTorch tensors.
 ./build/qwen3_5_forward ./models/Qwen3.5-0.8B --tokens 1,2 --layers 24 --logits
 ```
 
+CPU correctness can be checked against Hugging Face Transformers:
+
+```sh
+python tools/model/compare_qwen3_5_forward.py ./models/Qwen3.5-0.8B --tokens 1,2 --layers 24
+python tools/model/compare_qwen3_5_forward.py ./models/Qwen3.5-0.8B --tokens 1,2 --layers 24 --logits
+```
+
+The comparison script runs the C++ executable, dumps the C++ output to a small
+binary tensor format, runs the same input through Hugging Face on CPU, and
+reports max/mean absolute error plus top-k token agreement for logits.
+
 Implemented pieces:
 
 - `embed_tokens`
@@ -167,8 +178,7 @@ Current limitations:
 
 - text-only path; vision/multimodal modules are not wired yet
 - prefill/no-cache forward; incremental KV/recurrent cache is not implemented yet
-- correctness is smoke-tested against real weights; Python golden comparison for full
-  Qwen3.5 logits is still pending
+- correctness is checked against Hugging Face CPU forward for hidden states and logits
 - CPU path is intended for validation, not performance
 
 The current runnable HF-weight RL smoke uses Qwen embeddings as the policy input
