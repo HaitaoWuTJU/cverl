@@ -81,6 +81,18 @@ cverl_status_t cverl_ppo_clipped_loss_f32_cpu(
     cverl_loss_agg_mode_t agg_mode,
     cverl_ppo_loss_result_t* out);
 
+cverl_status_t cverl_ppo_clipped_loss_backward_f32_cpu(
+    cverl_const_tensor2d_t old_log_prob,
+    cverl_const_tensor2d_t log_prob,
+    cverl_const_tensor2d_t advantages,
+    cverl_const_tensor2d_t response_mask,
+    float clip_ratio,
+    float clip_ratio_low,
+    float clip_ratio_high,
+    float clip_ratio_c,
+    cverl_loss_agg_mode_t agg_mode,
+    cverl_tensor2d_t grad_log_prob);
+
 #ifdef __cplusplus
 }
 #endif

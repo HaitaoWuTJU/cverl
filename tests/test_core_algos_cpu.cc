@@ -149,6 +149,28 @@ void test_ppo_loss() {
   require_close(result.pg_clipfrac, 1.0f / 3.0f, 1.0e-6f, "ppo clipfrac");
 }
 
+void test_ppo_loss_backward() {
+  std::vector<float> old_lp{0.0f, 0.0f, 0.0f, 0.0f};
+  std::vector<float> lp{std::log(1.1f), std::log(1.5f), std::log(0.9f), std::log(0.5f)};
+  std::vector<float> adv{1.0f, 1.0f, -1.0f, -1.0f};
+  std::vector<float> mask{1.0f, 1.0f, 1.0f, 0.0f};
+  std::vector<float> grad(4);
+  require_status(
+      cverl_ppo_clipped_loss_backward_f32_cpu(
+          ct(old_lp, 2, 2),
+          ct(lp, 2, 2),
+          ct(adv, 2, 2),
+          ct(mask, 2, 2),
+          0.2f,
+          -1.0f,
+          -1.0f,
+          3.0f,
+          CVERL_LOSS_AGG_TOKEN_MEAN,
+          mt(grad, 2, 2)),
+      "ppo backward");
+  require_vec_close(grad, {-1.1f / 3.0f, 0.0f, 0.9f / 3.0f, 0.0f}, 1.0e-6f, "ppo grad");
+}
+
 }  // namespace
 
 int main() {
@@ -157,6 +179,7 @@ int main() {
   test_gae();
   test_grpo();
   test_ppo_loss();
+  test_ppo_loss_backward();
   std::cout << "cverl CPU core algos tests passed\n";
   return 0;
 }

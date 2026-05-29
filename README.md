@@ -18,6 +18,7 @@ Implemented CPU reference kernels:
 - GAE advantage and returns
 - GRPO outcome advantage
 - PPO clipped policy loss
+- PPO clipped policy loss backward gradient for `log_prob`
 
 Current tensor support:
 

@@ -124,6 +124,90 @@ float aggregate_loss(
   return static_cast<float>(seq_acc / (seq_count + static_cast<double>(kEps)));
 }
 
+float aggregate_grad_scale(
+    const float* mask,
+    int64_t rows,
+    int64_t cols,
+    int64_t row,
+    int64_t col,
+    cverl_loss_agg_mode_t mode) {
+  const int64_t i = row * cols + col;
+  if (mask[i] == 0.0f) {
+    return 0.0f;
+  }
+
+  if (mode == CVERL_LOSS_AGG_TOKEN_MEAN) {
+    return mask[i] / (mask_sum_raw(mask, rows * cols) + kEps);
+  }
+
+  double seq_count = 0.0;
+  for (int64_t r = 0; r < rows; ++r) {
+    double token_count = 0.0;
+    for (int64_t c = 0; c < cols; ++c) {
+      token_count += static_cast<double>(mask[r * cols + c]);
+    }
+    if (token_count > 0.0) {
+      seq_count += 1.0;
+    }
+  }
+
+  if (mode == CVERL_LOSS_AGG_SEQ_MEAN_TOKEN_SUM) {
+    return static_cast<float>(static_cast<double>(mask[i]) / (seq_count + static_cast<double>(kEps)));
+  }
+
+  if (mode == CVERL_LOSS_AGG_SEQ_MEAN_TOKEN_MEAN) {
+    double row_tokens = 0.0;
+    for (int64_t c = 0; c < cols; ++c) {
+      row_tokens += static_cast<double>(mask[row * cols + c]);
+    }
+    if (row_tokens == 0.0) {
+      return 0.0f;
+    }
+    return static_cast<float>(
+        static_cast<double>(mask[i]) / ((seq_count + static_cast<double>(kEps)) * row_tokens));
+  }
+
+  return 0.0f;
+}
+
+float ppo_token_loss_grad(
+    float old_log_prob,
+    float log_prob,
+    float advantage,
+    float clip_ratio_low,
+    float clip_ratio_high,
+    float clip_ratio_c) {
+  const float raw_x = log_prob - old_log_prob;
+  const float x = std::clamp(raw_x, -20.0f, 20.0f);
+  const bool x_has_grad = raw_x >= -20.0f && raw_x <= 20.0f;
+  const float ratio = std::exp(x);
+
+  const float loss1 = -advantage * ratio;
+  const float clipped_ratio = std::clamp(ratio, 1.0f - clip_ratio_low, 1.0f + clip_ratio_high);
+  const float loss2 = -advantage * clipped_ratio;
+  const bool ratio_unclipped = ratio >= 1.0f - clip_ratio_low && ratio <= 1.0f + clip_ratio_high;
+  const bool choose_loss1 = loss1 >= loss2;
+
+  float grad = 0.0f;
+  if (choose_loss1) {
+    grad = -advantage * ratio;
+  } else if (ratio_unclipped) {
+    grad = -advantage * ratio;
+  } else {
+    grad = 0.0f;
+  }
+
+  if (advantage < 0.0f) {
+    const float clipped_loss1 = std::max(loss1, loss2);
+    const float loss3 = -advantage * clip_ratio_c;
+    if (loss3 < clipped_loss1) {
+      grad = 0.0f;
+    }
+  }
+
+  return x_has_grad ? grad : 0.0f;
+}
+
 }  // namespace
 
 extern "C" cverl_status_t cverl_masked_sum_f32_cpu(
@@ -420,5 +504,61 @@ extern "C" cverl_status_t cverl_ppo_clipped_loss_f32_cpu(
   out->pg_clipfrac = masked_mean_raw(clipfrac.data(), mask, n);
   out->ppo_kl = masked_mean_raw(ppo_kl.data(), mask, n);
   out->pg_clipfrac_lower = masked_mean_raw(clipfrac_lower.data(), mask, n);
+  return CVERL_OK;
+}
+
+extern "C" cverl_status_t cverl_ppo_clipped_loss_backward_f32_cpu(
+    cverl_const_tensor2d_t old_log_prob,
+    cverl_const_tensor2d_t log_prob,
+    cverl_const_tensor2d_t advantages,
+    cverl_const_tensor2d_t response_mask,
+    float clip_ratio,
+    float clip_ratio_low,
+    float clip_ratio_high,
+    float clip_ratio_c,
+    cverl_loss_agg_mode_t agg_mode,
+    cverl_tensor2d_t grad_log_prob) {
+  if (clip_ratio_c <= 1.0f) {
+    return CVERL_ERR_INVALID_ARGUMENT;
+  }
+  if (clip_ratio_low < 0.0f) {
+    clip_ratio_low = clip_ratio;
+  }
+  if (clip_ratio_high < 0.0f) {
+    clip_ratio_high = clip_ratio;
+  }
+  cverl_status_t status = validate_binary(old_log_prob, log_prob);
+  if (status != CVERL_OK) {
+    return status;
+  }
+  status = validate_binary(old_log_prob, advantages);
+  if (status != CVERL_OK) {
+    return status;
+  }
+  status = validate_binary(old_log_prob, response_mask);
+  if (status != CVERL_OK) {
+    return status;
+  }
+  status = validate_out(old_log_prob, grad_log_prob);
+  if (status != CVERL_OK) {
+    return status;
+  }
+
+  const int64_t rows = old_log_prob.rows;
+  const int64_t cols = old_log_prob.cols;
+  const float* old_lp = ptr(old_log_prob);
+  const float* lp = ptr(log_prob);
+  const float* adv = ptr(advantages);
+  const float* mask = ptr(response_mask);
+  float* grad = ptr(grad_log_prob);
+
+  for (int64_t r = 0; r < rows; ++r) {
+    for (int64_t c = 0; c < cols; ++c) {
+      const int64_t i = r * cols + c;
+      const float token_grad = ppo_token_loss_grad(
+          old_lp[i], lp[i], adv[i], clip_ratio_low, clip_ratio_high, clip_ratio_c);
+      grad[i] = token_grad * aggregate_grad_scale(mask, rows, cols, r, c, agg_mode);
+    }
+  }
   return CVERL_OK;
 }
