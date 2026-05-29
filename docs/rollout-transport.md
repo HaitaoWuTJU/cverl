@@ -21,12 +21,47 @@ internal GPU tensors or NCCL communicators. Direct NCCL/RDMA transfer therefore
 requires a custom worker/plugin/sidecar in the rollout process. Without that
 cooperation, cverl can only optimize the client side around HTTP.
 
-The current code provides the POSIX shared-memory foundation:
+## Abstraction
 
-- `include/cverl/rollout/shared_memory.h`
-- `src/rollout/shared_memory.cc`
-- `tests/rollout/test_shared_memory.cc`
+All transports implement `cverl::rollout::RolloutTransport`:
 
-This is intended for structured CPU-side payloads. CUDA IPC and NCCL transport
-should be implemented behind the same rollout transport boundary rather than
-inside trainer logic.
+- `include/cverl/rollout/transport.h`  — `RolloutRequest`, `RolloutResponse`,
+  abstract base class, plus `LoopbackRolloutTransport` for tests.
+- `include/cverl/rollout/http_transport.h` — `HttpRolloutTransport`, libcurl
+  client for OpenAI-compatible `/v1/completions` and `/v1/chat/completions`.
+- `include/cverl/rollout/shared_memory.h` — POSIX shared-memory primitive for
+  local sidecars (CPU-side payloads).
+
+Trainer code talks to the abstract base class. Replacing HTTP with
+shared-memory or CUDA IPC later does not require touching trainer logic.
+
+## Pipeline binary
+
+`examples/rollout/gsm8k_rollout_pipeline.cc` exercises the boundary on CPU:
+
+```
+gsm8k_rollout_pipeline \
+  --dataset path/to/gsm8k.jsonl \
+  --transport loopback \
+  --prompts 4 --n 4 \
+  --reward-method strict
+```
+
+The same binary can hit a real vLLM/SGLang server with
+`--transport http --base-url http://host:8000 --model <model-id>`. It loads the
+JSONL dataset, calls the transport, scores each generation with the GSM8K rule
+reward (`include/cverl/reward/gsm8k.h`), and prints throughput + reward stats.
+
+## Tests
+
+- `tests/rollout/test_shared_memory.cc` — cross-process POSIX shm round-trip.
+- `tests/rollout/test_transport.cc` — abstract interface + loopback transport.
+- `tests/rollout/test_http_transport.cc` — drives `HttpRolloutTransport`
+  against a tiny in-process loopback HTTP server that emulates the
+  `/v1/completions` response shape, verifying request body fields, response
+  parsing and per-prompt routing.
+- `tests/reward/test_gsm8k_reward.cc` — strict + flexible extraction, ground
+  truth normalization, and end-to-end reward scoring.
+
+All tests are wired into `make test` and run on CPU only.
+

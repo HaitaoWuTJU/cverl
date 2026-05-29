@@ -10,6 +10,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(Torch REQUIRED)
+find_package(Threads REQUIRED)
 
 find_package(simdjson CONFIG QUIET
   HINTS
@@ -36,10 +37,11 @@ if (simdjson_FOUND OR (SIMDJSON_INCLUDE_DIR AND SIMDJSON_LIBRARY))
   set(CVERL_HAS_SIMDJSON ON)
 endif()
 
-if (NOT CVERL_HAS_SIMDJSON)
-  find_package(nlohmann_json QUIET)
-endif()
-if (NOT CVERL_HAS_SIMDJSON AND NOT nlohmann_json_FOUND)
+# nlohmann/json is always required (HTTP rollout transport needs to emit
+# JSON, which simdjson cannot do). simdjson is preferred for the JSONL
+# dataset loader hot path when available.
+find_package(nlohmann_json QUIET)
+if (NOT nlohmann_json_FOUND)
   find_path(NLOHMANN_JSON_INCLUDE_DIR nlohmann/json.hpp
     HINTS
       "$ENV{CONDA_PREFIX}/include"
@@ -47,9 +49,12 @@ if (NOT CVERL_HAS_SIMDJSON AND NOT nlohmann_json_FOUND)
       "$ENV{HOME}/miniconda3/envs/verl-cpu/include"
   )
   if (NOT NLOHMANN_JSON_INCLUDE_DIR)
-    message(FATAL_ERROR "simdjson or nlohmann/json.hpp is required for JSONL dataset loading.")
+    message(FATAL_ERROR "nlohmann/json.hpp is required (header at ${NLOHMANN_JSON_INCLUDE_DIR}).")
   endif()
 endif()
+
+# libcurl powers the HTTP rollout transport.
+find_package(CURL REQUIRED)
 
 if (CVERL_ENABLE_NCCL)
   find_package(Python COMPONENTS Interpreter REQUIRED)
@@ -87,7 +92,10 @@ add_library(cverl STATIC
   src/distributed/topology.cc
   src/model/hf_model_loader.cc
   src/model/qwen3_5_text.cc
+  src/reward/gsm8k.cc
+  src/rollout/http_transport.cc
   src/rollout/shared_memory.cc
+  src/rollout/transport.cc
   src/core_algos_c_api.cc
   src/torch/core_algos_torch.cc
   src/torch/simple_grpo_trainer.cc
@@ -96,7 +104,7 @@ target_include_directories(cverl PUBLIC include)
 if (CVERL_HAS_SIMDJSON AND NOT simdjson_FOUND)
   target_include_directories(cverl PUBLIC ${SIMDJSON_INCLUDE_DIR})
 endif()
-if (NOT CVERL_HAS_SIMDJSON AND NOT nlohmann_json_FOUND)
+if (NOT nlohmann_json_FOUND)
   target_include_directories(cverl PUBLIC ${NLOHMANN_JSON_INCLUDE_DIR})
 endif()
 target_link_libraries(cverl PUBLIC "${TORCH_LIBRARIES}")
@@ -107,9 +115,11 @@ if (CVERL_HAS_SIMDJSON)
   else()
     target_link_libraries(cverl PUBLIC ${SIMDJSON_LIBRARY})
   endif()
-elseif (nlohmann_json_FOUND)
+endif()
+if (nlohmann_json_FOUND)
   target_link_libraries(cverl PUBLIC nlohmann_json::nlohmann_json)
 endif()
+target_link_libraries(cverl PUBLIC CURL::libcurl)
 target_compile_options(cverl PRIVATE ${TORCH_CXX_FLAGS})
 target_compile_definitions(cverl PRIVATE
   CVERL_HF_DOWNLOAD_SCRIPT="${CMAKE_CURRENT_SOURCE_DIR}/tools/hf_snapshot_download.py"
@@ -170,6 +180,15 @@ if (CVERL_BUILD_TESTS)
   add_executable(test_rollout_shared_memory tests/rollout/test_shared_memory.cc)
   target_link_libraries(test_rollout_shared_memory PRIVATE cverl)
 
+  add_executable(test_rollout_transport tests/rollout/test_transport.cc)
+  target_link_libraries(test_rollout_transport PRIVATE cverl)
+
+  add_executable(test_rollout_http_transport tests/rollout/test_http_transport.cc)
+  target_link_libraries(test_rollout_http_transport PRIVATE cverl Threads::Threads)
+
+  add_executable(test_gsm8k_reward tests/reward/test_gsm8k_reward.cc)
+  target_link_libraries(test_gsm8k_reward PRIVATE cverl)
+
   add_executable(test_distributed_topology tests/distributed/test_topology.cc)
   target_link_libraries(test_distributed_topology PRIVATE cverl)
   target_compile_options(test_distributed_topology PRIVATE ${TORCH_CXX_FLAGS})
@@ -207,4 +226,7 @@ if (CVERL_BUILD_TESTS)
   add_executable(cverl_gsm8k_grpo_bench examples/bench/cverl_gsm8k_grpo_bench.cc)
   target_link_libraries(cverl_gsm8k_grpo_bench PRIVATE cverl)
   target_compile_options(cverl_gsm8k_grpo_bench PRIVATE ${TORCH_CXX_FLAGS})
+
+  add_executable(gsm8k_rollout_pipeline examples/rollout/gsm8k_rollout_pipeline.cc)
+  target_link_libraries(gsm8k_rollout_pipeline PRIVATE cverl)
 endif()

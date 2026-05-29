@@ -17,6 +17,9 @@ test: all
 	./$(BUILD_DIR)/test_simple_grpo_trainer
 	./$(BUILD_DIR)/test_hf_dataset
 	./$(BUILD_DIR)/test_rollout_shared_memory
+	./$(BUILD_DIR)/test_rollout_transport
+	./$(BUILD_DIR)/test_rollout_http_transport
+	./$(BUILD_DIR)/test_gsm8k_reward
 	./$(BUILD_DIR)/test_distributed_topology
 	./$(BUILD_DIR)/test_parallel_ops
 
