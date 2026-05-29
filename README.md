@@ -58,6 +58,7 @@ cmake -S . -B build \
 cmake --build build
 ./build/test_core_algos_cpu
 ./build/test_torch_backend
+./build/test_simple_grpo_trainer
 ```
 
 ### Make
@@ -86,6 +87,17 @@ using a LibTorch model, optimizer, and `cverl` RL losses:
 ```sh
 ./build/minimal_ppo_step
 ```
+
+The `toy_grpo_trainer` executable runs a complete synthetic GRPO/PPO training
+loop in C++:
+
+```sh
+./build/toy_grpo_trainer 32
+```
+
+It creates toy prompts, samples responses from a LibTorch policy, computes an
+accuracy reward, builds GRPO advantages, applies PPO updates, and prints CSV
+metrics.
 
 ## API Example
 

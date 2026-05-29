@@ -35,5 +35,15 @@ while `cverl` provides RL-specific losses and advantage computation. Once
 behavior is stable, hot kernels can be replaced by CUDA implementations behind
 the same tests.
 
+The `toy_grpo_trainer` executable is the current runnable training nucleus. It
+uses synthetic prompts and rewards, but exercises the full C++ loop:
+
+- rollout sampling from a LibTorch policy
+- reward computation
+- GRPO advantage construction
+- PPO loss and backward
+- optimizer step
+- scalar metrics
+
 This lets us avoid depending on Python while still reusing C++ APIs from mature
 ML systems.

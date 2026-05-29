@@ -14,6 +14,7 @@ add_library(cverl STATIC
   src/status.cc
   src/core_algos_c_api.cc
   src/torch/core_algos_torch.cc
+  src/torch/simple_grpo_trainer.cc
 )
 target_include_directories(cverl PUBLIC include)
 target_link_libraries(cverl PUBLIC "${TORCH_LIBRARIES}")
@@ -37,7 +38,15 @@ if (CVERL_BUILD_TESTS)
   target_link_libraries(test_torch_backend PRIVATE cverl)
   target_compile_options(test_torch_backend PRIVATE ${TORCH_CXX_FLAGS})
 
+  add_executable(test_simple_grpo_trainer tests/torch/test_simple_grpo_trainer.cc)
+  target_link_libraries(test_simple_grpo_trainer PRIVATE cverl)
+  target_compile_options(test_simple_grpo_trainer PRIVATE ${TORCH_CXX_FLAGS})
+
   add_executable(minimal_ppo_step examples/torch/minimal_ppo_step.cc)
   target_link_libraries(minimal_ppo_step PRIVATE cverl)
   target_compile_options(minimal_ppo_step PRIVATE ${TORCH_CXX_FLAGS})
+
+  add_executable(toy_grpo_trainer examples/torch/toy_grpo_trainer.cc)
+  target_link_libraries(toy_grpo_trainer PRIVATE cverl)
+  target_compile_options(toy_grpo_trainer PRIVATE ${TORCH_CXX_FLAGS})
 endif()
