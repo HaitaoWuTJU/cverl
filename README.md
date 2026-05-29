@@ -1,0 +1,135 @@
+# cverl
+
+`cverl` is a C++/CUDA rewrite target for the RL training and inference stack
+inspired by `verl`. The first milestone is intentionally small: implement the
+core RL math kernels in a standalone native library with a stable C ABI, then
+grow toward a pure C++/CUDA training backend.
+
+The current code does not depend on Python, PyTorch, Ray, TensorDict, or other
+runtime frameworks. CPU reference kernels are implemented first so correctness
+can be locked down before CUDA kernels and distributed runtime work are added.
+
+## Current Scope
+
+Implemented CPU reference kernels:
+
+- Masked reductions: `masked_sum`, `masked_mean`, `masked_whiten`
+- KL penalty: `k1`, `abs`, `k2`, `k3`
+- GAE advantage and returns
+- GRPO outcome advantage
+- PPO clipped policy loss
+
+Current tensor support:
+
+- contiguous `float32`
+- dense 2D tensors with shape `[batch, seq]`
+- CPU device
+
+CUDA support is scaffolded in the build system but the CUDA kernels are not
+implemented yet.
+
+## Layout
+
+```text
+cverl/
+  include/cverl/        Public C ABI headers
+  src/                  CPU reference implementation
+  cuda/                 CUDA implementation placeholder
+  tests/                Native C++ tests
+  tools/                Future golden-data and comparison tools
+  CMakeLists.txt        CMake build
+  Makefile              Minimal build for CPU-only environments
+```
+
+## Build
+
+### CMake
+
+```sh
+cmake -S . -B build
+cmake --build build
+./build/test_core_algos_cpu
+```
+
+### Make
+
+For minimal CPU-only environments:
+
+```sh
+make test
+```
+
+## CUDA Build Path
+
+The CUDA option is reserved for GPU environments:
+
+```sh
+cmake -S . -B build-cuda -DCVERL_ENABLE_CUDA=ON
+cmake --build build-cuda
+```
+
+At the moment this only validates the CUDA build path. Kernel implementations
+will be added after the CPU reference behavior is covered by golden tests.
+
+## API Example
+
+```c
+#include "cverl/cverl.h"
+
+float rewards[8] = {0};
+float values[8] = {0};
+float mask[8] = {1};
+float advantages[8];
+float returns[8];
+
+cverl_const_tensor2d_t rewards_t = {
+    rewards, CVERL_DTYPE_F32, CVERL_DEVICE_CPU, 2, 4};
+cverl_const_tensor2d_t values_t = {
+    values, CVERL_DTYPE_F32, CVERL_DEVICE_CPU, 2, 4};
+cverl_const_tensor2d_t mask_t = {
+    mask, CVERL_DTYPE_F32, CVERL_DEVICE_CPU, 2, 4};
+cverl_tensor2d_t adv_t = {
+    advantages, CVERL_DTYPE_F32, CVERL_DEVICE_CPU, 2, 4};
+cverl_tensor2d_t ret_t = {
+    returns, CVERL_DTYPE_F32, CVERL_DEVICE_CPU, 2, 4};
+
+cverl_status_t status = cverl_gae_advantage_return_f32_cpu(
+    rewards_t, values_t, mask_t, 1.0f, 1.0f, adv_t, ret_t);
+```
+
+## Correctness Strategy
+
+The CPU reference implementation is the source of truth for native kernels.
+The next correctness step is to add golden-data tests generated from the Python
+`verl` implementation:
+
+1. Generate random inputs and reference outputs from `verl`.
+2. Serialize them to a simple binary/JSON test format.
+3. Load the same cases in C++.
+4. Compare outputs with fp32 tolerances.
+
+Planned tolerance for fp32 kernels:
+
+- `rtol = 1e-5`
+- `atol = 1e-6`
+
+## Roadmap
+
+1. Add Python-generated golden tests for the current CPU kernels.
+2. Add CUDA kernels for masked reductions, KL, GAE, GRPO, and PPO loss.
+3. Add dtype support for `float16` and `bfloat16` where numerically appropriate.
+4. Add a native tensor/batch abstraction beyond simple 2D tensors.
+5. Build a minimal C++ trainer runtime.
+6. Add native model backend pieces: optimizer, checkpointing, transformer
+   blocks, sampling, KV cache, and distributed collectives.
+
+## Non-goals for the Current Milestone
+
+- Full `verl` feature parity
+- Ray-compatible scheduling
+- PyTorch/FSDP/Megatron integration
+- vLLM/SGLang replacement
+- Production LLM training runtime
+
+Those pieces can be revisited after the native RL math core is stable and
+covered by tests.

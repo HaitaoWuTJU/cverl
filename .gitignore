@@ -1,0 +1,13 @@
+build/
+build-*/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+__pycache__/
+.pytest_cache/
+.cache/
+compile_commands.json
