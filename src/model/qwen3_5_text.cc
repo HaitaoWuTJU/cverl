@@ -120,18 +120,27 @@ Qwen35TextModel::Qwen35TextModel(HfModelLoader loader) : loader_(std::move(loade
   config_ = load_qwen35_text_config(loader_.model_dir());
 }
 
+void Qwen35TextModel::to(torch::Device device) {
+  device_ = device;
+  for (auto& item : weights_) {
+    item.second = item.second.to(device_).contiguous();
+  }
+}
+
 torch::Tensor Qwen35TextModel::weight(const std::string& name) {
   auto it = weights_.find(name);
   if (it != weights_.end()) {
     return it->second;
   }
-  auto tensor = loader_.load_tensor(name).to(torch::kFloat32).contiguous();
+  auto tensor = loader_.load_tensor(name).to(torch::kFloat32).to(device_).contiguous();
   auto inserted = weights_.emplace(name, tensor);
   return inserted.first->second;
 }
 
 torch::Tensor Qwen35TextModel::embed(const torch::Tensor& input_ids) {
-  return torch::nn::functional::embedding(input_ids.to(torch::kLong), weight("model.language_model.embed_tokens.weight"));
+  auto emb = weight("model.language_model.embed_tokens.weight");
+  auto ids = input_ids.to(torch::TensorOptions().dtype(torch::kLong).device(emb.device()));
+  return torch::nn::functional::embedding(ids, emb);
 }
 
 torch::Tensor Qwen35TextModel::rms_norm(const torch::Tensor& x, const torch::Tensor& w) const {
@@ -436,6 +445,28 @@ torch::Tensor Qwen35TextModel::forward_hidden(const torch::Tensor& input_ids, in
     residual = hidden;
     hidden = rms_norm(hidden, weight(p + "post_attention_layernorm.weight"));
     hidden = residual + mlp(hidden, i);
+  }
+  return rms_norm(hidden, weight("model.language_model.norm.weight"));
+}
+
+torch::Tensor Qwen35TextModel::forward_hidden_tensor_parallel(const torch::Tensor& input_ids,
+                                                              const distributed::ParallelGroup& tensor_group,
+                                                              int64_t max_layers) {
+  auto hidden = embed(input_ids);
+  int64_t layers = max_layers < 0 ? config_.num_hidden_layers : std::min(max_layers, config_.num_hidden_layers);
+  for (int64_t i = 0; i < layers; ++i) {
+    std::string p = layer_prefix(i);
+    auto residual = hidden;
+    hidden = rms_norm(hidden, weight(p + "input_layernorm.weight"));
+    if (config_.layer_types.at(static_cast<size_t>(i)) == "full_attention") {
+      hidden = full_attention_tensor_parallel(hidden, i, tensor_group);
+    } else {
+      hidden = linear_attention_tensor_parallel(hidden, i, tensor_group);
+    }
+    hidden = residual + hidden;
+    residual = hidden;
+    hidden = rms_norm(hidden, weight(p + "post_attention_layernorm.weight"));
+    hidden = residual + mlp_tensor_parallel(hidden, i, tensor_group);
   }
   return rms_norm(hidden, weight("model.language_model.norm.weight"));
 }

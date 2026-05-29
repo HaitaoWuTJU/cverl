@@ -36,8 +36,12 @@ class Qwen35TextModel {
   explicit Qwen35TextModel(HfModelLoader loader);
 
   const Qwen35TextConfig& config() const { return config_; }
+  void to(torch::Device device);
   torch::Tensor forward_hidden(const torch::Tensor& input_ids, int64_t max_layers = -1);
   torch::Tensor forward_logits(const torch::Tensor& input_ids, int64_t max_layers = -1);
+  torch::Tensor forward_hidden_tensor_parallel(const torch::Tensor& input_ids,
+                                               const distributed::ParallelGroup& tensor_group,
+                                               int64_t max_layers = -1);
   torch::Tensor mlp_tensor_parallel(const torch::Tensor& x,
                                     int64_t layer_idx,
                                     const distributed::ParallelGroup& tensor_group);
@@ -64,6 +68,7 @@ class Qwen35TextModel {
   HfModelLoader loader_;
   Qwen35TextConfig config_;
   std::unordered_map<std::string, torch::Tensor> weights_;
+  torch::Device device_ = torch::kCPU;
 };
 
 Qwen35TextConfig load_qwen35_text_config(const std::string& model_dir);

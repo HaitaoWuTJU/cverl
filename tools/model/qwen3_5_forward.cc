@@ -20,6 +20,7 @@ struct Args {
   int64_t layers = -1;
   bool logits = false;
   std::string save_output;
+  std::string device = "cpu";
 };
 
 std::vector<int64_t> parse_tokens(const std::string& text) {
@@ -54,6 +55,8 @@ Args parse_args(int argc, char** argv) {
       args.logits = true;
     } else if (flag == "--save-output" && i + 1 < argc) {
       args.save_output = argv[++i];
+    } else if (flag == "--device" && i + 1 < argc) {
+      args.device = argv[++i];
     } else {
       throw std::runtime_error("unknown or incomplete arg: " + flag);
     }
@@ -100,6 +103,7 @@ int main(int argc, char** argv) {
     Args args = parse_args(argc, argv);
     cverl::HfModelLoader loader(args.model_dir);
     cverl::Qwen35TextModel model(std::move(loader));
+    model.to(torch::Device(args.device));
 
     auto ids = torch::tensor(args.tokens, torch::kLong).view({1, static_cast<int64_t>(args.tokens.size())});
     auto out = args.logits ? model.forward_logits(ids, args.layers) : model.forward_hidden(ids, args.layers);
@@ -109,6 +113,7 @@ int main(int argc, char** argv) {
     std::cout << "model_dir=" << args.model_dir << "\n";
     std::cout << "tokens=" << args.tokens.size() << "\n";
     std::cout << "layers=" << (args.layers < 0 ? model.config().num_hidden_layers : args.layers) << "\n";
+    std::cout << "device=" << args.device << "\n";
     std::cout << "output_shape=";
     print_shape(out);
     std::cout << "\n";
