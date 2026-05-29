@@ -33,6 +33,12 @@ Current model support:
 - Qwen3.5 linear attention, full attention, MLP, RMSNorm, RoPE, and tied lm head
 - Native C++ CLI smoke for hidden states and logits
 
+Current data support:
+
+- Hugging Face datasets download bridge through Python `datasets`
+- Prompt/answer JSONL materialization for C++ training loops
+- Pure C++ JSONL reader for prompt/answer examples
+
 Current distributed support:
 
 - DP/TP/PP topology config and rank-group planning
@@ -199,6 +205,34 @@ Face's supported cache, auth, revision, and pattern filtering behavior.
 The wrapper requires `huggingface_hub` to be installed in the selected Python
 environment. Use `--python /path/to/python` if the default `python3` is not the
 right interpreter.
+
+## Hugging Face Datasets
+
+Datasets are loaded through a small C++ wrapper around Python `datasets`, then
+materialized as prompt/answer JSONL. Native training code reads that JSONL from
+C++ via `cverl::data::load_prompt_answer_jsonl`.
+
+GSM8K smoke:
+
+```sh
+python -m pip install datasets
+./build/hf_dataset_download gsm8k \
+  --name main \
+  --split train \
+  --output-file ./data/gsm8k-train.jsonl \
+  --max-examples 8 \
+  --print-samples 1
+```
+
+The generated JSONL uses stable fields:
+
+```json
+{"prompt":"...","answer":"..."}
+```
+
+Use `--prompt-field` and `--answer-field` for datasets with different source
+column names. For compatibility with newer Hugging Face dataset repository
+names, the CLI maps `gsm8k` to `openai/gsm8k`.
 
 ## HF Model Loading
 

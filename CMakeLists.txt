@@ -41,6 +41,7 @@ endif()
 add_library(cverl STATIC
   src/status.cc
   src/hf_downloader.cc
+  src/data/hf_dataset.cc
   src/distributed/collectives.cc
   src/distributed/parallel_ops.cc
   src/distributed/topology.cc
@@ -55,6 +56,7 @@ target_link_libraries(cverl PUBLIC "${TORCH_LIBRARIES}")
 target_compile_options(cverl PRIVATE ${TORCH_CXX_FLAGS})
 target_compile_definitions(cverl PRIVATE
   CVERL_HF_DOWNLOAD_SCRIPT="${CMAKE_CURRENT_SOURCE_DIR}/tools/hf_snapshot_download.py"
+  CVERL_HF_DATASET_SCRIPT="${CMAKE_CURRENT_SOURCE_DIR}/tools/hf_dataset_download.py"
 )
 
 if (CVERL_ENABLE_CUDA)
@@ -83,6 +85,9 @@ if (CVERL_BUILD_TESTS)
   add_executable(hf_download tools/hf_download.cc)
   target_link_libraries(hf_download PRIVATE cverl)
 
+  add_executable(hf_dataset_download tools/data/hf_dataset_download.cc)
+  target_link_libraries(hf_dataset_download PRIVATE cverl)
+
   add_executable(inspect_hf_model tools/model/inspect_hf_model.cc)
   target_link_libraries(inspect_hf_model PRIVATE cverl)
 
@@ -101,6 +106,9 @@ if (CVERL_BUILD_TESTS)
   add_executable(test_hf_model_loader tests/model/test_hf_model_loader.cc)
   target_link_libraries(test_hf_model_loader PRIVATE cverl)
   target_compile_options(test_hf_model_loader PRIVATE ${TORCH_CXX_FLAGS})
+
+  add_executable(test_hf_dataset tests/data/test_hf_dataset.cc)
+  target_link_libraries(test_hf_dataset PRIVATE cverl)
 
   add_executable(test_distributed_topology tests/distributed/test_topology.cc)
   target_link_libraries(test_distributed_topology PRIVATE cverl)

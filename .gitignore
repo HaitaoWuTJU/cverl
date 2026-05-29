@@ -1,5 +1,6 @@
 build/
 build-*/
+/data/
 *.o
 *.a
 *.so
