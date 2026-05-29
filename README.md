@@ -1,19 +1,16 @@
 # cverl
 
 `cverl` is a C++/CUDA rewrite target for the RL training and inference stack
-inspired by `verl`. The first milestone is intentionally small: implement the
-core RL math kernels in a standalone native library with a stable C ABI, then
-grow toward a pure C++/CUDA training backend.
+inspired by `verl`. The first milestone keeps a stable C ABI while using
+LibTorch/ATen for tensor math, autograd, and optimizer-friendly C++ integration.
 
-The default core library does not depend on Python, PyTorch, Ray, TensorDict, or
-other runtime frameworks. CPU reference kernels are implemented first so
-correctness can be locked down before CUDA kernels and distributed runtime work
-are added. Optional backends, such as LibTorch, can be enabled explicitly for
-C++ trainer prototyping.
+The project does not depend on Python at runtime, Ray, TensorDict, or the Python
+PyTorch API. It does depend on LibTorch, either from a standalone LibTorch
+install or from the `torch` Python wheel's bundled C++ package at build time.
 
 ## Current Scope
 
-Implemented CPU reference kernels:
+Implemented kernels:
 
 - Masked reductions: `masked_sum`, `masked_mean`, `masked_whiten`
 - KL penalty: `k1`, `abs`, `k2`, `k3`
@@ -29,21 +26,20 @@ Current tensor support:
 - dense 2D tensors with shape `[batch, seq]`
 - CPU device
 
-CUDA support is scaffolded in the build system but the CUDA kernels are not
-implemented yet.
+The C ABI wraps raw pointers into `torch::Tensor` views and delegates math to
+LibTorch. Backward APIs use LibTorch autograd rather than manually derived
+gradient loops.
 
-Optional LibTorch backend:
-
-- `torch::Tensor` implementations of the same core algorithms
-- autograd support through LibTorch for C++ trainer prototyping
-- cross-checks against the C ABI kernels
+CUDA support is scaffolded in the build system. GPU execution should come
+through LibTorch/CUDA first; custom CUDA kernels should only be added for proven
+hot spots.
 
 ## Layout
 
 ```text
 cverl/
   include/cverl/        Public C ABI headers
-  src/                  CPU reference implementation
+  src/                  C ABI wrappers and LibTorch implementation
   cuda/                 CUDA implementation placeholder
   tests/                Native C++ tests
   tools/                Future golden-data and comparison tools
@@ -57,14 +53,16 @@ cverl/
 ### CMake
 
 ```sh
-cmake -S . -B build
+cmake -S . -B build \
+  -DCMAKE_PREFIX_PATH="$(python -c 'import torch; print(torch.utils.cmake_prefix_path)')"
 cmake --build build
 ./build/test_core_algos_cpu
+./build/test_torch_backend
 ```
 
 ### Make
 
-For minimal CPU-only environments:
+For environments with Python `torch` installed:
 
 ```sh
 make test
@@ -80,21 +78,13 @@ cmake --build build-cuda
 ```
 
 At the moment this only validates the CUDA build path. Kernel implementations
-will be added after the CPU reference behavior is covered by golden tests.
+will be added after the LibTorch behavior is covered by golden tests.
 
-### Optional LibTorch Backend
-
-`cverl` can also build an optional C++ backend on top of LibTorch. This is for
-native C++ trainer prototyping without Python, and avoids rewriting mature
-tensor/autograd/model infrastructure too early.
+The `minimal_ppo_step` executable shows a native C++ PPO-style training step
+using a LibTorch model, optimizer, and `cverl` RL losses:
 
 ```sh
-cmake -S . -B build-torch \
-  -DCVERL_ENABLE_TORCH=ON \
-  -DCMAKE_PREFIX_PATH="$(python -c 'import torch; print(torch.utils.cmake_prefix_path)')"
-cmake --build build-torch
-./build-torch/test_torch_backend
-./build-torch/minimal_ppo_step
+./build/minimal_ppo_step
 ```
 
 ## API Example
@@ -125,7 +115,7 @@ cverl_status_t status = cverl_gae_advantage_return_f32_cpu(
 
 ## Correctness Strategy
 
-The CPU reference implementation is the source of truth for native kernels.
+The LibTorch implementation is the source of truth for current kernels.
 Golden-data tests can be generated from the Python `verl` implementation. The
 current golden format covers forward outputs for KL, GAE, GRPO, PPO loss, plus
 autograd reference gradients for KL with respect to `logprob` and PPO loss with
@@ -157,12 +147,13 @@ Planned tolerance for fp32 kernels:
 ## Roadmap
 
 1. Add Python-generated golden tests for the current CPU kernels.
-2. Add CUDA kernels for masked reductions, KL, GAE, GRPO, and PPO loss.
+2. Use LibTorch CUDA for GPU execution and profile bottlenecks.
 3. Add dtype support for `float16` and `bfloat16` where numerically appropriate.
 4. Add a native tensor/batch abstraction beyond simple 2D tensors.
 5. Build a minimal C++ trainer runtime.
-6. Add native model backend pieces: optimizer, checkpointing, transformer
-   blocks, sampling, KV cache, and distributed collectives.
+6. Add native model backend pieces using existing C++ APIs where possible:
+   optimizer/checkpointing via LibTorch, distributed collectives via NCCL, and
+   attention/math via FlashAttention/cuBLAS/CUTLASS.
 
 ## Non-goals for the Current Milestone
 

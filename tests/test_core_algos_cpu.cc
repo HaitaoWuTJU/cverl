@@ -190,6 +190,6 @@ int main() {
   test_grpo();
   test_ppo_loss();
   test_ppo_loss_backward();
-  std::cout << "cverl CPU core algos tests passed\n";
+  std::cout << "cverl C ABI core algos tests passed\n";
   return 0;
 }

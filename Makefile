@@ -1,35 +1,19 @@
-CXX ?= g++
-CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -Wpedantic
-CPPFLAGS ?= -Iinclude
-AR ?= ar
+CMAKE ?= cmake
+PYTHON ?= python3
+BUILD_DIR ?= build
+TORCH_CMAKE_PREFIX ?= $(shell $(PYTHON) -c 'import torch; print(torch.utils.cmake_prefix_path)')
 
-SRC := src/status.cc src/core_algos_cpu.cc
-OBJ := $(SRC:.cc=.o)
-LIB := libcverl.a
-TEST_BIN := build/test_core_algos_cpu
-GOLDEN_BIN := build/compare_golden
+.PHONY: all configure test clean
 
-.PHONY: all test clean
+all: configure
+	$(CMAKE) --build $(BUILD_DIR)
 
-all: $(LIB) $(TEST_BIN) $(GOLDEN_BIN)
+configure:
+	$(CMAKE) -S . -B $(BUILD_DIR) -DCMAKE_PREFIX_PATH="$(TORCH_CMAKE_PREFIX)"
 
-$(LIB): $(OBJ)
-	$(AR) rcs $@ $^
-
-$(TEST_BIN): tests/test_core_algos_cpu.cc $(LIB)
-	mkdir -p build
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $< $(LIB) -o $@
-
-$(GOLDEN_BIN): tools/compare_golden.cc $(LIB)
-	mkdir -p build
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $< $(LIB) -o $@
-
-%.o: %.cc
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
-
-test: $(TEST_BIN)
-	./$(TEST_BIN)
+test: all
+	./$(BUILD_DIR)/test_core_algos_cpu
+	./$(BUILD_DIR)/test_torch_backend
 
 clean:
-	rm -f $(OBJ) $(LIB)
-	rm -rf build
+	rm -rf $(BUILD_DIR)
