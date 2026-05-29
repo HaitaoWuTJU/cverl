@@ -26,6 +26,13 @@ Current tensor support:
 - dense 2D tensors with shape `[batch, seq]`
 - CPU device
 
+Current model support:
+
+- Hugging Face safetensors metadata and tensor loading
+- Qwen3.5 text-only transformer prefill forward
+- Qwen3.5 linear attention, full attention, MLP, RMSNorm, RoPE, and tied lm head
+- Native C++ CLI smoke for hidden states and logits
+
 The C ABI wraps raw pointers into `torch::Tensor` views and delegates math to
 LibTorch. Backward APIs use LibTorch autograd rather than manually derived
 gradient loops.
@@ -133,10 +140,36 @@ individual safetensors weights into LibTorch tensors:
 ./build/inspect_hf_model ./models/Qwen3.5-0.8B --load-all
 ```
 
-This currently covers config parsing, safetensors metadata, tensor indexing, and
-single-tensor or full-weight loading into LibTorch tensors. Full Qwen forward
-execution is the next larger step because Qwen3.5 includes Qwen-specific linear
-attention and vision config.
+This covers config parsing, safetensors metadata, tensor indexing, and
+single-tensor or full-weight loading into LibTorch tensors.
+
+## Qwen3.5 Forward
+
+`cverl` includes a first native C++/LibTorch Qwen3.5 text forward path:
+
+```sh
+./build/qwen3_5_forward ./models/Qwen3.5-0.8B --tokens 1,2 --layers 24
+./build/qwen3_5_forward ./models/Qwen3.5-0.8B --tokens 1,2 --layers 24 --logits
+```
+
+Implemented pieces:
+
+- `embed_tokens`
+- decoder layer residual structure
+- Qwen3.5 RMSNorm weight convention
+- linear attention via LibTorch depthwise `conv1d` and recurrent gated delta rule
+- full attention with grouped KV heads, causal masking, RoPE, q/k norm, and output gate
+- SwiGLU MLP
+- final norm
+- tied lm head through `embed_tokens.weight`
+
+Current limitations:
+
+- text-only path; vision/multimodal modules are not wired yet
+- prefill/no-cache forward; incremental KV/recurrent cache is not implemented yet
+- correctness is smoke-tested against real weights; Python golden comparison for full
+  Qwen3.5 logits is still pending
+- CPU path is intended for validation, not performance
 
 The current runnable HF-weight RL smoke uses Qwen embeddings as the policy input
 and action head over a small vocabulary subset:
@@ -146,7 +179,8 @@ and action head over a small vocabulary subset:
 ```
 
 This verifies the path `HF safetensors -> LibTorch tensors -> GRPO/PPO training`.
-It is not yet the full Qwen3.5 transformer forward.
+Full-policy RL training can now be built on top of `Qwen35TextModel`, but the
+current trainer still uses the smaller embedding policy smoke for fast CPU tests.
 
 ## API Example
 
@@ -211,7 +245,7 @@ Planned tolerance for fp32 kernels:
 2. Use LibTorch CUDA for GPU execution and profile bottlenecks.
 3. Add dtype support for `float16` and `bfloat16` where numerically appropriate.
 4. Add a native tensor/batch abstraction beyond simple 2D tensors.
-5. Build a minimal C++ trainer runtime.
+5. Connect the minimal trainer runtime to `Qwen35TextModel` log-prob generation.
 6. Add native model backend pieces using existing C++ APIs where possible:
    optimizer/checkpointing via LibTorch, distributed collectives via NCCL, and
    attention/math via FlashAttention/cuBLAS/CUTLASS.
