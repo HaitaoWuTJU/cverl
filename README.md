@@ -138,6 +138,16 @@ single-tensor or full-weight loading into LibTorch tensors. Full Qwen forward
 execution is the next larger step because Qwen3.5 includes Qwen-specific linear
 attention and vision config.
 
+The current runnable HF-weight RL smoke uses Qwen embeddings as the policy input
+and action head over a small vocabulary subset:
+
+```sh
+./build/hf_embedding_grpo_trainer ./models/Qwen3.5-0.8B --steps 8 --vocab-subset 64
+```
+
+This verifies the path `HF safetensors -> LibTorch tensors -> GRPO/PPO training`.
+It is not yet the full Qwen3.5 transformer forward.
+
 ## API Example
 
 ```c
