@@ -1,4 +1,5 @@
 #include "cverl/distributed/nccl_collectives.h"
+#include "cverl/distributed/parallel_ops.h"
 
 #include <chrono>
 #include <cstdlib>
@@ -88,6 +89,30 @@ int main(int argc, char** argv) {
     auto expected_scatter = torch::full({1, 2}, static_cast<float>(world * (world + 1) / 2),
                                         torch::TensorOptions().device(torch::kCUDA, static_cast<int>(device)).dtype(torch::kFloat32));
     require_allclose(scattered, expected_scatter, "NCCL reduce_scatter mismatch");
+
+    torch::manual_seed(123);
+    auto cpu_x = torch::randn({2, 3, 8});
+    auto cpu_gate = torch::randn({16, 8});
+    auto cpu_up = torch::randn({16, 8});
+    auto cpu_down = torch::randn({8, 16});
+    auto mlp_x = cpu_x.to(torch::Device(torch::kCUDA, static_cast<int>(device)));
+    auto gate = cpu_gate.to(mlp_x.device());
+    auto up = cpu_up.to(mlp_x.device());
+    auto down = cpu_down.to(mlp_x.device());
+    cverl::distributed::ParallelGroup tp_group{rank, world, group, &comm};
+    auto tp_mlp = cverl::distributed::tensor_parallel_mlp_swiglu(mlp_x, gate, up, down, tp_group);
+    auto dense_gate = torch::matmul(mlp_x, gate.transpose(0, 1));
+    auto dense_up = torch::matmul(mlp_x, up.transpose(0, 1));
+    auto dense_mlp = torch::matmul((torch::silu(dense_gate) * dense_up), down.transpose(0, 1));
+    require_allclose(tp_mlp, dense_mlp, "NCCL tensor-parallel MLP mismatch");
+
+    auto param = torch::ones({2, 3}, torch::TensorOptions().device(mlp_x.device()).dtype(torch::kFloat32).requires_grad(true));
+    auto loss = (param * static_cast<double>(rank + 1)).sum();
+    loss.backward();
+    cverl::distributed::data_parallel_sync_gradients({param}, comm, group, true);
+    auto expected_grad = torch::full({2, 3}, static_cast<float>(world + 1) / 2.0f,
+                                     torch::TensorOptions().device(mlp_x.device()).dtype(torch::kFloat32));
+    require_allclose(param.grad(), expected_grad, "NCCL data-parallel gradient sync mismatch");
 
     comm.barrier();
     if (rank == 0) {

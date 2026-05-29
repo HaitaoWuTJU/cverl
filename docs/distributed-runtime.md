@@ -48,6 +48,31 @@ Expected collectives by parallel axis:
 tests use `SingleProcessCollectives`; CUDA/NCCL builds can enable
 `NcclCollectives` with `-DCVERL_ENABLE_NCCL=ON`.
 
+## Current TP/DP Implementation
+
+The first sharding layer is implemented in
+`include/cverl/distributed/parallel_ops.h`:
+
+- `column_parallel_linear`: shard output rows of a projection.
+- `row_parallel_linear`: shard input columns and all-reduce partial outputs.
+- `tensor_parallel_mlp_swiglu`: shard Qwen/SwiGLU gate and up projections by
+  intermediate dimension, then shard down projection by input dimension.
+- `data_parallel_sync_gradients`: all-reduce or average parameter gradients
+  across a DP group.
+
+Qwen3.5 has TP entry points for:
+
+- MLP: gate/up column-parallel, down row-parallel.
+- Full attention: q projection and o projection are sharded by attention heads;
+  k/v are replicated when the number of KV heads is smaller than TP size, then
+  narrowed to the local q-head range.
+- Linear attention: q/k/v projection rows, depthwise conv channels, z/a/b
+  projections, recurrent head state, and out projection are sharded by linear
+  heads.
+
+These entry points are separate from the dense forward path so correctness can
+be preserved while the trainer is migrated stage by stage.
+
 ## Memory Policy
 
 The runtime config separates memory decisions from model code:
@@ -93,14 +118,11 @@ system NCCL libraries.
 
 1. Keep CPU topology tests strict and deterministic.
 2. Add NCCL collectives implementation for GPU builds.
-3. Split Qwen3.5 modules:
-   - column-parallel q/k/v/gate/up projections
-   - row-parallel output/down projections
-   - head sharding for attention
+3. Add multi-rank Qwen module correctness tests against dense outputs.
 4. Add PP stage ownership and activation send/recv around decoder layer ranges.
 5. Add DP gradient reduce-scatter and optimizer state sharding.
 6. Add memory accounting per rank and fail early when a plan cannot fit.
-7. Add multi-process correctness tests with small tensors, then Qwen logits.
+7. Connect the trainer to the TP/DP Qwen path.
 
 The current CPU environment can validate topology, rank groups, config, and
 single-process collectives. Actual NCCL throughput, stream overlap, and NIC

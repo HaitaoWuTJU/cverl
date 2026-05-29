@@ -7,6 +7,7 @@
 
 #include <torch/torch.h>
 
+#include "cverl/distributed/parallel_ops.h"
 #include "cverl/model/hf_model_loader.h"
 
 namespace cverl {
@@ -37,6 +38,15 @@ class Qwen35TextModel {
   const Qwen35TextConfig& config() const { return config_; }
   torch::Tensor forward_hidden(const torch::Tensor& input_ids, int64_t max_layers = -1);
   torch::Tensor forward_logits(const torch::Tensor& input_ids, int64_t max_layers = -1);
+  torch::Tensor mlp_tensor_parallel(const torch::Tensor& x,
+                                    int64_t layer_idx,
+                                    const distributed::ParallelGroup& tensor_group);
+  torch::Tensor full_attention_tensor_parallel(const torch::Tensor& x,
+                                               int64_t layer_idx,
+                                               const distributed::ParallelGroup& tensor_group);
+  torch::Tensor linear_attention_tensor_parallel(const torch::Tensor& x,
+                                                 int64_t layer_idx,
+                                                 const distributed::ParallelGroup& tensor_group);
 
  private:
   torch::Tensor weight(const std::string& name);

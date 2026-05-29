@@ -42,6 +42,7 @@ add_library(cverl STATIC
   src/status.cc
   src/hf_downloader.cc
   src/distributed/collectives.cc
+  src/distributed/parallel_ops.cc
   src/distributed/topology.cc
   src/model/hf_model_loader.cc
   src/model/qwen3_5_text.cc
@@ -104,6 +105,10 @@ if (CVERL_BUILD_TESTS)
   add_executable(test_distributed_topology tests/distributed/test_topology.cc)
   target_link_libraries(test_distributed_topology PRIVATE cverl)
   target_compile_options(test_distributed_topology PRIVATE ${TORCH_CXX_FLAGS})
+
+  add_executable(test_parallel_ops tests/distributed/test_parallel_ops.cc)
+  target_link_libraries(test_parallel_ops PRIVATE cverl)
+  target_compile_options(test_parallel_ops PRIVATE ${TORCH_CXX_FLAGS})
 
   if (CVERL_ENABLE_NCCL)
     add_executable(test_nccl_collectives tests/distributed/test_nccl_collectives.cc)

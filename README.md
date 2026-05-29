@@ -39,6 +39,9 @@ Current distributed support:
 - GPU/NIC/NCCL environment policy generation
 - Memory policy for BF16/FP32 reduction, activation checkpointing, and sharding
 - Optional NCCL collectives backend for CUDA builds
+- Tensor-parallel linear helpers: column-parallel, row-parallel, and SwiGLU MLP
+- Qwen3.5 TP entry points for MLP, full attention, and linear attention
+- Data-parallel gradient all-reduce/average helper
 - Single-process collectives for CPU tests
 
 The C ABI wraps raw pointers into `torch::Tensor` views and delegates math to
