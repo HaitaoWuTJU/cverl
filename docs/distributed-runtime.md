@@ -63,9 +63,10 @@ The first sharding layer is implemented in
 Qwen3.5 has TP entry points for:
 
 - MLP: gate/up column-parallel, down row-parallel.
-- Full attention: q projection and o projection are sharded by attention heads;
-  k/v are replicated when the number of KV heads is smaller than TP size, then
-  narrowed to the local q-head range.
+- Full attention: q projection and o projection are sharded by attention heads.
+  The current safe path requires `TP <= num_key_value_heads`; for
+  Qwen3.5-0.8B, use `TP=2` and combine the remaining GPUs with DP until the
+  replicated-KV `TP > KV heads` path has a dedicated golden test.
 - Linear attention: q/k/v projection rows, depthwise conv channels, z/a/b
   projections, recurrent head state, and out projection are sharded by linear
   heads.

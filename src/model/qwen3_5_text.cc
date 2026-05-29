@@ -234,6 +234,10 @@ torch::Tensor Qwen35TextModel::full_attention_tensor_parallel(const torch::Tenso
   if (config_.num_attention_heads % tensor_group.world_size != 0) {
     throw std::invalid_argument("Qwen3.5 full attention TP requires num_attention_heads divisible by TP size");
   }
+  if (tensor_group.world_size > config_.num_key_value_heads) {
+    throw std::invalid_argument(
+        "Qwen3.5 full attention TP size currently must be <= num_key_value_heads; use TP=2,DP=2 on 4xH20 for Qwen3.5-0.8B");
+  }
   int64_t b = x.size(0);
   int64_t s = x.size(1);
   int64_t h = config_.num_attention_heads;

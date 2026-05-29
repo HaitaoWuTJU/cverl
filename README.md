@@ -136,6 +136,17 @@ WORLD_SIZE=4 \
 tools/distributed/run_nccl_smoke.sh build-h20-nccl
 ```
 
+For Qwen3.5-0.8B TP correctness with full-attention layers, use TP size 2
+because the model has 2 KV heads:
+
+```sh
+NCCL_SOCKET_IFNAME=eth1 \
+NCCL_LIB_DIR=/path/to/python/site-packages/nvidia/nccl/lib \
+WORLD_SIZE=2 \
+LAYERS=4 \
+tools/distributed/run_qwen_tp_smoke.sh ./models/Qwen3.5-0.8B
+```
+
 The `minimal_ppo_step` executable shows a native C++ PPO-style training step
 using a LibTorch model, optimizer, and `cverl` RL losses:
 
