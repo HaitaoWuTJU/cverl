@@ -101,7 +101,9 @@ cverl_status_t status = cverl_gae_advantage_return_f32_cpu(
 ## Correctness Strategy
 
 The CPU reference implementation is the source of truth for native kernels.
-Golden-data tests can be generated from the Python `verl` implementation:
+Golden-data tests can be generated from the Python `verl` implementation. The
+current golden format covers forward outputs for KL, GAE, GRPO, PPO loss, and
+the autograd reference gradient for PPO loss with respect to `log_prob`.
 
 1. Generate random inputs and reference outputs from `verl`.
 2. Serialize them to a simple binary/JSON test format.

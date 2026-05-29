@@ -11,7 +11,8 @@
 namespace {
 
 constexpr char kMagic[] = "CVERLGD1";
-constexpr uint32_t kVersion = 1;
+constexpr uint32_t kMinVersion = 1;
+constexpr uint32_t kMaxVersion = 2;
 constexpr float kAtol = 1.0e-5f;
 constexpr float kRtol = 1.0e-5f;
 
@@ -210,7 +211,7 @@ void compare_grpo(std::ifstream& in) {
   compare_tensor(actual_ret, expected_ret, "grpo returns");
 }
 
-void compare_ppo(std::ifstream& in) {
+void compare_ppo(std::ifstream& in, uint32_t version) {
   float clip = read_scalar<float>(in);
   float clip_low = read_scalar<float>(in);
   float clip_high = read_scalar<float>(in);
@@ -249,6 +250,26 @@ void compare_ppo(std::ifstream& in) {
   compare_scalar(actual.pg_clipfrac, expected_clipfrac, "ppo clipfrac");
   compare_scalar(actual.ppo_kl, expected_kl, "ppo kl");
   compare_scalar(actual.pg_clipfrac_lower, expected_clipfrac_lower, "ppo clipfrac_lower");
+
+  if (version >= 2) {
+    std::vector<float> expected_grad;
+    read_expect_tensor_shape(in, rows, cols, &expected_grad, "ppo expected grad");
+    std::vector<float> actual_grad(expected_grad.size());
+    require_status(
+        cverl_ppo_clipped_loss_backward_f32_cpu(
+            ct(old_log_prob, rows, cols),
+            ct(log_prob, rows, cols),
+            ct(advantages, rows, cols),
+            ct(mask, rows, cols),
+            clip,
+            clip_low,
+            clip_high,
+            clip_c,
+            static_cast<cverl_loss_agg_mode_t>(agg),
+            mt(actual_grad, rows, cols)),
+        "ppo backward");
+    compare_tensor(actual_grad, expected_grad, "ppo grad_log_prob");
+  }
 }
 
 }  // namespace
@@ -272,7 +293,7 @@ int main(int argc, char** argv) {
     return 1;
   }
   uint32_t version = read_scalar<uint32_t>(in);
-  if (version != kVersion) {
+  if (version < kMinVersion || version > kMaxVersion) {
     std::cerr << "unsupported golden file version " << version << "\n";
     return 1;
   }
@@ -291,7 +312,7 @@ int main(int argc, char** argv) {
         compare_grpo(in);
         break;
       case kKindPpo:
-        compare_ppo(in);
+        compare_ppo(in, version);
         break;
       default:
         std::cerr << "unknown golden record kind " << kind << "\n";

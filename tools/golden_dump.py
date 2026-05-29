@@ -24,7 +24,7 @@ import torch
 
 
 MAGIC = b"CVERLGD1"
-VERSION = 1
+VERSION = 2
 
 KIND_KL = 1
 KIND_GAE = 2
@@ -46,7 +46,7 @@ def _import_verl():
         from verl.trainer.ppo.core_algos import (
             compute_gae_advantage_return,
             compute_grpo_outcome_advantage,
-            compute_policy_loss,
+            compute_policy_loss_vanilla,
             kl_penalty,
         )
     except ModuleNotFoundError as exc:
@@ -55,7 +55,7 @@ def _import_verl():
             "for example: PYTHONPATH=../verl python3 tools/golden_dump.py build/golden.bin"
         ) from exc
 
-    return compute_gae_advantage_return, compute_grpo_outcome_advantage, compute_policy_loss, kl_penalty
+    return compute_gae_advantage_return, compute_grpo_outcome_advantage, compute_policy_loss_vanilla, kl_penalty
 
 
 def _write_u32(f: BinaryIO, value: int) -> None:
@@ -101,7 +101,7 @@ class ActorConfigLike(dict):
 
 
 def make_records(seed: int):
-    compute_gae, compute_grpo, compute_policy_loss, kl_penalty = _import_verl()
+    compute_gae, compute_grpo, compute_policy_loss_vanilla, kl_penalty = _import_verl()
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
@@ -129,20 +129,21 @@ def make_records(seed: int):
         records.append((KIND_GRPO, group_ids, 1.0e-6, int(norm), rewards, mask, adv, ret))
 
     old_log_prob = torch.randn(rows, cols, dtype=torch.float32) * 0.5
-    log_prob = old_log_prob + torch.randn(rows, cols, dtype=torch.float32) * 0.25
+    log_prob = (old_log_prob + torch.randn(rows, cols, dtype=torch.float32) * 0.25).detach().requires_grad_(True)
     advantages = torch.randn(rows, cols, dtype=torch.float32)
     mask = _rand_mask(rows, cols)
     cfg = ActorConfigLike(clip_ratio=0.2, clip_low=None, clip_high=None, clip_c=3.0)
-    loss, clipfrac, ppo_kl, clipfrac_lower = compute_policy_loss(
-        old_log_prob,
-        log_prob,
-        advantages,
-        mask,
-        cliprange=0.2,
-        clip_ratio_c=3.0,
+    loss, metrics = compute_policy_loss_vanilla(
+        old_log_prob=old_log_prob,
+        log_prob=log_prob,
+        advantages=advantages,
+        response_mask=mask,
         loss_agg_mode="token-mean",
+        config=cfg,
+        rollout_is_weights=None,
     )
-    del cfg
+    loss.backward()
+    grad_log_prob = log_prob.grad.detach().clone()
     records.append(
         (
             KIND_PPO,
@@ -156,9 +157,10 @@ def make_records(seed: int):
             advantages,
             mask,
             float(loss.item()),
-            float(clipfrac.item()),
-            float(ppo_kl.item()),
-            float(clipfrac_lower.item()),
+            float(metrics["actor/pg_clipfrac"]),
+            float(metrics["actor/ppo_kl"]),
+            float(metrics["actor/pg_clipfrac_lower"]),
+            grad_log_prob,
         )
     )
 
@@ -212,6 +214,7 @@ def write_records(path: pathlib.Path, records) -> None:
                     clipfrac,
                     ppo_kl,
                     clipfrac_lower,
+                    grad_log_prob,
                 ) = rec
                 f.write(struct.pack("<ffffI", clip, clip_low, clip_high, clip_c, agg))
                 _write_f32_tensor(f, old_log_prob)
@@ -219,6 +222,7 @@ def write_records(path: pathlib.Path, records) -> None:
                 _write_f32_tensor(f, advantages)
                 _write_f32_tensor(f, mask)
                 f.write(struct.pack("<ffff", loss, clipfrac, ppo_kl, clipfrac_lower))
+                _write_f32_tensor(f, grad_log_prob)
             else:
                 raise ValueError(f"unknown record kind {kind}")
 
