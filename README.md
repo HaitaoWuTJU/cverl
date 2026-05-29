@@ -100,13 +100,25 @@ cverl_status_t status = cverl_gae_advantage_return_f32_cpu(
 ## Correctness Strategy
 
 The CPU reference implementation is the source of truth for native kernels.
-The next correctness step is to add golden-data tests generated from the Python
-`verl` implementation:
+Golden-data tests can be generated from the Python `verl` implementation:
 
 1. Generate random inputs and reference outputs from `verl`.
 2. Serialize them to a simple binary/JSON test format.
 3. Load the same cases in C++.
 4. Compare outputs with fp32 tolerances.
+
+Example:
+
+```sh
+cmake -S . -B build
+cmake --build build
+
+PYTHONPATH=../verl python3 tools/golden_dump.py build/golden_core_algos.bin
+./build/compare_golden build/golden_core_algos.bin
+```
+
+The `golden_dump.py` script requires an environment with `torch`, `numpy`, and
+the Python `verl` checkout importable via `PYTHONPATH`.
 
 Planned tolerance for fp32 kernels:
 

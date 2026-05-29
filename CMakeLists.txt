@@ -24,4 +24,7 @@ endif()
 if (CVERL_BUILD_TESTS)
   add_executable(test_core_algos_cpu tests/test_core_algos_cpu.cc)
   target_link_libraries(test_core_algos_cpu PRIVATE cverl)
+
+  add_executable(compare_golden tools/compare_golden.cc)
+  target_link_libraries(compare_golden PRIVATE cverl)
 endif()
