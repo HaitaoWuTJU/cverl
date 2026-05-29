@@ -51,6 +51,11 @@ Current distributed support:
 - Data-parallel gradient all-reduce/average helper
 - Single-process collectives for CPU tests
 
+Current rollout transport support:
+
+- POSIX shared-memory region for local cverl/rollout sidecars
+- Transport plan for HTTP -> shared memory -> CUDA IPC -> NCCL/RDMA upgrades
+
 The C ABI wraps raw pointers into `torch::Tensor` views and delegates math to
 LibTorch. Backward APIs use LibTorch autograd rather than manually derived
 gradient loops.
@@ -261,6 +266,16 @@ tools/bench/compare_gsm8k_speed.sh
 The script writes raw per-backend CSV metrics to `build/bench/` and prints
 `cverl_vs_verl_speedup`. Set `DEVICE=cuda:0` when both builds/environments
 support CUDA.
+
+## Rollout Transport
+
+The first full GSM8K GRPO chain should reuse vLLM or SGLang via their
+OpenAI-compatible HTTP serving APIs. For lower overhead, cverl now has a
+shared-memory transport foundation for colocated rollout sidecars. Direct
+NCCL/RDMA transfer to stock vLLM/SGLang requires a custom worker/plugin because
+their public HTTP APIs do not expose internal GPU tensors or communicators.
+
+See `docs/rollout-transport.md`.
 
 ## HF Model Loading
 

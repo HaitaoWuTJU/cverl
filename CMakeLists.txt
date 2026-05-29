@@ -87,6 +87,7 @@ add_library(cverl STATIC
   src/distributed/topology.cc
   src/model/hf_model_loader.cc
   src/model/qwen3_5_text.cc
+  src/rollout/shared_memory.cc
   src/core_algos_c_api.cc
   src/torch/core_algos_torch.cc
   src/torch/simple_grpo_trainer.cc
@@ -165,6 +166,9 @@ if (CVERL_BUILD_TESTS)
 
   add_executable(test_hf_dataset tests/data/test_hf_dataset.cc)
   target_link_libraries(test_hf_dataset PRIVATE cverl)
+
+  add_executable(test_rollout_shared_memory tests/rollout/test_shared_memory.cc)
+  target_link_libraries(test_rollout_shared_memory PRIVATE cverl)
 
   add_executable(test_distributed_topology tests/distributed/test_topology.cc)
   target_link_libraries(test_distributed_topology PRIVATE cverl)
