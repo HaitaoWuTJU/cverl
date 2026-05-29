@@ -1,7 +1,6 @@
 #include "cverl/data/hf_dataset.h"
 
 #include <array>
-#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -9,7 +8,8 @@
 #include <stdexcept>
 #include <string>
 #include <sys/wait.h>
-#include <unordered_map>
+
+#include <nlohmann/json.hpp>
 
 #ifndef CVERL_HF_DATASET_SCRIPT
 #define CVERL_HF_DATASET_SCRIPT "tools/hf_dataset_download.py"
@@ -18,162 +18,17 @@
 namespace cverl::data {
 namespace {
 
-class JsonObjectParser {
- public:
-  explicit JsonObjectParser(std::string text) : text_(std::move(text)) {}
+using Json = nlohmann::json;
 
-  std::unordered_map<std::string, std::string> parse_string_object() {
-    std::unordered_map<std::string, std::string> out;
-    skip_ws();
-    expect('{');
-    skip_ws();
-    if (consume('}')) {
-      return out;
-    }
-    while (true) {
-      skip_ws();
-      std::string key = parse_string();
-      skip_ws();
-      expect(':');
-      skip_ws();
-      out.emplace(std::move(key), parse_value_as_string());
-      skip_ws();
-      if (consume('}')) {
-        break;
-      }
-      expect(',');
-    }
-    return out;
+std::string json_value_to_string(const Json& value) {
+  if (value.is_null()) {
+    return {};
   }
-
- private:
-  void skip_ws() {
-    while (pos_ < text_.size() && std::isspace(static_cast<unsigned char>(text_[pos_]))) {
-      ++pos_;
-    }
+  if (value.is_string()) {
+    return value.get<std::string>();
   }
-
-  bool consume(char expected) {
-    if (pos_ < text_.size() && text_[pos_] == expected) {
-      ++pos_;
-      return true;
-    }
-    return false;
-  }
-
-  void expect(char expected) {
-    if (!consume(expected)) {
-      throw std::invalid_argument("invalid JSON object");
-    }
-  }
-
-  std::string parse_string() {
-    expect('"');
-    std::string out;
-    while (pos_ < text_.size()) {
-      char ch = text_[pos_++];
-      if (ch == '"') {
-        return out;
-      }
-      if (ch != '\\') {
-        out.push_back(ch);
-        continue;
-      }
-      if (pos_ >= text_.size()) {
-        throw std::invalid_argument("unterminated JSON escape");
-      }
-      char esc = text_[pos_++];
-      switch (esc) {
-        case '"':
-        case '\\':
-        case '/':
-          out.push_back(esc);
-          break;
-        case 'b':
-          out.push_back('\b');
-          break;
-        case 'f':
-          out.push_back('\f');
-          break;
-        case 'n':
-          out.push_back('\n');
-          break;
-        case 'r':
-          out.push_back('\r');
-          break;
-        case 't':
-          out.push_back('\t');
-          break;
-        case 'u':
-          out += parse_unicode_escape_utf8();
-          break;
-        default:
-          throw std::invalid_argument("unsupported JSON escape");
-      }
-    }
-    throw std::invalid_argument("unterminated JSON string");
-  }
-
-  std::string parse_unicode_escape_utf8() {
-    if (pos_ + 4 > text_.size()) {
-      throw std::invalid_argument("short JSON unicode escape");
-    }
-    uint32_t code = 0;
-    for (int i = 0; i < 4; ++i) {
-      char ch = text_[pos_++];
-      code <<= 4;
-      if (ch >= '0' && ch <= '9') {
-        code += static_cast<uint32_t>(ch - '0');
-      } else if (ch >= 'a' && ch <= 'f') {
-        code += static_cast<uint32_t>(ch - 'a' + 10);
-      } else if (ch >= 'A' && ch <= 'F') {
-        code += static_cast<uint32_t>(ch - 'A' + 10);
-      } else {
-        throw std::invalid_argument("invalid JSON unicode escape");
-      }
-    }
-    if (code <= 0x7F) {
-      return std::string(1, static_cast<char>(code));
-    }
-    if (code <= 0x7FF) {
-      return std::string{static_cast<char>(0xC0 | (code >> 6)), static_cast<char>(0x80 | (code & 0x3F))};
-    }
-    return std::string{
-        static_cast<char>(0xE0 | (code >> 12)),
-        static_cast<char>(0x80 | ((code >> 6) & 0x3F)),
-        static_cast<char>(0x80 | (code & 0x3F))};
-  }
-
-  std::string parse_value_as_string() {
-    if (pos_ < text_.size() && text_[pos_] == '"') {
-      return parse_string();
-    }
-    size_t begin = pos_;
-    int depth = 0;
-    while (pos_ < text_.size()) {
-      char ch = text_[pos_];
-      if (ch == '[' || ch == '{') {
-        ++depth;
-      } else if (ch == ']' || ch == '}') {
-        if (depth == 0) {
-          break;
-        }
-        --depth;
-      } else if (ch == ',' && depth == 0) {
-        break;
-      }
-      ++pos_;
-    }
-    size_t end = pos_;
-    while (end > begin && std::isspace(static_cast<unsigned char>(text_[end - 1]))) {
-      --end;
-    }
-    return text_.substr(begin, end - begin);
-  }
-
-  std::string text_;
-  size_t pos_ = 0;
-};
+  return value.dump();
+}
 
 std::string shell_quote(const std::string& value) {
   std::string out = "'";
@@ -248,13 +103,17 @@ std::vector<PromptAnswerExample> load_prompt_answer_jsonl(const JsonlDatasetOpti
     if (line.empty()) {
       continue;
     }
-    auto object = JsonObjectParser(line).parse_string_object();
-    auto prompt_it = object.find(options.prompt_field);
-    auto answer_it = object.find(options.answer_field);
-    if (prompt_it == object.end() || answer_it == object.end()) {
+    Json object = Json::parse(line);
+    if (!object.is_object()) {
+      throw std::runtime_error("dataset JSONL row is not an object at line " + std::to_string(line_no));
+    }
+    if (!object.contains(options.prompt_field) || !object.contains(options.answer_field)) {
       throw std::runtime_error("dataset JSONL missing required field at line " + std::to_string(line_no));
     }
-    examples.push_back(PromptAnswerExample{prompt_it->second, answer_it->second});
+    examples.push_back(PromptAnswerExample{
+        json_value_to_string(object.at(options.prompt_field)),
+        json_value_to_string(object.at(options.answer_field)),
+    });
     if (options.max_examples >= 0 && static_cast<int64_t>(examples.size()) >= options.max_examples) {
       break;
     }

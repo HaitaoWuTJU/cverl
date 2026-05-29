@@ -10,6 +10,18 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(Torch REQUIRED)
+find_package(nlohmann_json QUIET)
+if (NOT nlohmann_json_FOUND)
+  find_path(NLOHMANN_JSON_INCLUDE_DIR nlohmann/json.hpp
+    HINTS
+      "$ENV{CONDA_PREFIX}/include"
+      "$ENV{HOME}/miniconda3/include"
+      "$ENV{HOME}/miniconda3/envs/verl-cpu/include"
+  )
+  if (NOT NLOHMANN_JSON_INCLUDE_DIR)
+    message(FATAL_ERROR "nlohmann/json.hpp is required. Install nlohmann-json or add it to CMAKE_PREFIX_PATH.")
+  endif()
+endif()
 
 if (CVERL_ENABLE_NCCL)
   find_package(Python COMPONENTS Interpreter REQUIRED)
@@ -52,7 +64,13 @@ add_library(cverl STATIC
   src/torch/simple_grpo_trainer.cc
 )
 target_include_directories(cverl PUBLIC include)
+if (NOT nlohmann_json_FOUND)
+  target_include_directories(cverl PUBLIC ${NLOHMANN_JSON_INCLUDE_DIR})
+endif()
 target_link_libraries(cverl PUBLIC "${TORCH_LIBRARIES}")
+if (nlohmann_json_FOUND)
+  target_link_libraries(cverl PUBLIC nlohmann_json::nlohmann_json)
+endif()
 target_compile_options(cverl PRIVATE ${TORCH_CXX_FLAGS})
 target_compile_definitions(cverl PRIVATE
   CVERL_HF_DOWNLOAD_SCRIPT="${CMAKE_CURRENT_SOURCE_DIR}/tools/hf_snapshot_download.py"
