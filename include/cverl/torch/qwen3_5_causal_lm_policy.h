@@ -14,7 +14,7 @@ namespace cverl::torch_backend {
 //
 // On construction it loads every weight the forward path needs (up to
 // `max_layers` transformer blocks) from the safetensors directory, registers
-// them as fp32 trainable nn::Module parameters, and pushes the same tensors
+// them as trainable nn::Module parameters in the requested dtype, and pushes the same tensors
 // into the underlying `Qwen35TextModel` via `set_weight_override` so that
 // `forward_logits` autograd-flows back through the registered parameters.
 //
@@ -28,7 +28,8 @@ class Qwen3_5CausalLmPolicy : public CausalLmPolicy {
  public:
   Qwen3_5CausalLmPolicy(const std::string& model_dir,
                         int32_t pad_id,
-                        int64_t max_layers = -1);
+                        int64_t max_layers = -1,
+                        torch::ScalarType param_dtype = torch::kFloat32);
 
   torch::Tensor forward(const torch::Tensor& prompt_ids,
                         const torch::Tensor& response_ids) override;
@@ -57,6 +58,7 @@ class Qwen3_5CausalLmPolicy : public CausalLmPolicy {
   std::string model_dir_;
   int32_t pad_id_;
   int64_t max_layers_;
+  torch::ScalarType param_dtype_;
   Qwen35TextConfig config_;
 
   std::unique_ptr<Qwen35TextModel> model_;

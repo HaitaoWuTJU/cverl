@@ -318,6 +318,10 @@ if (CVERL_BUILD_TESTS)
   target_link_libraries(test_qwen3_5_grpo_step PRIVATE cverl)
   target_compile_options(test_qwen3_5_grpo_step PRIVATE ${TORCH_CXX_FLAGS})
 
+  add_executable(test_qwen3_5_param_dtype tests/torch/test_qwen3_5_param_dtype.cc)
+  target_link_libraries(test_qwen3_5_param_dtype PRIVATE cverl)
+  target_compile_options(test_qwen3_5_param_dtype PRIVATE ${TORCH_CXX_FLAGS})
+
   add_executable(test_distributed_topology tests/distributed/test_topology.cc)
   target_link_libraries(test_distributed_topology PRIVATE cverl)
   target_compile_options(test_distributed_topology PRIVATE ${TORCH_CXX_FLAGS})

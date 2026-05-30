@@ -77,6 +77,9 @@ struct CausalLmPolicyOptions {
   std::string qwen_model_dir;
   // Truncate the layer stack for fast smoke runs. -1 keeps every layer.
   int64_t qwen_max_layers = -1;
+  // Trainable parameter dtype. float32 is the conservative CPU/default path;
+  // CUDA training and vLLM Native RL sync can use bfloat16 or float16.
+  torch::ScalarType param_dtype = torch::kFloat32;
 };
 
 std::shared_ptr<CausalLmPolicy> make_causal_lm_policy(const CausalLmPolicyOptions& options);

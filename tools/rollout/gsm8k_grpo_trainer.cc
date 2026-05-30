@@ -60,6 +60,7 @@ struct Args {
   std::string policy_kind = "tiny";
   std::string model_dir;
   int64_t qwen_max_layers = -1;
+  std::string param_dtype = "float32";
   std::string device = "cpu";
   std::string export_dir;
   int64_t export_every = 0;
@@ -141,6 +142,8 @@ Args parse_args(int argc, char** argv) {
       args.model_dir = require_value(i, argc, argv, "--model-dir");
     } else if (a == "--qwen-max-layers") {
       args.qwen_max_layers = std::strtoll(require_value(i, argc, argv, "--qwen-max-layers"), nullptr, 10);
+    } else if (a == "--param-dtype") {
+      args.param_dtype = require_value(i, argc, argv, "--param-dtype");
     } else if (a == "--device") {
       args.device = require_value(i, argc, argv, "--device");
     } else if (a == "--export-dir") {
@@ -178,6 +181,19 @@ std::string step_export_path(const std::string& export_dir, int64_t step) {
   std::ostringstream name;
   name << "step_" << std::setw(6) << std::setfill('0') << step;
   return (std::filesystem::path(export_dir) / name.str()).string();
+}
+
+torch::ScalarType parse_param_dtype(const std::string& dtype) {
+  if (dtype == "float32" || dtype == "fp32" || dtype == "f32") {
+    return torch::kFloat32;
+  }
+  if (dtype == "bfloat16" || dtype == "bf16") {
+    return torch::kBFloat16;
+  }
+  if (dtype == "float16" || dtype == "fp16" || dtype == "f16") {
+    return torch::kFloat16;
+  }
+  throw std::invalid_argument("--param-dtype must be float32|bfloat16|float16");
 }
 
 torch::Tensor ids_to_tensor(const std::vector<int32_t>& ids, torch::Device device) {
@@ -317,6 +333,7 @@ int main(int argc, char** argv) {
       policy_opts.kind = cverl::torch_backend::CausalLmPolicyOptions::Kind::kQwen3_5;
       policy_opts.qwen_model_dir = args.model_dir;
       policy_opts.qwen_max_layers = args.qwen_max_layers;
+      policy_opts.param_dtype = parse_param_dtype(args.param_dtype);
     }
     auto policy = cverl::torch_backend::make_causal_lm_policy(policy_opts);
     torch::Device run_device(torch::kCPU);

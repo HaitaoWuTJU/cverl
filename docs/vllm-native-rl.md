@@ -55,9 +55,13 @@ tools/rollout/vllm_nccl_weight_sender.py \
   --model-dir /path/to/Qwen3.5-0.8B \
   --base-url http://127.0.0.1:8000 \
   --master-port 29577 \
-  --world-size 2
+  --world-size 2 \
+  --param-dtype bfloat16
 ```
 
 `world-size` is `1 + vLLM_worker_world_size`: trainer rank 0 plus every vLLM
 worker rank. The script posts only init/update metadata to vLLM; tensors are
 broadcast by vLLM's NCCL packed weight-transfer path.
+`--param-dtype` accepts `float32`, `bfloat16`/`bf16`, and `float16`/`fp16`; the
+bridge exposes live tensors in that dtype and emits matching vLLM
+`update_info.dtype_names`.

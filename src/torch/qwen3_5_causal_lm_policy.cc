@@ -38,23 +38,29 @@ void Qwen3_5CausalLmPolicy::publish_overrides() {
 
 Qwen3_5CausalLmPolicy::Qwen3_5CausalLmPolicy(const std::string& model_dir,
                                              int32_t pad_id,
-                                             int64_t max_layers)
+                                             int64_t max_layers,
+                                             torch::ScalarType param_dtype)
     : model_dir_(model_dir),
       pad_id_(pad_id),
-      max_layers_(max_layers) {
+      max_layers_(max_layers),
+      param_dtype_(param_dtype) {
   HfModelLoader loader(model_dir_);
   model_ = std::make_unique<Qwen35TextModel>(std::move(loader));
   config_ = model_->config();
 
-  // Materialize every weight the forward path will hit, cast to fp32, and
-  // register as a trainable parameter on this nn::Module. We must NOT call
-  // model_->to(...) afterwards — it would reallocate every entry in its
+  TORCH_CHECK(param_dtype_ == torch::kFloat32 || param_dtype_ == torch::kBFloat16 ||
+                  param_dtype_ == torch::kFloat16,
+              "Qwen3_5CausalLmPolicy param_dtype must be float32, bfloat16, or float16");
+
+  // Materialize every weight the forward path will hit, cast to the requested
+  // training dtype, and register as a trainable parameter on this nn::Module.
+  // We must NOT call model_->to(...) afterwards — it would reallocate every entry in its
   // weights_ map and break the override link to our registered parameters.
   // Device migration goes through this->to_device(...).
   weight_names_ = model_->required_weight_names(max_layers_);
   registered_names_.reserve(weight_names_.size());
   for (const auto& name : weight_names_) {
-    auto tensor = model_->loader().load_tensor(name).to(torch::kFloat32).contiguous();
+    auto tensor = model_->loader().load_tensor(name).to(param_dtype_).contiguous();
     tensor.set_requires_grad(true);
     auto registered_name = sanitize_name(name);
     register_parameter(registered_name, tensor, /*requires_grad=*/true);
@@ -101,7 +107,7 @@ torch::Tensor Qwen3_5CausalLmPolicy::forward(const torch::Tensor& prompt_ids,
 }
 
 std::shared_ptr<CausalLmPolicy> Qwen3_5CausalLmPolicy::clone_as_reference() const {
-  auto ref = std::make_shared<Qwen3_5CausalLmPolicy>(model_dir_, pad_id_, max_layers_);
+  auto ref = std::make_shared<Qwen3_5CausalLmPolicy>(model_dir_, pad_id_, max_layers_, param_dtype_);
   // Copy parameters from `this` into ref, in registration order, then freeze.
   torch::NoGradGuard no_grad;
   auto src_named = const_cast<Qwen3_5CausalLmPolicy*>(this)->named_parameters(false);

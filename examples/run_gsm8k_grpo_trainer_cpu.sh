@@ -24,4 +24,5 @@ cmake --build "${BUILD_DIR}" -j "${JOBS:-2}" --target gsm8k_grpo_trainer
   --tokenizer hf \
   --tokenizer-path "${TOKENIZER_PATH}" \
   --device cpu \
+  --param-dtype "${PARAM_DTYPE:-float32}" \
   --temperature "${TEMPERATURE:-0}"

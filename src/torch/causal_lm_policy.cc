@@ -29,7 +29,7 @@ std::shared_ptr<CausalLmPolicy> make_causal_lm_policy(const CausalLmPolicyOption
         throw std::invalid_argument("qwen3_5 policy requires qwen_model_dir");
       }
       return std::make_shared<Qwen3_5CausalLmPolicy>(
-          options.qwen_model_dir, options.pad_id, options.qwen_max_layers);
+          options.qwen_model_dir, options.pad_id, options.qwen_max_layers, options.param_dtype);
   }
   throw std::invalid_argument("unsupported CausalLmPolicy kind");
 }

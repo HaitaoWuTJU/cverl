@@ -56,7 +56,8 @@ std::vector<std::string> parse_layer_types(const std::string& text) {
 }
 
 torch::Tensor dense(const torch::Tensor& x, const torch::Tensor& w) {
-  return torch::matmul(x, w.transpose(0, 1));
+  auto input = x.scalar_type() == w.scalar_type() ? x : x.to(w.scalar_type());
+  return torch::matmul(input, w.transpose(0, 1));
 }
 
 torch::Tensor rotate_half(const torch::Tensor& x) {
@@ -189,7 +190,7 @@ torch::Tensor Qwen35TextModel::embed(const torch::Tensor& input_ids) {
 torch::Tensor Qwen35TextModel::rms_norm(const torch::Tensor& x, const torch::Tensor& w) const {
   auto xf = x.to(torch::kFloat32);
   auto out = xf * torch::rsqrt((xf * xf).mean(-1, true) + config_.rms_norm_eps);
-  return out * (1.0 + w.to(torch::kFloat32));
+  return (out * (1.0 + w.to(torch::kFloat32))).to(x.scalar_type());
 }
 
 torch::Tensor Qwen35TextModel::rms_norm_gated(const torch::Tensor& x,
@@ -197,7 +198,7 @@ torch::Tensor Qwen35TextModel::rms_norm_gated(const torch::Tensor& x,
                                              const torch::Tensor& w) const {
   auto xf = x.to(torch::kFloat32);
   auto out = xf * torch::rsqrt((xf * xf).mean(-1, true) + config_.rms_norm_eps);
-  return (out * w.to(torch::kFloat32)) * torch::silu(gate.to(torch::kFloat32));
+  return ((out * w.to(torch::kFloat32)) * torch::silu(gate.to(torch::kFloat32))).to(x.scalar_type());
 }
 
 std::pair<torch::Tensor, torch::Tensor> Qwen35TextModel::rotary_embeddings(int64_t batch_size,
@@ -265,6 +266,7 @@ torch::Tensor Qwen35TextModel::full_attention(const torch::Tensor& x, int64_t la
   auto mask = torch::ones({s, s}, torch::TensorOptions().dtype(torch::kBool).device(x.device())).triu(1);
   attn = attn.masked_fill(mask.unsqueeze(0).unsqueeze(0), -1.0e9);
   attn = torch::softmax(attn.to(torch::kFloat32), -1);
+  attn = attn.to(v.scalar_type());
   auto out = torch::matmul(attn, v).transpose(1, 2).contiguous().reshape({b, s, h * d});
   out = out * torch::sigmoid(gate);
   return dense(out, weight(p + "o_proj.weight"));
@@ -314,6 +316,7 @@ torch::Tensor Qwen35TextModel::full_attention_tensor_parallel(const torch::Tenso
   auto mask = torch::ones({s, s}, torch::TensorOptions().dtype(torch::kBool).device(x.device())).triu(1);
   attn = attn.masked_fill(mask.unsqueeze(0).unsqueeze(0), -1.0e9);
   attn = torch::softmax(attn.to(torch::kFloat32), -1);
+  attn = attn.to(v.scalar_type());
   auto local = torch::matmul(attn, v).transpose(1, 2).contiguous().reshape({b, s, h_local * d});
   local = local * torch::sigmoid(gate);
   auto o_weight_shard = distributed::shard_dim(weight(p + "o_proj.weight"), 1, tensor_group.rank, tensor_group.world_size);

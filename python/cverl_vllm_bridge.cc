@@ -47,11 +47,25 @@ std::string dtype_name(torch::ScalarType dtype) {
   }
 }
 
+torch::ScalarType parse_param_dtype(const std::string& dtype) {
+  if (dtype == "float32" || dtype == "fp32" || dtype == "f32") {
+    return torch::kFloat32;
+  }
+  if (dtype == "bfloat16" || dtype == "bf16") {
+    return torch::kBFloat16;
+  }
+  if (dtype == "float16" || dtype == "fp16" || dtype == "f16") {
+    return torch::kFloat16;
+  }
+  throw std::invalid_argument("param_dtype must be float32|bfloat16|float16");
+}
+
 class QwenPolicyHandle {
  public:
   QwenPolicyHandle(const std::string& model_dir,
                    const std::string& tokenizer_path,
-                   const std::string& device) {
+                   const std::string& device,
+                   const std::string& param_dtype) {
     cverl::text::HfBpeTokenizerOptions tok_opts;
     tok_opts.tokenizer_json_path = tokenizer_path.empty()
         ? (std::filesystem::path(model_dir) / "tokenizer.json").string()
@@ -63,6 +77,7 @@ class QwenPolicyHandle {
     opts.qwen_model_dir = model_dir;
     opts.qwen_max_layers = -1;
     opts.pad_id = tokenizer_->pad_id() >= 0 ? tokenizer_->pad_id() : 0;
+    opts.param_dtype = parse_param_dtype(param_dtype);
     policy_ = cverl::torch_backend::make_causal_lm_policy(opts);
     to_device(device);
   }
@@ -116,10 +131,11 @@ class QwenPolicyHandle {
 
 PYBIND11_MODULE(_cverl_vllm_bridge, m) {
   py::class_<QwenPolicyHandle>(m, "QwenPolicy")
-      .def(py::init<const std::string&, const std::string&, const std::string&>(),
+      .def(py::init<const std::string&, const std::string&, const std::string&, const std::string&>(),
            py::arg("model_dir"),
            py::arg("tokenizer_path") = "",
-           py::arg("device") = "cuda:0")
+           py::arg("device") = "cuda:0",
+           py::arg("param_dtype") = "float32")
       .def("to_device", &QwenPolicyHandle::to_device)
       .def("named_parameters", &QwenPolicyHandle::named_parameters)
       .def("update_info", &QwenPolicyHandle::update_info,

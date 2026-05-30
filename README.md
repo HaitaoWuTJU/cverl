@@ -348,7 +348,9 @@ for fast CPU tests.
 For end-to-end RL on the actual Qwen3.5 weights, use `gsm8k_grpo_trainer
 --policy qwen --model-dir ./models/Qwen3.5-0.8B`. It wraps `Qwen35TextModel` in a
 `Qwen3_5CausalLmPolicy` nn::Module so AdamW + PPO autograd actually
-update the loaded fp32 parameters; `tests/torch/test_qwen3_5_grpo_step`
+update the loaded parameters. Use `--param-dtype float32|bfloat16|float16` to
+choose the trainable parameter dtype; CUDA examples default to bfloat16 and CPU
+debugging defaults to float32. `tests/torch/test_qwen3_5_grpo_step`
 verifies the param_delta is non-zero on H20 with mixed-correctness GRPO
 groups.
 

@@ -24,6 +24,7 @@ args=(
   --tokenizer hf
   --tokenizer-path "${TOKENIZER_PATH}"
   --device cuda
+  --param-dtype "${PARAM_DTYPE:-bfloat16}"
   --temperature "${TEMPERATURE:-1.0}"
 )
 

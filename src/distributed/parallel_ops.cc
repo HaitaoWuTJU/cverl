@@ -15,7 +15,8 @@ void validate_group(const ParallelGroup& group) {
 }
 
 torch::Tensor dense_linear(const torch::Tensor& input, const torch::Tensor& weight) {
-  return torch::matmul(input, weight.transpose(0, 1));
+  auto x = input.scalar_type() == weight.scalar_type() ? input : input.to(weight.scalar_type());
+  return torch::matmul(x, weight.transpose(0, 1));
 }
 
 }  // namespace
