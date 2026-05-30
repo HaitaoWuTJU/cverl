@@ -18,8 +18,13 @@ MASTER_WEIGHTS="${MASTER_WEIGHTS:-true}"
 SKIP_OPTIMIZER_STEP="${SKIP_OPTIMIZER_STEP:-false}"
 VARY_TOKENS_BY_STEP="${VARY_TOKENS_BY_STEP:-false}"
 JSONL_INPUT="${JSONL_INPUT:-}"
+ROLLOUT_JSON="${ROLLOUT_JSON:-}"
+ROLLOUT_DIR="${ROLLOUT_DIR:-}"
 JSONL_MAX_EXAMPLES="${JSONL_MAX_EXAMPLES:-16}"
 TOKENIZER_JSON="${TOKENIZER_JSON:-${MODEL_DIR}/tokenizer.json}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-}"
+CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-0}"
+METRICS_CSV="${METRICS_CSV:-}"
 DTYPE="${DTYPE:-bfloat16}"
 ID_PREFIX="${ID_PREFIX:-/tmp/cverl_qwen_pp_tp_ppo}"
 NCCL_LIB_DIR="${NCCL_LIB_DIR:-}"
@@ -58,8 +63,13 @@ for ((rank = 0; rank < WORLD_SIZE; ++rank)); do
       --skip-optimizer-step "${SKIP_OPTIMIZER_STEP}" \
       --vary-tokens-by-step "${VARY_TOKENS_BY_STEP}" \
       --jsonl-input "${JSONL_INPUT}" \
+      --rollout-json "${ROLLOUT_JSON}" \
+      --rollout-dir "${ROLLOUT_DIR}" \
       --jsonl-max-examples "${JSONL_MAX_EXAMPLES}" \
       --tokenizer-json "${TOKENIZER_JSON}" \
+      --checkpoint-dir "${CHECKPOINT_DIR}" \
+      --checkpoint-every "${CHECKPOINT_EVERY}" \
+      --metrics-csv "${METRICS_CSV}" \
       --dtype "${DTYPE}" \
       --id-prefix "${ID_PREFIX}" \
       >"/tmp/cverl_qwen_pp_tp_ppo_rank_${rank}.log" 2>&1 &

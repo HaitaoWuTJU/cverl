@@ -1,12 +1,15 @@
 #include <cstdlib>
 #include <cmath>
 #include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
+#include <nlohmann/json.hpp>
 #include <torch/torch.h>
 
 #include "cverl/data/hf_dataset.h"
@@ -16,6 +19,9 @@
 #include "cverl/distributed/topology.h"
 #include "cverl/model/hf_model_loader.h"
 #include "cverl/model/qwen3_5_text.h"
+#include "cverl/reward/gsm8k.h"
+#include "cverl/rollout/rollout_batch.h"
+#include "cverl/rollout/transport.h"
 #include "cverl/text/hf_bpe_tokenizer.h"
 #include "cverl/text/tokenizer.h"
 #include "cverl/torch/core_algos_torch.h"
@@ -85,6 +91,16 @@ std::vector<torch::Tensor> clone_params(const std::vector<torch::Tensor>& params
   return out;
 }
 
+struct PpPpoBatch {
+  std::vector<torch::Tensor> token_ids;
+  std::vector<torch::Tensor> advantages;
+  std::vector<torch::Tensor> response_masks;
+  int64_t rows = 0;
+  double mean_reward = 0.0;
+  double success_rate = 0.0;
+  double adv_abs_sum = 0.0;
+};
+
 torch::ScalarType parse_dtype(const std::string& dtype) {
   if (dtype == "float32" || dtype == "fp32") {
     return torch::kFloat32;
@@ -96,6 +112,192 @@ torch::ScalarType parse_dtype(const std::string& dtype) {
     return torch::kFloat16;
   }
   throw std::invalid_argument("unsupported dtype");
+}
+
+std::vector<std::string> json_string_vector(const nlohmann::json& obj, const char* key) {
+  if (!obj.contains(key) || !obj.at(key).is_array()) {
+    throw std::runtime_error(std::string("rollout JSON missing array: ") + key);
+  }
+  std::vector<std::string> out;
+  out.reserve(obj.at(key).size());
+  for (const auto& item : obj.at(key)) {
+    out.push_back(item.get<std::string>());
+  }
+  return out;
+}
+
+std::vector<uint32_t> json_u32_vector(const nlohmann::json& obj, const char* key) {
+  if (!obj.contains(key) || !obj.at(key).is_array()) {
+    throw std::runtime_error(std::string("rollout JSON missing array: ") + key);
+  }
+  std::vector<uint32_t> out;
+  out.reserve(obj.at(key).size());
+  for (const auto& item : obj.at(key)) {
+    out.push_back(item.get<uint32_t>());
+  }
+  return out;
+}
+
+std::string rollout_json_path_for_step(const std::string& rollout_json,
+                                       const std::string& rollout_dir,
+                                       int64_t step) {
+  if (!rollout_json.empty()) {
+    return rollout_json;
+  }
+  if (rollout_dir.empty()) {
+    return "";
+  }
+  char name[64];
+  std::snprintf(name, sizeof(name), "rollout_step_%06lld.json", static_cast<long long>(step + 1));
+  return (std::filesystem::path(rollout_dir) / name).string();
+}
+
+void save_rank_checkpoint(const std::string& checkpoint_dir,
+                          int64_t step,
+                          int64_t global_rank,
+                          const std::vector<torch::Tensor>& params,
+                          const std::vector<torch::Tensor>& master_params,
+                          bool use_master_weights) {
+  if (checkpoint_dir.empty()) {
+    return;
+  }
+  std::ostringstream step_name;
+  step_name << "step_" << std::setw(6) << std::setfill('0') << (step + 1);
+  const auto step_dir = std::filesystem::path(checkpoint_dir) / step_name.str();
+  std::filesystem::create_directories(step_dir);
+
+  torch::serialize::OutputArchive archive;
+  const auto& source = use_master_weights ? master_params : params;
+  for (size_t i = 0; i < source.size(); ++i) {
+    archive.write("param_" + std::to_string(i), source[i].detach().to(torch::kCPU));
+  }
+  archive.save_to((step_dir / ("rank_" + std::to_string(global_rank) + ".pt")).string());
+
+  if (global_rank == 0) {
+    nlohmann::json manifest;
+    manifest["step"] = step + 1;
+    manifest["format"] = "cverl_pp_tp_rank_local_params_v1";
+    manifest["use_master_weights"] = use_master_weights;
+    manifest["rank_files"] = nlohmann::json::array();
+    std::ofstream out(step_dir / "manifest.json");
+    out << manifest.dump(2) << "\n";
+  }
+}
+
+void append_metrics_csv(const std::string& path,
+                        int64_t step,
+                        int64_t pp_size,
+                        int64_t tp_size,
+                        int64_t micro_batches,
+                        int64_t layers,
+                        int64_t prompt_len,
+                        int64_t response_len,
+                        int64_t rollout_rows,
+                        double mean_reward,
+                        double success_rate,
+                        double adv_abs_sum,
+                        double total_loss,
+                        double total_kl,
+                        double total_clipfrac,
+                        double total_grad_norm,
+                        double total_param_delta) {
+  if (path.empty()) {
+    return;
+  }
+  const bool write_header = !std::filesystem::exists(path) || std::filesystem::file_size(path) == 0;
+  const auto parent = std::filesystem::path(path).parent_path();
+  if (!parent.empty()) {
+    std::filesystem::create_directories(parent);
+  }
+  std::ofstream out(path, std::ios::app);
+  if (write_header) {
+    out << "step,pp,tp,micro_batches,layers,prompt_len,response_len,rollout_rows,"
+        << "mean_reward,success_rate,adv_abs_sum,loss_sum,ppo_kl_sum,clipfrac_sum,"
+        << "grad_norm_sum,param_delta_sum\n";
+  }
+  out << step << ","
+      << pp_size << ","
+      << tp_size << ","
+      << micro_batches << ","
+      << layers << ","
+      << prompt_len << ","
+      << response_len << ","
+      << rollout_rows << ","
+      << mean_reward << ","
+      << success_rate << ","
+      << adv_abs_sum << ","
+      << total_loss << ","
+      << total_kl << ","
+      << total_clipfrac << ","
+      << total_grad_norm << ","
+      << total_param_delta << "\n";
+}
+
+PpPpoBatch load_rollout_ppo_batch(const std::string& path,
+                                  const std::string& tokenizer_json,
+                                  int64_t prompt_len,
+                                  int64_t response_len,
+                                  torch::Device device) {
+  std::ifstream in(path);
+  if (!in) {
+    throw std::runtime_error("failed to open rollout JSON: " + path);
+  }
+  nlohmann::json doc = nlohmann::json::parse(in);
+  auto prompts = json_string_vector(doc, "prompts");
+  auto answers = json_string_vector(doc, "answers");
+  auto responses = json_string_vector(doc, "responses");
+  auto prompt_indices = json_u32_vector(doc, "prompt_indices");
+  auto sample_indices = json_u32_vector(doc, "sample_indices");
+  if (responses.size() != prompt_indices.size() || responses.size() != sample_indices.size()) {
+    throw std::runtime_error("rollout JSON response/index size mismatch: " + path);
+  }
+
+  cverl::rollout::RolloutResponse rollout;
+  rollout.sequences.reserve(responses.size());
+  for (size_t i = 0; i < responses.size(); ++i) {
+    cverl::rollout::RolloutSequence seq;
+    seq.prompt_index = prompt_indices[i];
+    seq.sample_index = sample_indices[i];
+    seq.text = responses[i];
+    seq.finish_reason = "stop";
+    rollout.sequences.push_back(std::move(seq));
+  }
+
+  cverl::text::HfBpeTokenizerOptions tok_opts;
+  tok_opts.tokenizer_json_path = tokenizer_json;
+  cverl::text::HfBpeTokenizer tokenizer(tok_opts);
+  cverl::reward::Gsm8kRewardOptions reward_opts;
+  reward_opts.method = cverl::reward::Gsm8kExtractionMethod::Flexible;
+  cverl::rollout::RolloutBatchOptions batch_opts;
+  batch_opts.max_prompt_tokens = prompt_len;
+  batch_opts.max_response_tokens = response_len;
+  auto rollout_batch =
+      cverl::rollout::build_gsm8k_rollout_batch(rollout, prompts, answers, reward_opts, tokenizer, batch_opts);
+
+  auto prompt_ids = rollout_batch.prompt_ids.to(device);
+  auto response_ids = rollout_batch.response_ids.to(device);
+  auto response_mask = rollout_batch.response_mask.to(device);
+  auto token_rewards = rollout_batch.token_rewards.to(device);
+  auto group_ids = rollout_batch.group_ids.to(device);
+  torch::Tensor returns;
+  auto advantages = cverl::torch_backend::grpo_outcome_advantage(
+      token_rewards, response_mask, group_ids, 1.0e-6, true, &returns);
+
+  PpPpoBatch out;
+  out.rows = prompt_ids.size(0);
+  out.mean_reward = rollout_batch.scalar_rewards.mean().item<double>();
+  out.success_rate =
+      (rollout_batch.scalar_rewards >= reward_opts.correct_score - 1e-6).to(torch::kFloat32).mean().item<double>();
+  out.adv_abs_sum = advantages.abs().sum().item<double>();
+  out.token_ids.reserve(static_cast<size_t>(out.rows));
+  out.advantages.reserve(static_cast<size_t>(out.rows));
+  out.response_masks.reserve(static_cast<size_t>(out.rows));
+  for (int64_t i = 0; i < out.rows; ++i) {
+    out.token_ids.push_back(torch::cat({prompt_ids.index({i}), response_ids.index({i})}, 0).view({1, prompt_len + response_len}));
+    out.advantages.push_back(advantages.index({i}).view({1, response_len}));
+    out.response_masks.push_back(response_mask.index({i}).view({1, response_len}));
+  }
+  return out;
 }
 
 std::vector<torch::Tensor> load_jsonl_token_batches(const std::string& jsonl_path,
@@ -152,9 +354,14 @@ torch::Tensor make_token_ids(int64_t seq_len,
                              int64_t micro_batch,
                              int64_t step,
                              bool vary_tokens_by_step,
+                             const PpPpoBatch* rollout_batch,
                              const std::vector<torch::Tensor>& jsonl_batches,
                              const cverl::Qwen35TextConfig& config,
                              torch::Device device) {
+  if (rollout_batch != nullptr && rollout_batch->rows > 0) {
+    const int64_t idx = micro_batch % rollout_batch->rows;
+    return rollout_batch->token_ids[static_cast<size_t>(idx)];
+  }
   if (!jsonl_batches.empty()) {
     const int64_t idx = (step * 1024 + micro_batch) % static_cast<int64_t>(jsonl_batches.size());
     return jsonl_batches[static_cast<size_t>(idx)];
@@ -193,9 +400,14 @@ int main(int argc, char** argv) {
     const bool skip_optimizer_step = arg_bool(argc, argv, "--skip-optimizer-step", false);
     const bool vary_tokens_by_step = arg_bool(argc, argv, "--vary-tokens-by-step", false);
     const std::string jsonl_input = arg_str(argc, argv, "--jsonl-input", "");
+    const std::string rollout_json = arg_str(argc, argv, "--rollout-json", "");
+    const std::string rollout_dir = arg_str(argc, argv, "--rollout-dir", "");
     const std::string tokenizer_json =
         arg_str(argc, argv, "--tokenizer-json", (std::filesystem::path(model_dir) / "tokenizer.json").string());
     const int64_t jsonl_max_examples = arg_i64(argc, argv, "--jsonl-max-examples", 16);
+    const std::string checkpoint_dir = arg_str(argc, argv, "--checkpoint-dir", "");
+    const int64_t checkpoint_every = arg_i64(argc, argv, "--checkpoint-every", 0);
+    const std::string metrics_csv = arg_str(argc, argv, "--metrics-csv", "");
     const auto dtype = parse_dtype(arg_str(argc, argv, "--dtype", "bfloat16"));
     const std::string id_prefix = arg_str(argc, argv, "--id-prefix", "/tmp/cverl_qwen_pp_tp_ppo");
 
@@ -281,13 +493,26 @@ int main(int argc, char** argv) {
       double loss_sum = 0.0;
       double kl_sum = 0.0;
       double clipfrac_sum = 0.0;
+      double mean_reward = 0.0;
+      double success_rate = 0.0;
+      double adv_abs_sum = 0.0;
+      PpPpoBatch rollout_batch;
+      const std::string rollout_path = rollout_json_path_for_step(rollout_json, rollout_dir, step);
+      const PpPpoBatch* active_rollout = nullptr;
+      if (!rollout_path.empty()) {
+        rollout_batch = load_rollout_ppo_batch(rollout_path, tokenizer_json, prompt_len, response_len, device);
+        active_rollout = &rollout_batch;
+        mean_reward = rollout_batch.mean_reward;
+        success_rate = rollout_batch.success_rate;
+        adv_abs_sum = rollout_batch.adv_abs_sum;
+      }
 
       for (const auto& action : schedule) {
         if (action.op == cverl::distributed::PipelineScheduleOp::Forward) {
           torch::Tensor input;
           if (peers.is_first_stage) {
             auto ids = make_token_ids(
-                seq_len, action.micro_batch, step, vary_tokens_by_step, jsonl_batches, model.config(), device);
+                seq_len, action.micro_batch, step, vary_tokens_by_step, active_rollout, jsonl_batches, model.config(), device);
             input = model.token_embeddings(ids);
           } else {
             auto like = torch::empty(hidden_shape, torch::TensorOptions().device(device).dtype(dtype));
@@ -307,14 +532,22 @@ int main(int argc, char** argv) {
           }
           if (peers.is_last_stage) {
             auto ids = make_token_ids(
-                seq_len, action.micro_batch, step, vary_tokens_by_step, jsonl_batches, model.config(), device);
+                seq_len, action.micro_batch, step, vary_tokens_by_step, active_rollout, jsonl_batches, model.config(), device);
             auto logits = model.lm_head_logits(out_it->second).to(torch::kFloat32);
             auto response_logits = logits.slice(1, prompt_len - 1, prompt_len + response_len - 1);
             auto response_ids = ids.slice(1, prompt_len, prompt_len + response_len);
             auto log_probs = cverl::torch_backend::response_log_probs(response_logits, response_ids);
             auto old_log_probs = log_probs.detach();
-            auto advantages = torch::ones_like(log_probs) * advantage_scale;
-            auto response_mask = torch::ones_like(log_probs);
+            torch::Tensor advantages;
+            torch::Tensor response_mask;
+            if (active_rollout != nullptr) {
+              const int64_t idx = action.micro_batch % active_rollout->rows;
+              advantages = active_rollout->advantages[static_cast<size_t>(idx)];
+              response_mask = active_rollout->response_masks[static_cast<size_t>(idx)];
+            } else {
+              advantages = torch::ones_like(log_probs) * advantage_scale;
+              response_mask = torch::ones_like(log_probs);
+            }
             auto loss = cverl::torch_backend::ppo_clipped_loss(
                 old_log_probs,
                 log_probs,
@@ -357,6 +590,10 @@ int main(int argc, char** argv) {
               : (use_master_weights ? cverl::torch_backend::parameter_delta_sum(
                                           param_before, optimizer.master_parameters())
                                     : cverl::torch_backend::parameter_delta_sum(param_before, params));
+      if (checkpoint_every > 0 && (step + 1) % checkpoint_every == 0) {
+        save_rank_checkpoint(
+            checkpoint_dir, step, global_rank, params, optimizer.master_parameters(), use_master_weights);
+      }
 
       auto grad_tensor = torch::tensor({local_grad_norm}, torch::TensorOptions().device(device).dtype(torch::kFloat32));
       auto delta_tensor = torch::tensor({local_param_delta}, torch::TensorOptions().device(device).dtype(torch::kFloat32));
@@ -391,6 +628,23 @@ int main(int argc, char** argv) {
           total_kl += kl_sums[i].item<double>();
           total_clipfrac += clip_sums[i].item<double>();
         }
+        append_metrics_csv(metrics_csv,
+                           step,
+                           pp_size,
+                           tp_size,
+                           micro_batches,
+                           layers,
+                           prompt_len,
+                           response_len,
+                           active_rollout != nullptr ? active_rollout->rows : 0,
+                           mean_reward,
+                           success_rate,
+                           adv_abs_sum,
+                           total_loss,
+                           total_kl,
+                           total_clipfrac,
+                           total_grad_norm,
+                           total_param_delta);
         std::cout << "step=" << step
                   << " pp=" << pp_size
                   << " tp=" << tp_size
@@ -402,6 +656,10 @@ int main(int argc, char** argv) {
                   << " skip_optimizer_step=" << (skip_optimizer_step ? "true" : "false")
                   << " vary_tokens_by_step=" << (vary_tokens_by_step ? "true" : "false")
                   << " jsonl_examples=" << jsonl_batches.size()
+                  << " rollout_rows=" << (active_rollout != nullptr ? active_rollout->rows : 0)
+                  << " mean_reward=" << mean_reward
+                  << " success_rate=" << success_rate
+                  << " adv_abs_sum=" << adv_abs_sum
                   << " loss_sum=" << total_loss
                   << " ppo_kl_sum=" << total_kl
                   << " clipfrac_sum=" << total_clipfrac

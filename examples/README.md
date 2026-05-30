@@ -25,6 +25,11 @@ NCCL_SOCKET_IFNAME=eth1 CUDA_VISIBLE_DEVICES=0,1,2,3 \
 # Timing baseline; writes build/bench/qwen_multigpu_ppo_bench.csv.
 NCCL_SOCKET_IFNAME=eth1 CUDA_VISIBLE_DEVICES=0,1,2,3 \
   tools/bench/qwen_multigpu_ppo_bench.sh ../models/Qwen3.5-0.8B
+
+# Real rollout batch -> PP/TP PPO trainer. Use ROLLOUT_BACKEND=vllm with a
+# running vLLM server, or oracle for a deterministic reward-variance check.
+ROLLOUT_BACKEND=oracle NCCL_SOCKET_IFNAME=eth1 CUDA_VISIBLE_DEVICES=0,1,2,3 \
+  tools/distributed/run_rollout_to_pp_tp_ppo.sh ../models/Qwen3.5-0.8B
 ```
 
 Useful distributed planning command:

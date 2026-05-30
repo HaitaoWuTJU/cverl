@@ -220,6 +220,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--packed-num-buffers", type=int, default=2)
     parser.add_argument("--checkpoint-format", action=argparse.BooleanOptionalAction, default=True,
                         help="send HF checkpoint names and let vLLM map them into kernel-format parameters")
+    parser.add_argument("--dump-rollout-dir", default="",
+                        help="write each real rollout batch as JSON for the C++ PP/TP trainer")
+    parser.add_argument("--skip-train", action="store_true",
+                        help="only generate and dump rollout batches; do not update local cverl policy")
     return parser.parse_args()
 
 
@@ -227,18 +231,21 @@ def main() -> int:
     args = parse_args()
     random.seed(args.seed)
 
-    import torch
-    import _cverl_vllm_bridge
-
-    if not torch.cuda.is_available() and args.device.startswith("cuda"):
-        raise RuntimeError("CUDA device requested but torch.cuda is not available")
-    if args.device.startswith("cuda"):
-        torch.cuda.set_device(int(args.device.split(":", 1)[1]))
-
     data = load_jsonl(args.dataset, args.prompt_field, args.answer_field, args.max_examples)
-    policy = _cverl_vllm_bridge.QwenPolicy(
-        args.model_dir, args.tokenizer_path, args.device, args.param_dtype, args.qwen_max_layers)
-    syncer = None if args.no_weight_sync else VllmNcclSync(args)
+    policy = None
+    syncer = None
+    if not args.skip_train:
+        import torch
+        import _cverl_vllm_bridge
+
+        if not torch.cuda.is_available() and args.device.startswith("cuda"):
+            raise RuntimeError("CUDA device requested but torch.cuda is not available")
+        if args.device.startswith("cuda"):
+            torch.cuda.set_device(int(args.device.split(":", 1)[1]))
+
+        policy = _cverl_vllm_bridge.QwenPolicy(
+            args.model_dir, args.tokenizer_path, args.device, args.param_dtype, args.qwen_max_layers)
+        syncer = None if args.no_weight_sync else VllmNcclSync(args)
 
     if args.sync_initial and syncer is not None:
         syncer.sync(policy)
@@ -258,6 +265,31 @@ def main() -> int:
                 args.base_url, served_model, prompts, args.n, args.max_tokens,
                 args.temperature, args.top_p, args.seed + step * 100003, args.timeout)
         t1 = time.perf_counter()
+
+        if args.dump_rollout_dir:
+            dump_dir = Path(args.dump_rollout_dir)
+            dump_dir.mkdir(parents=True, exist_ok=True)
+            tmp_path = dump_dir / f"rollout_step_{step:06d}.json.tmp"
+            out_path = dump_dir / f"rollout_step_{step:06d}.json"
+            tmp_path.write_text(json.dumps({
+                "step": step,
+                "prompts": prompts,
+                "answers": answers,
+                "responses": responses,
+                "prompt_indices": prompt_indices,
+                "sample_indices": sample_indices,
+            }, ensure_ascii=False))
+            tmp_path.replace(out_path)
+
+        if args.skip_train:
+            print(
+                f"{step},{args.rollout_backend},{len(responses)},"
+                f"0.000000,0.000000,0.000000,0.000000,"
+                f"0.000000,0.000000,0.000000,0.000000,"
+                f"0.000000,{t1 - t0:.6f},0.000000,0.000000",
+                flush=True,
+            )
+            continue
 
         metrics = policy.gsm8k_grpo_update(
             prompts, responses, answers, prompt_indices, sample_indices,
