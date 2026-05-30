@@ -42,7 +42,7 @@ shared-memory or CUDA IPC later does not require touching trainer logic.
 
 ## Pipeline binaries
 
-`examples/rollout/gsm8k_rollout_pipeline.cc` exercises the upper half of the
+`tools/rollout/gsm8k_rollout_pipeline.cc` exercises the upper half of the
 chain (rollout + reward, no trainer):
 
 ```
@@ -53,7 +53,7 @@ gsm8k_rollout_pipeline \
   --reward-method strict
 ```
 
-`examples/rollout/gsm8k_grpo_smoke.cc` runs the full closed loop on CPU:
+`tools/rollout/gsm8k_grpo_smoke.cc` runs the full closed loop on CPU:
 GSM8K -> RolloutTransport -> rule reward -> Tokenizer -> TinyCausalPolicy
 logprobs -> GRPO advantages -> PPO clipped step. KL penalty against a frozen
 reference policy is enabled with `--kl-coef > 0` and `--kl-penalty
@@ -121,4 +121,3 @@ computation, PPO loss, optimizer step) does not change between transports.
   by Python `tokenizers`.
 
 All tests are wired into `make test` and run on CPU only.
-

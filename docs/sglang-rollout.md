@@ -20,7 +20,7 @@ The full smoke can be run with:
 PATCH_SGLANG_ACTIVATION_JIT=1 \
 BUILD_DIR=build-h20-nccl \
 MODEL_PATH=../models/Qwen3.5-0.8B \
-examples/scripts/run_sglang_gsm8k_smoke.sh
+examples/run_sglang_gsm8k_smoke.sh
 ```
 
 The script starts SGLang, checks `/v1/models`, sends one `/v1/completions`

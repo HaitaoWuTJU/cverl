@@ -290,26 +290,26 @@ if (CVERL_BUILD_TESTS)
     target_compile_options(qwen3_5_dp_tp_smoke PRIVATE ${TORCH_CXX_FLAGS})
   endif()
 
-  add_executable(minimal_ppo_step examples/torch/minimal_ppo_step.cc)
+  add_executable(minimal_ppo_step tools/torch/minimal_ppo_step.cc)
   target_link_libraries(minimal_ppo_step PRIVATE cverl)
   target_compile_options(minimal_ppo_step PRIVATE ${TORCH_CXX_FLAGS})
 
-  add_executable(toy_grpo_trainer examples/torch/toy_grpo_trainer.cc)
+  add_executable(toy_grpo_trainer tools/torch/toy_grpo_trainer.cc)
   target_link_libraries(toy_grpo_trainer PRIVATE cverl)
   target_compile_options(toy_grpo_trainer PRIVATE ${TORCH_CXX_FLAGS})
 
-  add_executable(hf_embedding_grpo_trainer examples/model/hf_embedding_grpo_trainer.cc)
+  add_executable(hf_embedding_grpo_trainer tools/model/hf_embedding_grpo_trainer.cc)
   target_link_libraries(hf_embedding_grpo_trainer PRIVATE cverl)
   target_compile_options(hf_embedding_grpo_trainer PRIVATE ${TORCH_CXX_FLAGS})
 
-  add_executable(cverl_gsm8k_grpo_bench examples/bench/cverl_gsm8k_grpo_bench.cc)
+  add_executable(cverl_gsm8k_grpo_bench tools/bench/cverl_gsm8k_grpo_bench.cc)
   target_link_libraries(cverl_gsm8k_grpo_bench PRIVATE cverl)
   target_compile_options(cverl_gsm8k_grpo_bench PRIVATE ${TORCH_CXX_FLAGS})
 
-  add_executable(gsm8k_rollout_pipeline examples/rollout/gsm8k_rollout_pipeline.cc)
+  add_executable(gsm8k_rollout_pipeline tools/rollout/gsm8k_rollout_pipeline.cc)
   target_link_libraries(gsm8k_rollout_pipeline PRIVATE cverl)
 
-  add_executable(gsm8k_grpo_smoke examples/rollout/gsm8k_grpo_smoke.cc)
+  add_executable(gsm8k_grpo_smoke tools/rollout/gsm8k_grpo_smoke.cc)
   target_link_libraries(gsm8k_grpo_smoke PRIVATE cverl)
   target_compile_options(gsm8k_grpo_smoke PRIVATE ${TORCH_CXX_FLAGS})
 endif()
