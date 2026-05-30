@@ -226,7 +226,7 @@ int main(int argc, char** argv) {
     // but for the smoke loop the initial policy is fine.
     auto ref_policy = cverl::torch_backend::clone_as_reference(policy);
 
-    std::cout << "step,transport,total_seq,mean_reward,success_rate,no_answer,loss,pg_loss,kl_loss,ppo_kl,clipfrac,seconds\n";
+    std::cout << "step,transport,total_seq,mean_reward,success_rate,no_answer,loss,pg_loss,kl_loss,ppo_kl,clipfrac,param_delta,seconds\n";
 
     for (int64_t step = 1; step <= args.steps; ++step) {
       // Build the per-step batch from the dataset.
@@ -279,6 +279,15 @@ int main(int argc, char** argv) {
         }
       }
 
+      std::vector<torch::Tensor> params_before;
+      params_before.reserve(policy->parameters().size());
+      {
+        torch::NoGradGuard no_grad;
+        for (const auto& param : policy->parameters()) {
+          params_before.push_back(param.detach().clone());
+        }
+      }
+
       double last_loss = 0.0;
       double last_pg_loss = 0.0;
       double last_kl_loss = 0.0;
@@ -309,6 +318,15 @@ int main(int argc, char** argv) {
         last_clipfrac = loss.pg_clipfrac.item<double>();
       }
 
+      double param_delta = 0.0;
+      {
+        torch::NoGradGuard no_grad;
+        auto params_after = policy->parameters();
+        for (size_t i = 0; i < params_before.size(); ++i) {
+          param_delta += (params_after[i].detach() - params_before[i]).abs().sum().item<double>();
+        }
+      }
+
       // Reporting.
       double mean_reward = batch.scalar_rewards.mean().item<double>();
       double success_rate = (batch.scalar_rewards >= reward_opts.correct_score - 1e-6).to(torch::kFloat32).mean().item<double>();
@@ -331,6 +349,7 @@ int main(int argc, char** argv) {
                 << last_kl_loss << ","
                 << last_kl << ","
                 << last_clipfrac << ","
+                << param_delta << ","
                 << seconds << "\n";
     }
     return 0;
