@@ -220,6 +220,58 @@ void test_pipeline_peers() {
   require(cverl::distributed::pipeline_warmup_micro_batches(topology, first) == 1, "first stage warmup");
 }
 
+void test_pipeline_1f1b_schedule() {
+  cverl::distributed::ClusterSpec spec;
+  spec.parallel.data_parallel = 1;
+  spec.parallel.pipeline_parallel = 4;
+  spec.parallel.context_parallel = 1;
+  spec.parallel.tensor_parallel = 1;
+  spec.parallel.micro_batches = 8;
+  spec.world_size = 4;
+  spec.local_world_size = 4;
+  spec.gpus_per_node = 4;
+
+  {
+    spec.rank = 0;
+    cverl::distributed::Topology topology(spec);
+    auto actions = cverl::distributed::pipeline_1f1b_schedule(topology, topology.local_rank_info());
+    require(actions.size() == 16, "stage0 action count");
+    require(actions[0].phase == cverl::distributed::PipelineSchedulePhase::Warmup &&
+                actions[0].op == cverl::distributed::PipelineScheduleOp::Forward &&
+                actions[0].micro_batch == 0 && !actions[0].recv_forward && actions[0].send_forward,
+            "stage0 warmup fwd0");
+    require(actions[2].micro_batch == 2 && actions[2].op == cverl::distributed::PipelineScheduleOp::Forward,
+            "stage0 warmup fwd2");
+    require(actions[3].phase == cverl::distributed::PipelineSchedulePhase::Steady &&
+                actions[3].op == cverl::distributed::PipelineScheduleOp::Forward &&
+                actions[3].micro_batch == 3,
+            "stage0 steady fwd3");
+    require(actions[4].op == cverl::distributed::PipelineScheduleOp::Backward &&
+                actions[4].micro_batch == 0 && actions[4].recv_backward && !actions[4].send_backward,
+            "stage0 steady bwd0");
+    require(actions.back().phase == cverl::distributed::PipelineSchedulePhase::Cooldown &&
+                actions.back().op == cverl::distributed::PipelineScheduleOp::Backward &&
+                actions.back().micro_batch == 7,
+            "stage0 cooldown bwd7");
+    require(cverl::distributed::pipeline_schedule_max_live_activations(actions) == 4, "stage0 max live");
+  }
+
+  {
+    spec.rank = 3;
+    cverl::distributed::Topology topology(spec);
+    auto actions = cverl::distributed::pipeline_1f1b_schedule(topology, topology.local_rank_info());
+    require(actions.size() == 16, "last stage action count");
+    require(actions[0].phase == cverl::distributed::PipelineSchedulePhase::Steady &&
+                actions[0].op == cverl::distributed::PipelineScheduleOp::Forward &&
+                actions[0].micro_batch == 0 && actions[0].recv_forward && !actions[0].send_forward,
+            "last stage steady fwd0");
+    require(actions[1].op == cverl::distributed::PipelineScheduleOp::Backward &&
+                actions[1].micro_batch == 0 && !actions[1].recv_backward && actions[1].send_backward,
+            "last stage steady bwd0");
+    require(cverl::distributed::pipeline_schedule_max_live_activations(actions) == 1, "last stage max live");
+  }
+}
+
 void test_context_parallel_slice() {
   auto x = torch::arange(2 * 8 * 3, torch::kFloat32).view({2, 8, 3});
   auto left = cverl::distributed::context_parallel_slice(x, 0, 2, 1);
@@ -249,6 +301,7 @@ int main() {
     test_single_process_collectives();
     test_cluster_spec_from_env();
     test_pipeline_peers();
+    test_pipeline_1f1b_schedule();
     test_context_parallel_slice();
     test_dtype_names();
   } catch (const std::exception& e) {

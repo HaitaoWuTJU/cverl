@@ -40,7 +40,7 @@ void print_vec(const char* name, const std::vector<int64_t>& values) {
 void usage(const char* argv0) {
   std::cerr << "usage: " << argv0
             << " --dp D --tp T --pp P --cp C [--micro-batches M] [--rank R] [--world-size W]"
-               " [--num-layers N] [--all-ranks]\n";
+               " [--num-layers N] [--all-ranks] [--schedule]\n";
 }
 
 }  // namespace
@@ -74,6 +74,7 @@ int main(int argc, char** argv) {
     std::cout << "micro_batches=" << dims.micro_batches << "\n";
 
     const bool all_ranks = has_flag(argc, argv, "--all-ranks");
+    const bool show_schedule = has_flag(argc, argv, "--schedule");
     int64_t begin = all_ranks ? 0 : topology.rank();
     int64_t end = all_ranks ? topology.world_size() : topology.rank() + 1;
     for (int64_t rank = begin; rank < end; ++rank) {
@@ -92,6 +93,21 @@ int main(int argc, char** argv) {
       if (num_layers > 0) {
         auto range = topology.pipeline_layer_range(num_layers, info.pipeline_rank);
         std::cout << "  layer_range=" << range.begin << ":" << range.end << "\n";
+      }
+      if (show_schedule) {
+        auto actions = cverl::distributed::pipeline_1f1b_schedule(topology, info);
+        std::cout << "  max_live_activations=" << cverl::distributed::pipeline_schedule_max_live_activations(actions)
+                  << "\n";
+        for (size_t i = 0; i < actions.size(); ++i) {
+          const auto& action = actions[i];
+          std::cout << "  schedule[" << i << "]=" << cverl::distributed::pipeline_schedule_phase_name(action.phase)
+                    << ":" << cverl::distributed::pipeline_schedule_op_name(action.op)
+                    << ":mb" << action.micro_batch
+                    << ":rf" << (action.recv_forward ? 1 : 0)
+                    << ":sf" << (action.send_forward ? 1 : 0)
+                    << ":rb" << (action.recv_backward ? 1 : 0)
+                    << ":sb" << (action.send_backward ? 1 : 0) << "\n";
+        }
       }
     }
 

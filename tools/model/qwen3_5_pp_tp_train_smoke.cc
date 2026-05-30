@@ -3,12 +3,14 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <torch/torch.h>
 
 #include "cverl/distributed/nccl_collectives.h"
 #include "cverl/distributed/parallel_ops.h"
+#include "cverl/distributed/pipeline.h"
 #include "cverl/distributed/topology.h"
 #include "cverl/model/hf_model_loader.h"
 #include "cverl/model/qwen3_5_text.h"
@@ -84,6 +86,7 @@ int main(int argc, char** argv) {
         arg_i64(argc, argv, "--device", std::getenv("LOCAL_RANK") ? std::stoll(std::getenv("LOCAL_RANK")) : global_rank);
     const int64_t layers = arg_i64(argc, argv, "--layers", 2);
     const int64_t seq_len = arg_i64(argc, argv, "--seq-len", 4);
+    const int64_t micro_batches = arg_i64(argc, argv, "--micro-batches", pp_size);
     const auto dtype = parse_dtype(arg_str(argc, argv, "--dtype", "bfloat16"));
     const std::string id_prefix = arg_str(argc, argv, "--id-prefix", "/tmp/cverl_qwen_pp_tp_train");
 
@@ -92,7 +95,7 @@ int main(int argc, char** argv) {
     dims.pipeline_parallel = pp_size;
     dims.context_parallel = 1;
     dims.tensor_parallel = tp_size;
-    dims.micro_batches = pp_size;
+    dims.micro_batches = micro_batches;
     cverl::distributed::ClusterSpec spec;
     spec.world_size = world_size;
     spec.rank = global_rank;
@@ -103,6 +106,8 @@ int main(int argc, char** argv) {
     cverl::distributed::Topology topology(spec);
     auto info = topology.local_rank_info();
     auto range = topology.pipeline_layer_range(layers, info.pipeline_rank);
+    auto schedule = cverl::distributed::pipeline_1f1b_schedule(topology, info);
+    auto peers = cverl::distributed::pipeline_peers(topology, info);
 
     const std::string full_id_path = id_prefix + "_full.bin";
     const std::string tp_id_path = id_prefix + "_tp_pp" + std::to_string(info.pipeline_rank) + ".bin";
@@ -137,28 +142,59 @@ int main(int argc, char** argv) {
                          .view({1, seq_len})
                          .to(torch::Device(torch::kCUDA, static_cast<int>(device)));
     const std::vector<int64_t> hidden_shape{1, seq_len, model.config().hidden_size};
-    torch::Tensor activation;
+    std::unordered_map<int64_t, torch::Tensor> stage_inputs;
+    std::unordered_map<int64_t, torch::Tensor> stage_outputs;
+    double loss_sum = 0.0;
+    for (const auto& action : schedule) {
+      if (action.op == cverl::distributed::PipelineScheduleOp::Forward) {
+        torch::Tensor input;
+        if (peers.is_first_stage) {
+          auto mb_ids = ids + action.micro_batch;
+          input = model.token_embeddings(mb_ids);
+        } else {
+          auto like = torch::empty(hidden_shape, torch::TensorOptions()
+                                                    .device(torch::kCUDA, static_cast<int>(device))
+                                                    .dtype(dtype));
+          input = full_comm.recv_like(like, peers.previous_rank).detach().set_requires_grad(true);
+          stage_inputs[action.micro_batch] = input;
+        }
+        auto output = model.forward_hidden_range_tensor_parallel(
+            input, range.begin, range.end, tp_group, peers.is_last_stage);
+        stage_outputs[action.micro_batch] = output;
+        if (!peers.is_last_stage) {
+          full_comm.send(output.contiguous(), peers.next_rank);
+        }
+      } else {
+        auto out_it = stage_outputs.find(action.micro_batch);
+        if (out_it == stage_outputs.end()) {
+          throw std::runtime_error("missing stage activation for backward");
+        }
+        if (peers.is_last_stage) {
+          auto loss = out_it->second.to(torch::kFloat32).square().mean();
+          loss_sum += loss.item<double>();
+          loss.backward();
+        } else {
+          auto grad = full_comm.recv_like(out_it->second.contiguous(), peers.next_rank);
+          out_it->second.backward(grad);
+        }
 
-    if (info.pipeline_rank == 0) {
-      auto hidden = model.token_embeddings(ids);
-      activation = model.forward_hidden_range_tensor_parallel(hidden, range.begin, range.end, tp_group, false);
-      full_comm.send(activation.contiguous(), global_rank + tp_size);
-      auto grad = full_comm.recv_like(activation.contiguous(), global_rank + tp_size);
-      activation.backward(grad);
-    } else if (info.pipeline_rank + 1 == pp_size) {
-      auto like = torch::empty(hidden_shape, torch::TensorOptions().device(torch::kCUDA, static_cast<int>(device)).dtype(dtype));
-      auto input = full_comm.recv_like(like, global_rank - tp_size).detach().set_requires_grad(true);
-      auto hidden = model.forward_hidden_range_tensor_parallel(input, range.begin, range.end, tp_group, true);
-      auto loss = hidden.to(torch::kFloat32).square().mean();
-      loss.backward();
-      full_comm.send(input.grad().contiguous(), global_rank - tp_size);
-    } else {
-      throw std::runtime_error("qwen3_5_pp_tp_train_smoke currently expects pp-size=2");
+        if (!peers.is_first_stage) {
+          auto in_it = stage_inputs.find(action.micro_batch);
+          if (in_it == stage_inputs.end()) {
+            throw std::runtime_error("missing stage input for backward");
+          }
+          full_comm.send(in_it->second.grad().contiguous(), peers.previous_rank);
+          stage_inputs.erase(in_it);
+        }
+        stage_outputs.erase(out_it);
+      }
     }
 
     const double local_grad_norm = grad_norm_sum(params);
     auto grad_tensor = torch::tensor({local_grad_norm}, torch::TensorOptions().device(torch::kCUDA, static_cast<int>(device)).dtype(torch::kFloat32));
     auto grad_norms = full_comm.all_gather(grad_tensor.contiguous(), full_group(world_size), 0).cpu();
+    auto loss_tensor = torch::tensor({loss_sum}, torch::TensorOptions().device(torch::kCUDA, static_cast<int>(device)).dtype(torch::kFloat32));
+    auto loss_sums = full_comm.all_gather(loss_tensor.contiguous(), full_group(world_size), 0).cpu();
     full_comm.barrier();
 
     if (global_rank == 0) {
@@ -166,13 +202,16 @@ int main(int argc, char** argv) {
       for (int64_t pp = 0; pp < pp_size; ++pp) {
         std::filesystem::remove(id_prefix + "_tp_pp" + std::to_string(pp) + ".bin");
       }
-      std::cout << "qwen3.5 pp/tp train smoke pp=" << pp_size << " tp=" << tp_size << " layers=" << layers
-                << " seq_len=" << seq_len << "\n";
+      std::cout << "qwen3.5 pp/tp 1f1b train smoke pp=" << pp_size << " tp=" << tp_size
+                << " micro_batches=" << micro_batches << " layers=" << layers << " seq_len=" << seq_len << "\n";
       bool all_have_grad = true;
       for (int64_t i = 0; i < grad_norms.numel(); ++i) {
         const double value = grad_norms[i].item<double>();
         std::cout << "rank" << i << "_grad_norm_sum=" << value << "\n";
         all_have_grad = all_have_grad && value > 0.0;
+      }
+      for (int64_t i = 0; i < loss_sums.numel(); ++i) {
+        std::cout << "rank" << i << "_loss_sum=" << loss_sums[i].item<double>() << "\n";
       }
       std::cout << "all_ranks_have_grad=" << (all_have_grad ? "true" : "false") << "\n";
       return all_have_grad ? 0 : 2;

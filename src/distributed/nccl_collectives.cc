@@ -8,6 +8,7 @@
 #include <iterator>
 #include <stdexcept>
 #include <thread>
+#include <unistd.h>
 
 namespace cverl::distributed {
 namespace {
@@ -92,18 +93,24 @@ NcclUniqueIdBytes create_nccl_unique_id() {
 }
 
 void write_nccl_unique_id_file(const std::string& path, const NcclUniqueIdBytes& id) {
-  std::ofstream out(path, std::ios::binary);
+  const std::string tmp_path = path + ".tmp." + std::to_string(::getpid());
+  std::ofstream out(tmp_path, std::ios::binary);
   if (!out) {
-    throw std::runtime_error("failed to open NCCL id file for write: " + path);
+    throw std::runtime_error("failed to open NCCL id file for write: " + tmp_path);
   }
   out.write(id.bytes.data(), static_cast<std::streamsize>(id.bytes.size()));
   if (!out) {
-    throw std::runtime_error("failed to write NCCL id file: " + path);
+    throw std::runtime_error("failed to write NCCL id file: " + tmp_path);
   }
+  out.close();
+  std::filesystem::rename(tmp_path, path);
 }
 
 NcclUniqueIdBytes read_nccl_unique_id_file(const std::string& path) {
-  for (int i = 0; i < 200 && !std::filesystem::exists(path); ++i) {
+  for (int i = 0; i < 200; ++i) {
+    if (std::filesystem::exists(path) && std::filesystem::file_size(path) == NCCL_UNIQUE_ID_BYTES) {
+      break;
+    }
     std::this_thread::sleep_for(std::chrono::milliseconds(25));
   }
   std::ifstream in(path, std::ios::binary);

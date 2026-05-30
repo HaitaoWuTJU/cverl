@@ -8,6 +8,7 @@ TP_SIZE="${TP_SIZE:-2}"
 WORLD_SIZE=$((PP_SIZE * TP_SIZE))
 LAYERS="${LAYERS:-2}"
 SEQ_LEN="${SEQ_LEN:-4}"
+MICRO_BATCHES="${MICRO_BATCHES:-4}"
 DTYPE="${DTYPE:-bfloat16}"
 ID_PREFIX="${ID_PREFIX:-/tmp/cverl_qwen_pp_tp_train}"
 NCCL_LIB_DIR="${NCCL_LIB_DIR:-}"
@@ -30,6 +31,7 @@ for ((rank = 0; rank < WORLD_SIZE; ++rank)); do
       --device "${rank}" \
       --layers "${LAYERS}" \
       --seq-len "${SEQ_LEN}" \
+      --micro-batches "${MICRO_BATCHES}" \
       --dtype "${DTYPE}" \
       --id-prefix "${ID_PREFIX}" \
       >"/tmp/cverl_qwen_pp_tp_train_rank_${rank}.log" 2>&1 &
