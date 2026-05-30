@@ -39,9 +39,9 @@ void broadcast_parameters_from_root(const std::vector<ParameterView>& parameters
   collectives.barrier();
 }
 
-std::vector<ParameterView> module_parameter_views(torch::nn::Module& module) {
+std::vector<ParameterView> module_parameter_views(torch::nn::Module& module, bool recurse) {
   std::vector<ParameterView> out;
-  auto named = module.named_parameters(/*recurse=*/false);
+  auto named = module.named_parameters(recurse);
   out.reserve(named.size());
   for (const auto& kv : named) {
     out.push_back(ParameterView{kv.key(), kv.value()});

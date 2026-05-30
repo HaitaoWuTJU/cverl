@@ -4,6 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-${ROOT_DIR}/build}"
 DATASET="${DATASET:-${ROOT_DIR}/data/gsm8k-train-smoke.jsonl}"
+MODEL_DIR="${MODEL_DIR:-${ROOT_DIR}/../models/Qwen3.5-0.8B}"
+TOKENIZER_PATH="${TOKENIZER_PATH:-${MODEL_DIR}/tokenizer.json}"
 
 cmake -S "${ROOT_DIR}" -B "${BUILD_DIR}"
 cmake --build "${BUILD_DIR}" -j "${JOBS:-2}" --target gsm8k_grpo_trainer
@@ -17,7 +19,9 @@ cmake --build "${BUILD_DIR}" -j "${JOBS:-2}" --target gsm8k_grpo_trainer
   --max-tokens "${MAX_TOKENS:-8}" \
   --max-prompt-tokens "${MAX_PROMPT_TOKENS:-64}" \
   --max-response-tokens "${MAX_RESPONSE_TOKENS:-16}" \
-  --policy "${POLICY:-tiny}" \
-  --tokenizer "${TOKENIZER:-byte}" \
+  --policy qwen \
+  --model-dir "${MODEL_DIR}" \
+  --tokenizer hf \
+  --tokenizer-path "${TOKENIZER_PATH}" \
   --device cpu \
   --temperature "${TEMPERATURE:-0}"

@@ -27,9 +27,12 @@ Implemented foundation:
 - `cverl::distributed::NcclCollectives::broadcast`
 - `cverl::distributed::broadcast_parameters_from_root`
 - `cverl::rollout::RolloutWorker`
+- `cverl::rollout::PolicyRolloutWorker`
+- `cverl::rollout::DynamicRolloutWorker`
 - `cverl::rollout::synchronize_rollout_actor_weights`
 - CPU unit test: `test_weight_sync`
 - CPU unit test: `test_rollout_worker`
+- plugin loader unit test: `test_plugin_worker`
 - NCCL test coverage inside `test_nccl_collectives`
 
 `gsm8k_grpo_trainer` may still export HF checkpoints for debugging or offline
@@ -53,3 +56,5 @@ The reuse point is their CUDA kernels, paged-attention cache, scheduler,
 tensor-parallel sharding, pipeline scheduling, and optimizer/communication
 patterns. The boundary must be C++/CUDA worker/plugin APIs exposing GPU tensors,
 not HTTP endpoints.
+
+See `docs/rollout-worker-plugin.md` for the plugin ABI.

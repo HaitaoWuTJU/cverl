@@ -54,6 +54,7 @@ Current distributed support:
 Current efficient rollout foundation:
 
 - `RolloutWorker` interface for vLLM/Megatron/native CUDA worker plugins
+- dynamic rollout worker plugin loader (`cverl_create_rollout_worker`)
 - direct GPU parameter registration via `ParameterView`
 - NCCL broadcast for trainer-to-rollout actor weight synchronization
 - POSIX shared-memory region only for small CPU metadata/control messages

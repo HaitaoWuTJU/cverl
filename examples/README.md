@@ -5,8 +5,8 @@ This directory contains shell launchers only. C++ sources and tests belong under
 
 Current examples:
 
-- `run_gsm8k_grpo_trainer_cpu.sh`: tiny CPU end-to-end GRPO/PPO run.
-- `run_gsm8k_grpo_trainer_cuda.sh`: Qwen/Tiny CUDA trainer entry point with
+- `run_gsm8k_grpo_trainer_cpu.sh`: Qwen3.5-0.8B CPU entry point for debugging.
+- `run_gsm8k_grpo_trainer_cuda.sh`: Qwen3.5-0.8B CUDA trainer entry point with
   in-process rollout.
 - `run_h20_nccl_weight_sync.sh`: H20 NCCL collectives and parameter sync check.
 

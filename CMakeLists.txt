@@ -112,6 +112,8 @@ add_library(cverl STATIC
   src/model/safetensors_writer.cc
   src/reward/gsm8k.cc
   src/rollout/rollout_batch.cc
+  src/rollout/policy_worker.cc
+  src/rollout/plugin_worker.cc
   src/rollout/shared_memory.cc
   src/rollout/shared_memory_transport.cc
   src/rollout/transport.cc
@@ -148,6 +150,7 @@ endif()
 target_link_libraries(cverl PUBLIC Threads::Threads)
 # librt provides POSIX shared memory + named semaphores on Linux.
 target_link_libraries(cverl PUBLIC rt)
+target_link_libraries(cverl PUBLIC ${CMAKE_DL_LIBS})
 target_include_directories(cverl PUBLIC ${PCRE2_INCLUDE_DIR})
 target_link_libraries(cverl PUBLIC ${PCRE2_LIBRARY})
 target_compile_options(cverl PRIVATE ${TORCH_CXX_FLAGS})
@@ -223,6 +226,18 @@ if (CVERL_BUILD_TESTS)
   add_executable(test_rollout_worker tests/rollout/test_rollout_worker.cc)
   target_link_libraries(test_rollout_worker PRIVATE cverl)
   target_compile_options(test_rollout_worker PRIVATE ${TORCH_CXX_FLAGS})
+
+  add_executable(test_policy_rollout_worker tests/rollout/test_policy_rollout_worker.cc)
+  target_link_libraries(test_policy_rollout_worker PRIVATE cverl)
+  target_compile_options(test_policy_rollout_worker PRIVATE ${TORCH_CXX_FLAGS})
+
+  add_library(test_rollout_worker_plugin_fixture SHARED tests/rollout/plugin_worker_fixture.cc)
+  target_link_libraries(test_rollout_worker_plugin_fixture PRIVATE cverl)
+  target_compile_options(test_rollout_worker_plugin_fixture PRIVATE ${TORCH_CXX_FLAGS})
+
+  add_executable(test_plugin_worker tests/rollout/test_plugin_worker.cc)
+  target_link_libraries(test_plugin_worker PRIVATE cverl)
+  target_compile_options(test_plugin_worker PRIVATE ${TORCH_CXX_FLAGS})
 
   add_executable(test_gsm8k_reward tests/reward/test_gsm8k_reward.cc)
   target_link_libraries(test_gsm8k_reward PRIVATE cverl)

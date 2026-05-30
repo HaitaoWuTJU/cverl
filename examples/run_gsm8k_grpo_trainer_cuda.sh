@@ -4,8 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-${ROOT_DIR}/build-h20-nccl}"
 DATASET="${DATASET:-${ROOT_DIR}/data/gsm8k-train-smoke.jsonl}"
-POLICY="${POLICY:-qwen}"
-MODEL_DIR="${MODEL_DIR:-${ROOT_DIR}/models/Qwen3.5-0.8B}"
+MODEL_DIR="${MODEL_DIR:-${ROOT_DIR}/../models/Qwen3.5-0.8B}"
 TOKENIZER_PATH="${TOKENIZER_PATH:-${MODEL_DIR}/tokenizer.json}"
 
 cmake -S "${ROOT_DIR}" -B "${BUILD_DIR}" -DCVERL_ENABLE_NCCL="${CVERL_ENABLE_NCCL:-ON}"
@@ -20,18 +19,16 @@ args=(
   --max-tokens "${MAX_TOKENS:-16}"
   --max-prompt-tokens "${MAX_PROMPT_TOKENS:-128}"
   --max-response-tokens "${MAX_RESPONSE_TOKENS:-32}"
-  --policy "${POLICY}"
+  --policy qwen
+  --model-dir "${MODEL_DIR}"
+  --tokenizer hf
+  --tokenizer-path "${TOKENIZER_PATH}"
   --device cuda
   --temperature "${TEMPERATURE:-1.0}"
 )
 
-if [[ "${POLICY}" == "qwen" ]]; then
-  args+=(--model-dir "${MODEL_DIR}" --tokenizer hf --tokenizer-path "${TOKENIZER_PATH}")
-  if [[ -n "${QWEN_MAX_LAYERS:-}" ]]; then
-    args+=(--qwen-max-layers "${QWEN_MAX_LAYERS}")
-  fi
-else
-  args+=(--tokenizer byte)
+if [[ -n "${QWEN_MAX_LAYERS:-}" ]]; then
+  args+=(--qwen-max-layers "${QWEN_MAX_LAYERS}")
 fi
 
 "${BUILD_DIR}/gsm8k_grpo_trainer" "${args[@]}"

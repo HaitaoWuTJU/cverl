@@ -23,6 +23,6 @@ void broadcast_parameters_from_root(const std::vector<ParameterView>& parameters
                                     int64_t root,
                                     const std::vector<int64_t>& group);
 
-std::vector<ParameterView> module_parameter_views(torch::nn::Module& module);
+std::vector<ParameterView> module_parameter_views(torch::nn::Module& module, bool recurse = true);
 
 }  // namespace cverl::distributed

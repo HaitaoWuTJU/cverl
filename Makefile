@@ -20,6 +20,8 @@ test: all
 	./$(BUILD_DIR)/test_rollout_shared_memory_transport
 	./$(BUILD_DIR)/test_rollout_transport
 	./$(BUILD_DIR)/test_rollout_worker
+	./$(BUILD_DIR)/test_policy_rollout_worker
+	./$(BUILD_DIR)/test_plugin_worker ./$(BUILD_DIR)/libtest_rollout_worker_plugin_fixture.so
 	./$(BUILD_DIR)/test_gsm8k_reward
 	./$(BUILD_DIR)/test_byte_tokenizer
 	./$(BUILD_DIR)/test_hf_bpe_tokenizer
