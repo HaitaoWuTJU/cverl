@@ -15,6 +15,18 @@ Current examples:
   on GPU0-1 and cverl trainer/sender on GPU2, with GPU3 left free for the next
   trainer DP/TP step.
 
+Multi-GPU regression and benchmark entry points:
+
+```bash
+# Pass/fail baseline for Megatron-style Qwen PPO training.
+NCCL_SOCKET_IFNAME=eth1 CUDA_VISIBLE_DEVICES=0,1,2,3 \
+  tools/distributed/run_qwen_multigpu_regression.sh ../models/Qwen3.5-0.8B
+
+# Timing baseline; writes build/bench/qwen_multigpu_ppo_bench.csv.
+NCCL_SOCKET_IFNAME=eth1 CUDA_VISIBLE_DEVICES=0,1,2,3 \
+  tools/bench/qwen_multigpu_ppo_bench.sh ../models/Qwen3.5-0.8B
+```
+
 Useful distributed planning command:
 
 ```bash

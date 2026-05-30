@@ -10,6 +10,12 @@ if [[ -n "${NCCL_LIB_DIR}" ]]; then
   export LD_LIBRARY_PATH="${NCCL_LIB_DIR}:${LD_LIBRARY_PATH:-}"
 fi
 
+if [[ "${BUILD_DIR}" = /* ]]; then
+  TEST_NCCL="${BUILD_DIR}/test_nccl_collectives"
+else
+  TEST_NCCL="./${BUILD_DIR}/test_nccl_collectives"
+fi
+
 rm -f "${ID_FILE}" /tmp/cverl_nccl_rank_*.log
 
 for ((rank = 0; rank < WORLD_SIZE; ++rank)); do
@@ -17,7 +23,7 @@ for ((rank = 0; rank < WORLD_SIZE; ++rank)); do
   WORLD_SIZE="${WORLD_SIZE}" \
   LOCAL_RANK="${rank}" \
   CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}" \
-    "./${BUILD_DIR}/test_nccl_collectives" \
+    "${TEST_NCCL}" \
       --rank "${rank}" \
       --world-size "${WORLD_SIZE}" \
       --device "${rank}" \

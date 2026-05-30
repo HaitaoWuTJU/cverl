@@ -5,6 +5,7 @@ option(CVERL_BUILD_TESTS "Build cverl tests" ON)
 option(CVERL_ENABLE_CUDA "Build CUDA kernels" OFF)
 option(CVERL_ENABLE_NCCL "Build NCCL collectives" OFF)
 option(CVERL_BUILD_PYTHON_BRIDGE "Build Python bridge for vLLM Native RL weight sync" ON)
+option(CVERL_ENABLE_GPU_SMOKE_TESTS "Register multi-GPU smoke tests with CTest" OFF)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -227,6 +228,8 @@ if (CVERL_BUILD_PYTHON_BRIDGE)
 endif()
 
 if (CVERL_BUILD_TESTS)
+  enable_testing()
+
   add_executable(test_core_algos_cpu tests/test_core_algos_cpu.cc)
   target_link_libraries(test_core_algos_cpu PRIVATE cverl)
 
@@ -361,6 +364,20 @@ if (CVERL_BUILD_TESTS)
     add_executable(qwen3_5_pp_tp_ppo_trainer tools/model/qwen3_5_pp_tp_ppo_trainer.cc)
     target_link_libraries(qwen3_5_pp_tp_ppo_trainer PRIVATE cverl)
     target_compile_options(qwen3_5_pp_tp_ppo_trainer PRIVATE ${TORCH_CXX_FLAGS})
+
+    if (CVERL_ENABLE_GPU_SMOKE_TESTS)
+      add_test(
+        NAME qwen3_5_multigpu_pp_tp_ppo_regression
+        COMMAND
+          ${CMAKE_CURRENT_SOURCE_DIR}/tools/distributed/run_qwen_multigpu_regression.sh
+          ${CMAKE_CURRENT_SOURCE_DIR}/../models/Qwen3.5-0.8B
+      )
+      set_tests_properties(qwen3_5_multigpu_pp_tp_ppo_regression PROPERTIES
+        ENVIRONMENT
+          "BUILD_DIR=${CMAKE_BINARY_DIR};JSONL_INPUT=${CMAKE_CURRENT_SOURCE_DIR}/data/gsm8k-train-bench.jsonl"
+        TIMEOUT 600
+      )
+    endif()
   endif()
 
   add_executable(minimal_ppo_step tools/torch/minimal_ppo_step.cc)

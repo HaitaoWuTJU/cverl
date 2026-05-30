@@ -28,6 +28,12 @@ if [[ -n "${NCCL_LIB_DIR}" ]]; then
   export LD_LIBRARY_PATH="${NCCL_LIB_DIR}:${LD_LIBRARY_PATH:-}"
 fi
 
+if [[ "${BUILD_DIR}" = /* ]]; then
+  TRAINER="${BUILD_DIR}/qwen3_5_pp_tp_ppo_trainer"
+else
+  TRAINER="./${BUILD_DIR}/qwen3_5_pp_tp_ppo_trainer"
+fi
+
 rm -f "${ID_PREFIX}"_*.bin /tmp/cverl_qwen_pp_tp_ppo_rank_*.log
 
 for ((rank = 0; rank < WORLD_SIZE; ++rank)); do
@@ -35,7 +41,7 @@ for ((rank = 0; rank < WORLD_SIZE; ++rank)); do
   WORLD_SIZE="${WORLD_SIZE}" \
   LOCAL_RANK="${rank}" \
   CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}" \
-    "./${BUILD_DIR}/qwen3_5_pp_tp_ppo_trainer" "${MODEL_DIR}" \
+    "${TRAINER}" "${MODEL_DIR}" \
       --global-rank "${rank}" \
       --pp-size "${PP_SIZE}" \
       --tp-size "${TP_SIZE}" \
