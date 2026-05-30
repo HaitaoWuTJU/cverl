@@ -21,6 +21,7 @@
 #include "cverl/model/qwen3_5_text.h"
 #include "cverl/reward/gsm8k.h"
 #include "cverl/rollout/gpu_ipc_rollout_batch.h"
+#include "cverl/rollout/nccl_gpu_batch_transport.h"
 #include "cverl/rollout/rollout_batch.h"
 #include "cverl/rollout/transport.h"
 #include "cverl/text/hf_bpe_tokenizer.h"
@@ -443,6 +444,47 @@ PpPpoBatch load_rollout_ipc_batch(const std::string& path,
   }
   return out;
 #endif
+}
+
+PpPpoBatch convert_gpu_rollout_batch(const cverl::rollout::GpuRolloutBatch& gpu_batch,
+                                     int64_t expected_prompt_len,
+                                     int64_t expected_response_len) {
+  if (!gpu_batch.prompt_ids.defined() || !gpu_batch.response_ids.defined() ||
+      !gpu_batch.response_mask.defined() || !gpu_batch.advantages.defined()) {
+    throw std::runtime_error("NCCL GPU rollout batch missing required tensors");
+  }
+  const int64_t batch = gpu_batch.prompt_ids.size(0);
+  const int64_t prompt_len = gpu_batch.prompt_ids.size(1);
+  const int64_t response_len = gpu_batch.response_ids.size(1);
+  if (prompt_len != expected_prompt_len || response_len != expected_response_len) {
+    throw std::runtime_error("NCCL GPU rollout batch prompt/response length mismatch");
+  }
+  PpPpoBatch out;
+  out.rows = batch;
+  out.adv_abs_sum = gpu_batch.advantages.to(torch::kFloat32).abs().sum().item<double>();
+  if (gpu_batch.rewards.defined() && gpu_batch.rewards.numel() > 0) {
+    auto rewards = gpu_batch.rewards.to(torch::kFloat32);
+    out.mean_reward = rewards.mean().item<double>();
+    out.success_rate = (rewards >= 1.0 - 1e-6).to(torch::kFloat32).mean().item<double>();
+  }
+  out.token_ids.reserve(static_cast<size_t>(batch));
+  out.advantages.reserve(static_cast<size_t>(batch));
+  out.response_masks.reserve(static_cast<size_t>(batch));
+  out.old_log_probs.reserve(static_cast<size_t>(batch));
+  auto response_mask = gpu_batch.response_mask.to(torch::kFloat32);
+  auto advantages = gpu_batch.advantages.to(torch::kFloat32);
+  torch::Tensor old_log_probs = gpu_batch.old_log_probs.defined() ? gpu_batch.old_log_probs.to(torch::kFloat32) : torch::Tensor();
+  for (int64_t i = 0; i < batch; ++i) {
+    out.token_ids.push_back(torch::cat({gpu_batch.prompt_ids.index({i}), gpu_batch.response_ids.index({i})}, 0)
+                                .view({1, prompt_len + response_len})
+                                .contiguous());
+    out.advantages.push_back(advantages.index({i}).view({1, response_len}).contiguous());
+    out.response_masks.push_back(response_mask.index({i}).view({1, response_len}).contiguous());
+    if (old_log_probs.defined()) {
+      out.old_log_probs.push_back(old_log_probs.index({i}).view({1, response_len}).contiguous());
+    }
+  }
+  return out;
 }
 
 std::vector<torch::Tensor> load_jsonl_token_batches(const std::string& jsonl_path,

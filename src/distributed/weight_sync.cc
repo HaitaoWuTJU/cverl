@@ -1,5 +1,9 @@
 #include "cverl/distributed/weight_sync.h"
 
+#ifdef CVERL_ENABLE_NCCL
+#include "cverl/distributed/nccl_collectives.h"
+#endif
+
 #include <stdexcept>
 
 namespace cverl::distributed {
@@ -48,5 +52,31 @@ std::vector<ParameterView> module_parameter_views(torch::nn::Module& module, boo
   }
   return out;
 }
+
+#ifdef CVERL_ENABLE_NCCL
+void send_parameter_shards(const std::vector<ParameterView>& shards,
+                           NcclCollectives& collectives,
+                           int64_t peer) {
+  torch::NoGradGuard no_grad;
+  for (const auto& shard : shards) {
+    require_parameter(shard);
+    collectives.send(shard.tensor.contiguous(), peer);
+  }
+}
+
+void recv_parameter_shards(const std::vector<ParameterView>& shards,
+                           NcclCollectives& collectives,
+                           int64_t peer) {
+  torch::NoGradGuard no_grad;
+  for (const auto& shard : shards) {
+    require_parameter(shard);
+    auto received = collectives.recv_like(shard.tensor.contiguous(), peer);
+    if (received.sizes() != shard.tensor.sizes() || received.scalar_type() != shard.tensor.scalar_type()) {
+      throw std::runtime_error("received incompatible parameter shard: " + shard.name);
+    }
+    shard.tensor.copy_(received);
+  }
+}
+#endif
 
 }  // namespace cverl::distributed

@@ -106,6 +106,9 @@ endif()
 message(STATUS "Found PCRE2: ${PCRE2_LIBRARY}")
 
 if (CVERL_ENABLE_NCCL)
+  if (NOT CVERL_ENABLE_CUDA)
+    message(FATAL_ERROR "CVERL_ENABLE_NCCL=ON requires CVERL_ENABLE_CUDA=ON")
+  endif()
   find_package(Python COMPONENTS Interpreter REQUIRED)
   execute_process(
     COMMAND "${Python_EXECUTABLE}" -c
@@ -209,6 +212,7 @@ endif()
 if (CVERL_ENABLE_NCCL)
   target_sources(cverl PRIVATE
     src/distributed/nccl_collectives.cc
+    src/rollout/nccl_gpu_batch_transport.cc
   )
   target_include_directories(cverl PUBLIC ${NCCL_INCLUDE_DIR})
   target_link_libraries(cverl PUBLIC ${NCCL_LIBRARY})
@@ -357,6 +361,10 @@ if (CVERL_BUILD_TESTS)
     add_executable(test_nccl_collectives tests/distributed/test_nccl_collectives.cc)
     target_link_libraries(test_nccl_collectives PRIVATE cverl)
     target_compile_options(test_nccl_collectives PRIVATE ${TORCH_CXX_FLAGS})
+
+    add_executable(test_nccl_gpu_batch_transport tests/rollout/test_nccl_gpu_batch_transport.cc)
+    target_link_libraries(test_nccl_gpu_batch_transport PRIVATE cverl)
+    target_compile_options(test_nccl_gpu_batch_transport PRIVATE ${TORCH_CXX_FLAGS})
 
     add_executable(qwen3_5_tp_smoke tools/model/qwen3_5_tp_smoke.cc)
     target_link_libraries(qwen3_5_tp_smoke PRIVATE cverl)

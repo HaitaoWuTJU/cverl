@@ -10,6 +10,10 @@
 
 namespace cverl::distributed {
 
+#ifdef CVERL_ENABLE_NCCL
+class NcclCollectives;
+#endif
+
 struct ParameterView {
   std::string name;
   torch::Tensor tensor;
@@ -24,5 +28,18 @@ void broadcast_parameters_from_root(const std::vector<ParameterView>& parameters
                                     const std::vector<int64_t>& group);
 
 std::vector<ParameterView> module_parameter_views(torch::nn::Module& module, bool recurse = true);
+
+#ifdef CVERL_ENABLE_NCCL
+// Shard-wise GPU parameter transfer. The caller is responsible for building
+// matching source/destination shard lists from a reshard plan. No parameter is
+// gathered to CPU or reconstructed as a full model tensor here.
+void send_parameter_shards(const std::vector<ParameterView>& shards,
+                           NcclCollectives& collectives,
+                           int64_t peer);
+
+void recv_parameter_shards(const std::vector<ParameterView>& shards,
+                           NcclCollectives& collectives,
+                           int64_t peer);
+#endif
 
 }  // namespace cverl::distributed

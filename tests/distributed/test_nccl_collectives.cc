@@ -174,6 +174,31 @@ int main(int argc, char** argv) {
       }
     }
 
+    if (world >= 2) {
+      auto shard0 = torch::zeros({2, 2}, torch::TensorOptions().device(torch::kCUDA, static_cast<int>(device)).dtype(torch::kFloat32));
+      auto shard1 = torch::zeros({3}, torch::TensorOptions().device(torch::kCUDA, static_cast<int>(device)).dtype(torch::kFloat32));
+      if (rank == 0) {
+        shard0.copy_(torch::arange(1, 5, torch::TensorOptions().device(shard0.device()).dtype(torch::kFloat32)).reshape({2, 2}));
+        shard1.copy_(torch::tensor({11.0f, 12.0f, 13.0f}, torch::TensorOptions().device(shard1.device())));
+        cverl::distributed::send_parameter_shards(
+            {cverl::distributed::ParameterView{"tp_linear.weight.shard0", shard0},
+             cverl::distributed::ParameterView{"tp_linear.bias.shard0", shard1}},
+            comm,
+            1);
+      } else if (rank == 1) {
+        cverl::distributed::recv_parameter_shards(
+            {cverl::distributed::ParameterView{"tp_linear.weight.shard0", shard0},
+             cverl::distributed::ParameterView{"tp_linear.bias.shard0", shard1}},
+            comm,
+            0);
+        auto expected_shard0 =
+            torch::arange(1, 5, torch::TensorOptions().device(shard0.device()).dtype(torch::kFloat32)).reshape({2, 2});
+        auto expected_shard1 = torch::tensor({11.0f, 12.0f, 13.0f}, torch::TensorOptions().device(shard1.device()));
+        require_allclose(shard0, expected_shard0, "NCCL shard-wise parameter sync weight mismatch");
+        require_allclose(shard1, expected_shard1, "NCCL shard-wise parameter sync bias mismatch");
+      }
+    }
+
     comm.barrier();
     if (rank == 0) {
       std::filesystem::remove(id_path);
