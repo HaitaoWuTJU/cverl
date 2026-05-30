@@ -312,6 +312,10 @@ if (CVERL_BUILD_TESTS)
   target_link_libraries(cverl_gsm8k_grpo_bench PRIVATE cverl)
   target_compile_options(cverl_gsm8k_grpo_bench PRIVATE ${TORCH_CXX_FLAGS})
 
+  add_executable(vllm_weight_manifest tools/rollout/vllm_weight_manifest.cc)
+  target_link_libraries(vllm_weight_manifest PRIVATE cverl)
+  target_compile_options(vllm_weight_manifest PRIVATE ${TORCH_CXX_FLAGS})
+
   add_executable(gsm8k_grpo_trainer tools/rollout/gsm8k_grpo_trainer.cc)
   target_link_libraries(gsm8k_grpo_trainer PRIVATE cverl)
   target_compile_options(gsm8k_grpo_trainer PRIVATE ${TORCH_CXX_FLAGS})

@@ -54,6 +54,7 @@ Current distributed support:
 Current efficient rollout foundation:
 
 - `RolloutWorker` interface for vLLM/Megatron/native CUDA worker plugins
+- vLLM Native RL control helper and Qwen3.5 weight manifest generation
 - dynamic rollout worker plugin loader (`cverl_create_rollout_worker`)
 - direct GPU parameter registration via `ParameterView`
 - NCCL broadcast for trainer-to-rollout actor weight synchronization

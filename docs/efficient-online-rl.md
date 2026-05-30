@@ -51,10 +51,10 @@ struct RolloutWorker {
 };
 ```
 
-vLLM, FlashAttention, and Megatron are still important dependencies to reuse.
-The reuse point is their CUDA kernels, paged-attention cache, scheduler,
-tensor-parallel sharding, pipeline scheduling, and optimizer/communication
-patterns. The boundary must be C++/CUDA worker/plugin APIs exposing GPU tensors,
-not HTTP endpoints.
+vLLM is the first rollout backend to reuse. The reuse point is its paged
+attention/KV cache, continuous batching scheduler, FlashAttention backends,
+tensor-parallel serving, and Native RL weight-transfer path. cverl should only
+replace those pieces after measurement shows vLLM is the bottleneck.
 
 See `docs/rollout-worker-plugin.md` for the plugin ABI.
+See `docs/vllm-native-rl.md` for the vLLM Native RL control/sync path.
