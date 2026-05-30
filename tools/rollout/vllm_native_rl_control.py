@@ -19,6 +19,8 @@ import requests
 def post_json(base_url: str, path: str, payload: dict, timeout: float) -> dict:
     response = requests.post(f"{base_url.rstrip('/')}{path}", json=payload, timeout=timeout)
     response.raise_for_status()
+    if not response.content:
+        return {}
     return response.json()
 
 
@@ -43,7 +45,13 @@ def main() -> int:
 
     sub.add_parser("pause")
     sub.add_parser("resume")
+    sleep = sub.add_parser("sleep")
+    sleep.add_argument("--level", type=int, default=1)
+    sleep.add_argument("--mode", choices=("abort", "wait", "keep"), default="wait")
+    wake = sub.add_parser("wake")
+    wake.add_argument("--tags", nargs="*", default=None)
     sub.add_parser("world-size")
+    sub.add_parser("is-sleeping")
 
     init = sub.add_parser("init-nccl")
     init.add_argument("--master-address", default="127.0.0.1")
@@ -60,8 +68,22 @@ def main() -> int:
         print(json.dumps(post_json(args.base_url, "/pause?mode=wait", {}, args.timeout), indent=2))
     elif args.cmd == "resume":
         print(json.dumps(post_json(args.base_url, "/resume", {}, args.timeout), indent=2))
+    elif args.cmd == "sleep":
+        print(json.dumps(post_json(
+            args.base_url,
+            f"/sleep?level={args.level}&mode={args.mode}",
+            {},
+            args.timeout,
+        ), indent=2))
+    elif args.cmd == "wake":
+        suffix = ""
+        if args.tags:
+            suffix = "?" + "&".join(f"tags={tag}" for tag in args.tags)
+        print(json.dumps(post_json(args.base_url, "/wake_up" + suffix, {}, args.timeout), indent=2))
     elif args.cmd == "world-size":
         print(json.dumps(get_json(args.base_url, "/get_world_size?include_dp=true", args.timeout), indent=2))
+    elif args.cmd == "is-sleeping":
+        print(json.dumps(get_json(args.base_url, "/is_sleeping", args.timeout), indent=2))
     elif args.cmd == "init-nccl":
         payload = {
             "init_info": {

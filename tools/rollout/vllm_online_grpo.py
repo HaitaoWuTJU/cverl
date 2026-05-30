@@ -31,6 +31,8 @@ def normalize_dtype_name(dtype_name: str) -> str:
 def post_json(base_url: str, path: str, payload: dict[str, Any], timeout: float) -> dict[str, Any]:
     response = requests.post(f"{base_url.rstrip('/')}{path}", json=payload, timeout=timeout)
     response.raise_for_status()
+    if not response.content:
+        return {}
     return response.json()
 
 
@@ -175,6 +177,14 @@ class VllmNcclSync:
         post_json(self.args.base_url, "/resume", {}, self.args.timeout)
 
 
+def vllm_sleep(base_url: str, level: int, mode: str, timeout: float) -> None:
+    post_json(base_url, f"/sleep?level={level}&mode={mode}", {}, timeout)
+
+
+def vllm_wake(base_url: str, timeout: float) -> None:
+    post_json(base_url, "/wake_up", {}, timeout)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", required=True)
@@ -211,6 +221,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sync-initial", action="store_true")
     parser.add_argument("--sync-every", type=int, default=1)
     parser.add_argument("--no-weight-sync", action="store_true")
+    parser.add_argument("--sleep-vllm-for-train", action="store_true",
+                        help="after rollout, put vLLM sleep-mode on before local training, then wake before weight sync")
+    parser.add_argument("--vllm-sleep-level", type=int, default=1,
+                        help="vLLM sleep level: 1 offloads weights and drops KV cache; 2 drops all GPU allocations")
+    parser.add_argument("--vllm-sleep-mode", choices=("abort", "wait", "keep"), default="wait")
     parser.add_argument("--master-address", default="127.0.0.1")
     parser.add_argument("--master-port", type=int, default=29577)
     parser.add_argument("--world-size", type=int, default=2)
@@ -265,6 +280,8 @@ def main() -> int:
                 args.base_url, served_model, prompts, args.n, args.max_tokens,
                 args.temperature, args.top_p, args.seed + step * 100003, args.timeout)
         t1 = time.perf_counter()
+        if args.sleep_vllm_for_train and args.rollout_backend == "vllm":
+            vllm_sleep(args.base_url, args.vllm_sleep_level, args.vllm_sleep_mode, args.timeout)
 
         rollout_doc = None
         if args.dump_rollout_dir:
@@ -305,8 +322,12 @@ def main() -> int:
         sync_seconds = 0.0
         if syncer is not None and args.sync_every > 0 and step % args.sync_every == 0:
             s0 = time.perf_counter()
+            if args.sleep_vllm_for_train and args.rollout_backend == "vllm":
+                vllm_wake(args.base_url, args.timeout)
             syncer.sync(policy)
             sync_seconds = time.perf_counter() - s0
+        elif args.sleep_vllm_for_train and args.rollout_backend == "vllm":
+            vllm_wake(args.base_url, args.timeout)
 
         print(
             f"{step},{args.rollout_backend},{metrics['total_seq']},"

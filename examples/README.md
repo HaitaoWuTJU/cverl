@@ -14,6 +14,11 @@ Current examples:
 - `run_vllm_tp2_online_grpo_h20.sh`: 4-card H20 node launcher using vLLM TP=2
   on GPU0-1 and cverl trainer/sender on GPU2, with GPU3 left free for the next
   trainer DP/TP step.
+- `run_vllm_static_split_4gpu_h20.sh`: 4-card static role split for the 8-card
+  production design. GPU0-1 run vLLM TP=2; GPU2-3 run the PP/TP trainer. This
+  avoids vLLM sleep/wake phase switching. Use `ROLLOUT_BACKEND=oracle` for a
+  deterministic reward-variance trainer smoke; default `vllm` uses real
+  generation and may produce zero reward on tiny GSM8K samples.
 
 Multi-GPU regression and benchmark entry points:
 

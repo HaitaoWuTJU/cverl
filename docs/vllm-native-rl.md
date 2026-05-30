@@ -23,6 +23,9 @@ until vLLM becomes the bottleneck.
 - `tools/rollout/vllm_native_rl_control.py`
   - `pause`
   - `resume`
+  - `sleep`
+  - `wake`
+  - `is-sleeping`
   - `world-size`
   - `init-nccl`
   - `update-nccl`
@@ -93,3 +96,52 @@ tools/rollout/vllm_online_grpo.py \
 For trainer-only validation without a vLLM server, use
 `--rollout-backend oracle --no-weight-sync`. This still exercises the live Qwen
 GRPO/PPO update path and is useful before enabling vLLM Native RL sync.
+
+## Static Rollout/Trainer Split
+
+The production direction is static role assignment, not phase switching:
+
+```text
+rollout pool:
+  vLLM stays alive, uses TP, owns paged KV cache and scheduler state
+
+trainer pool:
+  cverl/Megatron-style trainer owns gradients, optimizer states, PP/TP/DP/CP
+```
+
+On an 8-card node this maps naturally to:
+
+```text
+GPU 0-3: rollout, vLLM TP=4
+GPU 4-7: trainer, FSDP/TP/PP/CP
+```
+
+The current test node has 4 GPUs, so the regression is the scaled-down version:
+
+```text
+GPU 0-1: rollout, vLLM TP=2
+GPU 2-3: trainer, PP/TP world=2
+```
+
+Run:
+
+```bash
+examples/run_vllm_static_split_4gpu_h20.sh
+```
+
+This keeps vLLM running while the trainer uses a separate GPU set. The current
+script still dumps rollout batches to files for compatibility with the existing
+PP/TP trainer entry. The next production step is to replace that handoff with
+the NCCL GPU batch data plane, then run shard-wise trainer-to-vLLM weight sync
+without stopping either side.
+
+For a deterministic trainer update smoke on 4 GPUs, set
+`ROLLOUT_BACKEND=oracle`; this still uses the same trainer GPU assignment but
+generates reward variance intentionally. With `ROLLOUT_BACKEND=vllm`, Qwen3.5
+0.8B may produce zero correct GSM8K answers in a tiny sample, so the
+infrastructure can run while PPO correctly has zero advantage and no parameter
+update.
+
+`sleep`/`wake` remain implemented in `tools/rollout/vllm_native_rl_control.py`
+for debug and emergency memory recovery, but they are not the default efficient
+online RL lifecycle.
