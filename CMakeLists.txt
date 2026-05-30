@@ -4,6 +4,7 @@ project(cverl LANGUAGES CXX)
 option(CVERL_BUILD_TESTS "Build cverl tests" ON)
 option(CVERL_ENABLE_CUDA "Build CUDA kernels" OFF)
 option(CVERL_ENABLE_NCCL "Build NCCL collectives" OFF)
+option(CVERL_BUILD_PYTHON_BRIDGE "Build Python bridge for vLLM Native RL weight sync" ON)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -11,6 +12,37 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(Torch REQUIRED)
 find_package(Threads REQUIRED)
+if (CVERL_BUILD_PYTHON_BRIDGE)
+  find_package(Python COMPONENTS Interpreter QUIET)
+  if (Python_Interpreter_FOUND)
+    execute_process(
+      COMMAND "${Python_EXECUTABLE}" -c
+              "import sysconfig; print(sysconfig.get_paths()['include']); print(sysconfig.get_config_var('EXT_SUFFIX') or '.so')"
+      OUTPUT_VARIABLE CVERL_PYTHON_CONFIG
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+    string(REPLACE "\n" ";" CVERL_PYTHON_CONFIG_LIST "${CVERL_PYTHON_CONFIG}")
+    list(GET CVERL_PYTHON_CONFIG_LIST 0 CVERL_PYTHON_INCLUDE_DIR)
+    list(GET CVERL_PYTHON_CONFIG_LIST 1 CVERL_PYTHON_EXT_SUFFIX)
+    execute_process(
+      COMMAND "${Python_EXECUTABLE}" -c
+              "import torch, pathlib; print(pathlib.Path(torch.__file__).parent / 'lib')"
+      OUTPUT_VARIABLE CVERL_TORCH_PYTHON_LIB_DIR
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+    execute_process(
+      COMMAND "${Python_EXECUTABLE}" -c
+              "import torch.utils.cpp_extension as e; print(';'.join(e.include_paths()))"
+      OUTPUT_VARIABLE CVERL_TORCH_EXTENSION_INCLUDES
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+    find_library(TORCH_PYTHON_LIBRARY torch_python HINTS "${CVERL_TORCH_PYTHON_LIB_DIR}" NO_DEFAULT_PATH)
+  endif()
+  if (NOT Python_Interpreter_FOUND OR NOT CVERL_PYTHON_INCLUDE_DIR OR NOT TORCH_PYTHON_LIBRARY)
+    message(WARNING "Python bridge disabled: requires Python headers and libtorch_python")
+    set(CVERL_BUILD_PYTHON_BRIDGE OFF)
+  endif()
+endif()
 
 find_package(simdjson CONFIG QUIET
   HINTS
@@ -128,6 +160,7 @@ add_library(cverl STATIC
   src/torch/tiny_causal_lm_policy.cc
   src/torch/tiny_causal_policy.cc
 )
+set_target_properties(cverl PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(cverl PUBLIC include)
 if (CVERL_HAS_SIMDJSON AND NOT simdjson_FOUND)
   target_include_directories(cverl PUBLIC ${SIMDJSON_INCLUDE_DIR})
@@ -173,6 +206,21 @@ if (CVERL_ENABLE_NCCL)
   target_include_directories(cverl PUBLIC ${NCCL_INCLUDE_DIR})
   target_link_libraries(cverl PUBLIC ${NCCL_LIBRARY})
   target_compile_definitions(cverl PUBLIC CVERL_ENABLE_NCCL=1)
+endif()
+
+if (CVERL_BUILD_PYTHON_BRIDGE)
+  add_library(_cverl_vllm_bridge MODULE python/cverl_vllm_bridge.cc)
+  target_include_directories(_cverl_vllm_bridge PRIVATE
+    ${CVERL_PYTHON_INCLUDE_DIR}
+    ${CVERL_TORCH_EXTENSION_INCLUDES}
+  )
+  target_link_libraries(_cverl_vllm_bridge PRIVATE cverl ${TORCH_PYTHON_LIBRARY})
+  target_compile_options(_cverl_vllm_bridge PRIVATE ${TORCH_CXX_FLAGS})
+  set_target_properties(_cverl_vllm_bridge PROPERTIES
+    PREFIX ""
+    SUFFIX "${CVERL_PYTHON_EXT_SUFFIX}"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+  )
 endif()
 
 if (CVERL_BUILD_TESTS)
