@@ -57,6 +57,32 @@ cverl::rollout::RolloutResponse make_fake_response(const std::vector<std::string
   return resp;
 }
 
+int64_t env_i64(const char* name, int64_t fallback) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || std::string(value).empty()) {
+    return fallback;
+  }
+  return std::strtoll(value, nullptr, 10);
+}
+
+torch::ScalarType env_dtype(const char* name, torch::ScalarType fallback) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || std::string(value).empty()) {
+    return fallback;
+  }
+  std::string dtype = value;
+  if (dtype == "float32" || dtype == "fp32" || dtype == "f32") {
+    return torch::kFloat32;
+  }
+  if (dtype == "bfloat16" || dtype == "bf16") {
+    return torch::kBFloat16;
+  }
+  if (dtype == "float16" || dtype == "fp16" || dtype == "f16") {
+    return torch::kFloat16;
+  }
+  throw std::invalid_argument("CVERL_QWEN_PARAM_DTYPE must be float32|bfloat16|float16");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -110,7 +136,8 @@ int main(int argc, char** argv) {
     policy_opts.kind = cverl::torch_backend::CausalLmPolicyOptions::Kind::kQwen3_5;
     policy_opts.pad_id = tokenizer.pad_id() >= 0 ? tokenizer.pad_id() : 0;
     policy_opts.qwen_model_dir = model_dir;
-    policy_opts.qwen_max_layers = 2;  // smoke truncation, full forward exercised
+    policy_opts.qwen_max_layers = env_i64("CVERL_QWEN_MAX_LAYERS", 2);
+    policy_opts.param_dtype = env_dtype("CVERL_QWEN_PARAM_DTYPE", torch::kFloat32);
     auto policy = cverl::torch_backend::make_causal_lm_policy(policy_opts);
     policy->to_device(device);
 
@@ -174,6 +201,7 @@ int main(int argc, char** argv) {
     std::cout << "test_qwen3_5_grpo_step passed (loss=" << loss_value
               << ", adv_abs_sum=" << adv_abs_sum
               << ", param_delta=" << param_delta
+              << ", layers=" << policy_opts.qwen_max_layers
               << ", device=" << (device.is_cuda() ? "cuda" : "cpu") << ")\n";
     return 0;
   } catch (const std::exception& e) {
