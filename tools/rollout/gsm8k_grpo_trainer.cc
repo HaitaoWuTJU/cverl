@@ -1,20 +1,17 @@
 // gsm8k_grpo_trainer
 //
 // End-to-end rollout-driven GRPO/PPO trainer:
-//   GSM8K JSONL  ->  RolloutTransport (loopback or HTTP)
+//   GSM8K JSONL  ->  in-process actor rollout
 //                 ->  GSM8K rule reward
 //                 ->  Tokenizer
 //                 ->  CausalLmPolicy logprobs
 //                 ->  GRPO advantages -> PPO clipped step
 //
-// HTTP rollout remains useful for bring-up. Efficient online RL should use a
-// colocated rollout worker and synchronize GPU weights with NCCL/CUDA IPC,
-// not checkpoint reload through an HTTP API.
+// The rollout and trainer share the same actor parameters in-process. This is
+// the baseline efficient path: no HTTP, no JSON transport, no checkpoint reload.
 #include "cverl/data/hf_dataset.h"
 #include "cverl/reward/gsm8k.h"
-#include "cverl/rollout/http_transport.h"
 #include "cverl/rollout/rollout_batch.h"
-#include "cverl/rollout/transport.h"
 #include "cverl/text/byte_tokenizer.h"
 #include "cverl/text/hf_bpe_tokenizer.h"
 #include "cverl/text/tokenizer.h"
@@ -41,13 +38,6 @@ namespace {
 
 struct Args {
   std::string dataset;
-  std::string transport = "loopback";
-  std::string base_url;
-  std::string endpoint = "completions";
-  std::string api_key;
-  std::string model;
-  std::string system_prompt;
-  std::string loopback_suffix = " #### 0";
   int64_t prompts_per_batch = 4;
   uint32_t n = 4;
   int64_t steps = 4;
@@ -89,20 +79,6 @@ Args parse_args(int argc, char** argv) {
     std::string a = argv[i];
     if (a == "--dataset") {
       args.dataset = require_value(i, argc, argv, "--dataset");
-    } else if (a == "--transport") {
-      args.transport = require_value(i, argc, argv, "--transport");
-    } else if (a == "--base-url") {
-      args.base_url = require_value(i, argc, argv, "--base-url");
-    } else if (a == "--endpoint") {
-      args.endpoint = require_value(i, argc, argv, "--endpoint");
-    } else if (a == "--api-key") {
-      args.api_key = require_value(i, argc, argv, "--api-key");
-    } else if (a == "--model") {
-      args.model = require_value(i, argc, argv, "--model");
-    } else if (a == "--system-prompt") {
-      args.system_prompt = require_value(i, argc, argv, "--system-prompt");
-    } else if (a == "--loopback-suffix") {
-      args.loopback_suffix = require_value(i, argc, argv, "--loopback-suffix");
     } else if (a == "--prompts") {
       args.prompts_per_batch = std::strtoll(require_value(i, argc, argv, "--prompts"), nullptr, 10);
     } else if (a == "--n") {
@@ -183,9 +159,6 @@ Args parse_args(int argc, char** argv) {
   if (args.prompts_per_batch <= 0 || args.n == 0 || args.steps <= 0 || args.ppo_epochs <= 0) {
     throw std::invalid_argument("invalid batch shape");
   }
-  if (args.transport == "http" && args.base_url.empty()) {
-    throw std::invalid_argument("--transport http requires --base-url");
-  }
   if (args.policy_kind != "tiny" && args.policy_kind != "qwen") {
     throw std::invalid_argument("--policy must be tiny|qwen");
   }
@@ -201,28 +174,104 @@ Args parse_args(int argc, char** argv) {
   return args;
 }
 
-std::unique_ptr<cverl::rollout::RolloutTransport> build_transport(const Args& args) {
-  if (args.transport == "loopback") {
-    cverl::rollout::LoopbackRolloutTransport::Options opts;
-    opts.completion_suffix = args.loopback_suffix;
-    return std::make_unique<cverl::rollout::LoopbackRolloutTransport>(opts);
-  }
-  if (args.transport == "http") {
-    cverl::rollout::HttpRolloutOptions opts;
-    opts.base_url = args.base_url;
-    opts.endpoint = args.endpoint;
-    opts.api_key = args.api_key;
-    opts.model = args.model;
-    opts.system_prompt = args.system_prompt;
-    return std::make_unique<cverl::rollout::HttpRolloutTransport>(std::move(opts));
-  }
-  throw std::invalid_argument("unsupported transport: " + args.transport);
-}
-
 std::string step_export_path(const std::string& export_dir, int64_t step) {
   std::ostringstream name;
   name << "step_" << std::setw(6) << std::setfill('0') << step;
   return (std::filesystem::path(export_dir) / name.str()).string();
+}
+
+torch::Tensor ids_to_tensor(const std::vector<int32_t>& ids, torch::Device device) {
+  auto cpu = torch::empty({1, static_cast<int64_t>(ids.size())},
+                          torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+  auto* ptr = cpu.data_ptr<int64_t>();
+  for (size_t i = 0; i < ids.size(); ++i) {
+    ptr[i] = static_cast<int64_t>(ids[i]);
+  }
+  if (device.is_cpu()) {
+    return cpu;
+  }
+  return cpu.to(device, /*non_blocking=*/true);
+}
+
+int64_t sample_next_token(const torch::Tensor& logits, double temperature, double top_p) {
+  auto scores = logits.to(torch::kFloat32);
+  if (temperature <= 0.0) {
+    return scores.argmax(-1).item<int64_t>();
+  }
+  scores = scores / temperature;
+  auto probs = torch::softmax(scores, -1);
+  if (top_p > 0.0 && top_p < 1.0) {
+    auto sorted_pair = probs.sort(/*dim=*/-1, /*descending=*/true);
+    auto sorted_probs = std::get<0>(sorted_pair);
+    auto sorted_indices = std::get<1>(sorted_pair);
+    auto keep = sorted_probs.cumsum(-1) <= top_p;
+    keep.index_put_({0}, true);
+    auto filtered = torch::where(keep, sorted_probs, torch::zeros_like(sorted_probs));
+    filtered = filtered / filtered.sum();
+    auto sampled_sorted = torch::multinomial(filtered, /*num_samples=*/1).item<int64_t>();
+    return sorted_indices.index({sampled_sorted}).item<int64_t>();
+  }
+  return torch::multinomial(probs, /*num_samples=*/1).item<int64_t>();
+}
+
+cverl::rollout::RolloutResponse generate_in_process(
+    cverl::torch_backend::CausalLmPolicy& policy,
+    const cverl::text::Tokenizer& tokenizer,
+    const std::vector<std::string>& prompts,
+    const Args& args,
+    torch::Device device,
+    uint64_t seed) {
+  torch::NoGradGuard no_grad;
+  torch::manual_seed(static_cast<int64_t>(seed));
+
+  cverl::rollout::RolloutResponse response;
+  response.sequences.reserve(prompts.size() * static_cast<size_t>(args.n));
+
+  cverl::text::EncodeOptions prompt_encode;
+  prompt_encode.add_bos = false;
+  prompt_encode.add_eos = false;
+  prompt_encode.max_tokens = static_cast<int32_t>(args.max_prompt_tokens);
+
+  const int32_t pad_id = tokenizer.pad_id() >= 0 ? tokenizer.pad_id() : 0;
+  const int32_t eos_id = tokenizer.eos_id();
+  const int64_t max_tokens = static_cast<int64_t>(args.max_tokens);
+
+  for (size_t pidx = 0; pidx < prompts.size(); ++pidx) {
+    auto prompt_tokens = tokenizer.encode(prompts[pidx], prompt_encode);
+    if (prompt_tokens.empty()) {
+      prompt_tokens.push_back(pad_id);
+    }
+    auto prompt_ids = ids_to_tensor(prompt_tokens, device);
+
+    for (uint32_t sample = 0; sample < args.n; ++sample) {
+      std::vector<int32_t> generated;
+      generated.reserve(static_cast<size_t>(max_tokens));
+      for (int64_t t = 0; t < max_tokens; ++t) {
+        std::vector<int32_t> response_context = generated;
+        response_context.push_back(pad_id);
+        auto response_ids = ids_to_tensor(response_context, device);
+        auto logits = policy.forward(prompt_ids, response_ids).index({0, -1});
+        int64_t next = sample_next_token(logits, args.temperature, args.top_p);
+        if (next < 0 || next >= tokenizer.vocab_size()) {
+          next = tokenizer.unk_id() >= 0 ? tokenizer.unk_id() : pad_id;
+        }
+        if (eos_id >= 0 && next == eos_id) {
+          break;
+        }
+        generated.push_back(static_cast<int32_t>(next));
+      }
+
+      cverl::rollout::RolloutSequence seq;
+      seq.prompt_index = static_cast<uint32_t>(pidx);
+      seq.sample_index = sample;
+      seq.text = tokenizer.decode(generated, true);
+      seq.token_ids = generated;
+      seq.finish_reason = generated.size() >= static_cast<size_t>(max_tokens) ? "length" : "stop";
+      response.sequences.push_back(std::move(seq));
+    }
+  }
+  response.metrics["rollout_backend"] = "in_process_policy";
+  return response;
 }
 
 }  // namespace
@@ -238,8 +287,6 @@ int main(int argc, char** argv) {
     if (data.empty()) {
       throw std::runtime_error("dataset is empty");
     }
-
-    auto transport = build_transport(args);
 
     std::unique_ptr<cverl::text::Tokenizer> tokenizer;
     if (args.tokenizer_kind == "byte") {
@@ -290,7 +337,7 @@ int main(int argc, char** argv) {
     auto ref_policy = policy->clone_as_reference();
     ref_policy->to_device(run_device);
 
-    std::cout << "step,transport,total_seq,mean_reward,success_rate,no_answer,loss,pg_loss,kl_loss,ppo_kl,clipfrac,param_delta,seconds\n";
+    std::cout << "step,rollout,total_seq,mean_reward,success_rate,no_answer,loss,pg_loss,kl_loss,ppo_kl,clipfrac,param_delta,seconds\n";
 
     for (int64_t step = 1; step <= args.steps; ++step) {
       // Build the per-step batch from the dataset.
@@ -305,17 +352,9 @@ int main(int argc, char** argv) {
         ground_truths.push_back(data[idx].answer);
       }
 
-      cverl::rollout::RolloutRequest req;
-      req.prompts = prompts;
-      req.n = args.n;
-      req.max_tokens = args.max_tokens;
-      req.temperature = args.temperature;
-      req.top_p = args.top_p;
-      req.seed = args.seed + static_cast<uint64_t>(step);
-      req.model = args.model;
-
       auto t0 = std::chrono::steady_clock::now();
-      auto resp = transport->generate(req);
+      auto resp = generate_in_process(
+          *policy, *tokenizer, prompts, args, run_device, args.seed + static_cast<uint64_t>(step));
       auto t1 = std::chrono::steady_clock::now();
 
       cverl::rollout::RolloutBatchOptions batch_opts;
@@ -421,7 +460,7 @@ int main(int argc, char** argv) {
       double seconds = std::chrono::duration<double>(t1 - t0).count();
 
       std::cout << step << ","
-                << transport->name() << ","
+                << "in_process_policy" << ","
                 << batch.scalar_rewards.size(0) << ","
                 << std::fixed << std::setprecision(6) << mean_reward << ","
                 << success_rate << ","

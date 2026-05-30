@@ -1,6 +1,6 @@
 // Smoke test: rollout-driven GRPO step with the real Qwen3.5 policy.
 //
-// Mirrors tests/rollout/test_gsm8k_grpo_smoke.cc, but swaps the bag-of-tokens
+// Mirrors tests/rollout/test_gsm8k_grpo_trainer.cc, but swaps the bag-of-tokens
 // TinyCausalPolicy for Qwen3_5CausalLmPolicy on whichever device CUDA is
 // available on. We mix correct and wrong samples per prompt so GRPO gives
 // non-zero advantages and the PPO step has to actually move parameters.

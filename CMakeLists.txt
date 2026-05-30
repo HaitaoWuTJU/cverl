@@ -37,9 +37,8 @@ if (simdjson_FOUND OR (SIMDJSON_INCLUDE_DIR AND SIMDJSON_LIBRARY))
   set(CVERL_HAS_SIMDJSON ON)
 endif()
 
-# nlohmann/json is always required (HTTP rollout transport needs to emit
-# JSON, which simdjson cannot do). simdjson is preferred for the JSONL
-# dataset loader hot path when available.
+# nlohmann/json is required by the HF tokenizer and dataset loader. simdjson is
+# preferred for the JSONL dataset loader hot path when available.
 find_package(nlohmann_json QUIET)
 if (NOT nlohmann_json_FOUND)
   find_path(NLOHMANN_JSON_INCLUDE_DIR nlohmann/json.hpp
@@ -50,30 +49,6 @@ if (NOT nlohmann_json_FOUND)
   )
   if (NOT NLOHMANN_JSON_INCLUDE_DIR)
     message(FATAL_ERROR "nlohmann/json.hpp is required (header at ${NLOHMANN_JSON_INCLUDE_DIR}).")
-  endif()
-endif()
-
-# libcurl powers the HTTP rollout transport.
-find_package(CURL QUIET)
-if (NOT CURL_FOUND)
-  find_path(CURL_INCLUDE_DIR curl/curl.h
-    HINTS
-      "$ENV{CONDA_PREFIX}/include"
-      "$ENV{HOME}/miniconda3/include"
-      "$ENV{HOME}/miniconda3/envs/verl-cpu/include"
-      /root/miniconda3/include
-      /usr/include
-  )
-  find_library(CURL_LIBRARY NAMES curl libcurl
-    HINTS
-      "$ENV{CONDA_PREFIX}/lib"
-      "$ENV{HOME}/miniconda3/lib"
-      "$ENV{HOME}/miniconda3/envs/verl-cpu/lib"
-      /root/miniconda3/lib
-      /usr/lib64 /usr/lib
-  )
-  if (NOT CURL_INCLUDE_DIR OR NOT CURL_LIBRARY)
-    message(FATAL_ERROR "libcurl is required for HTTP rollout transport")
   endif()
 endif()
 
@@ -136,11 +111,11 @@ add_library(cverl STATIC
   src/model/qwen3_5_text.cc
   src/model/safetensors_writer.cc
   src/reward/gsm8k.cc
-  src/rollout/http_transport.cc
   src/rollout/rollout_batch.cc
   src/rollout/shared_memory.cc
   src/rollout/shared_memory_transport.cc
   src/rollout/transport.cc
+  src/rollout/worker.cc
   src/text/byte_tokenizer.cc
   src/text/hf_bpe_tokenizer.cc
   src/core_algos_c_api.cc
@@ -169,12 +144,6 @@ if (CVERL_HAS_SIMDJSON)
 endif()
 if (nlohmann_json_FOUND)
   target_link_libraries(cverl PUBLIC nlohmann_json::nlohmann_json)
-endif()
-if (CURL_FOUND)
-  target_link_libraries(cverl PUBLIC CURL::libcurl)
-else()
-  target_include_directories(cverl PUBLIC ${CURL_INCLUDE_DIR})
-  target_link_libraries(cverl PUBLIC ${CURL_LIBRARY})
 endif()
 target_link_libraries(cverl PUBLIC Threads::Threads)
 # librt provides POSIX shared memory + named semaphores on Linux.
@@ -251,8 +220,9 @@ if (CVERL_BUILD_TESTS)
   add_executable(test_rollout_transport tests/rollout/test_transport.cc)
   target_link_libraries(test_rollout_transport PRIVATE cverl)
 
-  add_executable(test_rollout_http_transport tests/rollout/test_http_transport.cc)
-  target_link_libraries(test_rollout_http_transport PRIVATE cverl Threads::Threads)
+  add_executable(test_rollout_worker tests/rollout/test_rollout_worker.cc)
+  target_link_libraries(test_rollout_worker PRIVATE cverl)
+  target_compile_options(test_rollout_worker PRIVATE ${TORCH_CXX_FLAGS})
 
   add_executable(test_gsm8k_reward tests/reward/test_gsm8k_reward.cc)
   target_link_libraries(test_gsm8k_reward PRIVATE cverl)
@@ -269,9 +239,9 @@ if (CVERL_BUILD_TESTS)
   target_link_libraries(test_rollout_batch PRIVATE cverl)
   target_compile_options(test_rollout_batch PRIVATE ${TORCH_CXX_FLAGS})
 
-  add_executable(test_gsm8k_grpo_smoke tests/rollout/test_gsm8k_grpo_smoke.cc)
-  target_link_libraries(test_gsm8k_grpo_smoke PRIVATE cverl)
-  target_compile_options(test_gsm8k_grpo_smoke PRIVATE ${TORCH_CXX_FLAGS})
+  add_executable(test_gsm8k_grpo_trainer tests/rollout/test_gsm8k_grpo_trainer.cc)
+  target_link_libraries(test_gsm8k_grpo_trainer PRIVATE cverl)
+  target_compile_options(test_gsm8k_grpo_trainer PRIVATE ${TORCH_CXX_FLAGS})
 
   add_executable(test_reference_policy_kl tests/torch/test_reference_policy_kl.cc)
   target_link_libraries(test_reference_policy_kl PRIVATE cverl)
@@ -327,14 +297,8 @@ if (CVERL_BUILD_TESTS)
   target_link_libraries(cverl_gsm8k_grpo_bench PRIVATE cverl)
   target_compile_options(cverl_gsm8k_grpo_bench PRIVATE ${TORCH_CXX_FLAGS})
 
-  add_executable(gsm8k_rollout_pipeline tools/rollout/gsm8k_rollout_pipeline.cc)
-  target_link_libraries(gsm8k_rollout_pipeline PRIVATE cverl)
-
   add_executable(gsm8k_grpo_trainer tools/rollout/gsm8k_grpo_trainer.cc)
   target_link_libraries(gsm8k_grpo_trainer PRIVATE cverl)
   target_compile_options(gsm8k_grpo_trainer PRIVATE ${TORCH_CXX_FLAGS})
 
-  add_executable(gsm8k_grpo_smoke tools/rollout/gsm8k_grpo_smoke.cc)
-  target_link_libraries(gsm8k_grpo_smoke PRIVATE cverl)
-  target_compile_options(gsm8k_grpo_smoke PRIVATE ${TORCH_CXX_FLAGS})
 endif()

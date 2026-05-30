@@ -120,7 +120,7 @@ int main() {
     std::cout << "gsm8k grpo smoke tests passed (loss=" << loss_value << ", param_delta=" << delta << ")\n";
     return 0;
   } catch (const std::exception& e) {
-    std::cerr << "test_gsm8k_grpo_smoke failed: " << e.what() << "\n";
+    std::cerr << "test_gsm8k_grpo_trainer failed: " << e.what() << "\n";
     return 1;
   }
 }

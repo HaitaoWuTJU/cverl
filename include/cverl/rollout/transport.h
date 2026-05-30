@@ -11,14 +11,10 @@ namespace cverl::rollout {
 
 // Generation request that the trainer hands to a rollout transport.
 //
-// Fields are intentionally minimal so HTTP, shared memory, CUDA IPC and NCCL
-// transports can all consume the same struct. Transports that do not support
-// a given option (e.g. logprobs over HTTP when the server has them disabled)
-// must document the fallback in their implementation.
+// Legacy/debug request type for CPU/shared-memory tests. The core efficient
+// path uses `RolloutWorker` with GPU token tensors instead.
 struct RolloutRequest {
-  // Raw prompt strings. For HTTP transports these are sent as user messages;
-  // for shared-memory / GPU transports the producer side is expected to have
-  // tokenized them already and pass token ids via prompt_token_ids instead.
+  // Raw prompt strings.
   std::vector<std::string> prompts;
 
   // Optional pre-tokenized prompts. When non-empty its outer size must match
@@ -39,12 +35,10 @@ struct RolloutRequest {
   bool return_logprobs = false;
   uint64_t seed = 0;
 
-  // Optional model id (HTTP only - typically ignored by colocated transports).
+  // Optional model id for legacy adapters.
   std::string model;
 
-  // Free-form key/value parameters forwarded to the backend (e.g. vLLM-only
-  // sampling extensions). Transports that do not understand a key must ignore
-  // it without erroring.
+  // Free-form key/value parameters forwarded to the backend.
   std::map<std::string, std::string> extra_params;
 
   // Identifier propagated through to the response, useful for correlating
@@ -71,10 +65,8 @@ struct RolloutResponse {
   std::map<std::string, std::string> metrics;
 };
 
-// Abstract transport between the trainer and a generation engine (vLLM,
-// SGLang, in-process model, ...).  Implementations must be safe to call from
-// the trainer's main thread; multi-threaded use is the caller's
-// responsibility.
+// Legacy/debug text transport. Efficient integrations should implement
+// `RolloutWorker` instead.
 class RolloutTransport {
  public:
   virtual ~RolloutTransport() = default;
@@ -83,7 +75,7 @@ class RolloutTransport {
   // RolloutResponse::sequences in (prompt_index, sample_index) order.
   virtual RolloutResponse generate(const RolloutRequest& request) = 0;
 
-  // Human-readable transport name, e.g. "http(vllm)", "shm", "loopback".
+  // Human-readable transport name.
   virtual std::string name() const = 0;
 };
 

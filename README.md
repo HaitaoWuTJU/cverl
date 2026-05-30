@@ -51,10 +51,12 @@ Current distributed support:
 - Data-parallel gradient all-reduce/average helper
 - Single-process collectives for CPU tests
 
-Current rollout transport support:
+Current efficient rollout foundation:
 
-- POSIX shared-memory region for local cverl/rollout sidecars
-- Transport plan for HTTP -> shared memory -> CUDA IPC -> NCCL/RDMA upgrades
+- `RolloutWorker` interface for vLLM/Megatron/native CUDA worker plugins
+- direct GPU parameter registration via `ParameterView`
+- NCCL broadcast for trainer-to-rollout actor weight synchronization
+- POSIX shared-memory region only for small CPU metadata/control messages
 
 The C ABI wraps raw pointers into `torch::Tensor` views and delegates math to
 LibTorch. Backward APIs use LibTorch autograd rather than manually derived
@@ -267,15 +269,15 @@ The script writes raw per-backend CSV metrics to `build/bench/` and prints
 `cverl_vs_verl_speedup`. Set `DEVICE=cuda:0` when both builds/environments
 support CUDA.
 
-## Rollout Transport
+## Efficient Rollout
 
-The first full GSM8K GRPO chain should reuse vLLM or SGLang via their
-OpenAI-compatible HTTP serving APIs. For lower overhead, cverl now has a
-shared-memory transport foundation for colocated rollout sidecars. Direct
-NCCL/RDMA transfer to stock vLLM/SGLang requires a custom worker/plugin because
-their public HTTP APIs do not expose internal GPU tensors or communicators.
+cverl's core rollout path must keep tokens and weights on GPU. Reuse vLLM
+kernels/schedulers, FlashAttention, and Megatron TP/PP/optimizer components
+through worker plugins or colocated sidecars, not through OpenAI HTTP APIs.
+Rollout-side actor parameters are registered as GPU tensors and synchronized
+from trainer ranks with NCCL/CUDA IPC.
 
-See `docs/rollout-transport.md`.
+See `docs/efficient-online-rl.md`.
 
 ## HF Model Loading
 
@@ -341,9 +343,7 @@ This verifies the path `HF safetensors -> LibTorch tensors -> GRPO/PPO training`
 for fast CPU tests.
 
 For end-to-end RL on the actual Qwen3.5 weights, use `gsm8k_grpo_trainer
---policy qwen --model-dir ./models/Qwen3.5-0.8B` or
-`examples/run_vllm_gsm8k_train.sh` (see `docs/vllm-rollout.md`). It wraps
-`Qwen35TextModel` in a
+--policy qwen --model-dir ./models/Qwen3.5-0.8B`. It wraps `Qwen35TextModel` in a
 `Qwen3_5CausalLmPolicy` nn::Module so AdamW + PPO autograd actually
 update the loaded fp32 parameters; `tests/torch/test_qwen3_5_grpo_step`
 verifies the param_delta is non-zero on H20 with mixed-correctness GRPO
@@ -422,8 +422,6 @@ Planned tolerance for fp32 kernels:
 
 - Full `verl` feature parity
 - Ray-compatible scheduling
-- PyTorch/FSDP/Megatron integration
-- vLLM/SGLang replacement
 - Production LLM training runtime
 
 Those pieces can be revisited after the native RL math core is stable and

@@ -1,8 +1,7 @@
 # Efficient Online RL Path
 
-HTTP is a debug transport only. It is useful for bootstrapping rollout against
-stock vLLM/SGLang, but it is the wrong mechanism for maximum-efficiency online
-RL because:
+HTTP is not part of the core rollout/training path. It is the wrong mechanism
+for maximum-efficiency online RL because:
 
 - token batches are serialized through JSON and copied through CPU memory;
 - parameter updates require checkpoint materialization or server reload;
@@ -12,8 +11,8 @@ RL because:
 The efficient path is:
 
 1. Trainer actor, reference, and optimizer own GPU parameters through LibTorch.
-2. Rollout workers are colocated C++/CUDA sidecars or vLLM/SGLang worker
-   plugins, not external HTTP clients.
+2. Rollout workers are colocated C++/CUDA sidecars, vLLM worker plugins, or
+   Megatron-backed workers, not external HTTP clients.
 3. Prompt token IDs and generated token IDs/logprobs move through shared memory
    for CPU metadata and CUDA IPC for same-node GPU tensors.
 4. Updated actor weights synchronize from trainer ranks to rollout ranks with
@@ -27,7 +26,10 @@ Implemented foundation:
 - `cverl::distributed::Collectives::broadcast`
 - `cverl::distributed::NcclCollectives::broadcast`
 - `cverl::distributed::broadcast_parameters_from_root`
+- `cverl::rollout::RolloutWorker`
+- `cverl::rollout::synchronize_rollout_actor_weights`
 - CPU unit test: `test_weight_sync`
+- CPU unit test: `test_rollout_worker`
 - NCCL test coverage inside `test_nccl_collectives`
 
 `gsm8k_grpo_trainer` may still export HF checkpoints for debugging or offline
@@ -36,15 +38,18 @@ path. A production rollout integration should register rollout-side parameter
 tensors and call `broadcast_parameters_from_root` after each optimizer step or
 after each configured synchronization interval.
 
-The next integration boundary is a rollout worker interface with three calls:
+The integration boundary is a rollout worker interface:
 
 ```cpp
 struct RolloutWorker {
-  virtual void generate(const TokenBatch& prompts, TokenBatch* responses) = 0;
+  virtual GenerationOutput generate(const TokenBatch& prompts,
+                                    const GenerationConfig& config) = 0;
   virtual std::vector<cverl::distributed::ParameterView> actor_parameters() = 0;
-  virtual void synchronize_actor_weights(int64_t trainer_root) = 0;
 };
 ```
 
-For stock vLLM/SGLang this requires a worker/plugin/sidecar, because their HTTP
-server process does not expose internal weight tensors to a C++ client.
+vLLM, FlashAttention, and Megatron are still important dependencies to reuse.
+The reuse point is their CUDA kernels, paged-attention cache, scheduler,
+tensor-parallel sharding, pipeline scheduling, and optimizer/communication
+patterns. The boundary must be C++/CUDA worker/plugin APIs exposing GPU tensors,
+not HTTP endpoints.

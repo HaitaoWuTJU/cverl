@@ -1,12 +1,16 @@
 # cverl Examples
 
-This directory is for runnable shell examples.
+This directory contains shell launchers only. C++ sources and tests belong under
+`tools/`, `src/`, or `tests/`.
 
-- `run_vllm_gsm8k_train.sh`: starts a local vLLM OpenAI-compatible server,
-  probes `/v1/completions`, then runs GSM8K GRPO/PPO through
-  `gsm8k_grpo_trainer`.
-- `run_sglang_gsm8k_train.sh`: same GSM8K GRPO/PPO path with SGLang.
-- `run_vllm_gsm8k_smoke.sh` / `run_sglang_gsm8k_smoke.sh`: legacy quick
-  launchers retained for small regression runs.
+Current examples:
 
-C++ executable sources live under `tools/` next to the related subsystem.
+- `run_gsm8k_grpo_trainer_cpu.sh`: tiny CPU end-to-end GRPO/PPO run.
+- `run_gsm8k_grpo_trainer_cuda.sh`: Qwen/Tiny CUDA trainer entry point with
+  in-process rollout.
+- `run_h20_nccl_weight_sync.sh`: H20 NCCL collectives and parameter sync check.
+
+HTTP rollout launchers are intentionally absent from the core path. Efficient
+rollout should use in-process workers or vLLM/Megatron/FlashAttention-backed
+plugin workers that keep tokens and weights on GPU and synchronize actor
+weights through NCCL/CUDA IPC.
