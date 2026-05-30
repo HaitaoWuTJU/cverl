@@ -499,26 +499,45 @@ torch::Tensor Qwen35TextModel::forward_hidden(const torch::Tensor& input_ids, in
   return rms_norm(hidden, weight("model.language_model.norm.weight"));
 }
 
+torch::Tensor Qwen35TextModel::token_embeddings(const torch::Tensor& input_ids) {
+  return embed(input_ids);
+}
+
 torch::Tensor Qwen35TextModel::forward_hidden_tensor_parallel(const torch::Tensor& input_ids,
                                                               const distributed::ParallelGroup& tensor_group,
                                                               int64_t max_layers) {
   auto hidden = embed(input_ids);
   int64_t layers = max_layers < 0 ? config_.num_hidden_layers : std::min(max_layers, config_.num_hidden_layers);
-  for (int64_t i = 0; i < layers; ++i) {
-    std::string p = layer_prefix(i);
-    auto residual = hidden;
-    hidden = rms_norm(hidden, weight(p + "input_layernorm.weight"));
-    if (config_.layer_types.at(static_cast<size_t>(i)) == "full_attention") {
-      hidden = full_attention_tensor_parallel(hidden, i, tensor_group);
-    } else {
-      hidden = linear_attention_tensor_parallel(hidden, i, tensor_group);
-    }
-    hidden = residual + hidden;
-    residual = hidden;
-    hidden = rms_norm(hidden, weight(p + "post_attention_layernorm.weight"));
-    hidden = residual + mlp_tensor_parallel(hidden, i, tensor_group);
+  return forward_hidden_range_tensor_parallel(hidden, 0, layers, tensor_group, true);
+}
+
+torch::Tensor Qwen35TextModel::forward_hidden_range_tensor_parallel(const torch::Tensor& hidden,
+                                                                    int64_t layer_begin,
+                                                                    int64_t layer_end,
+                                                                    const distributed::ParallelGroup& tensor_group,
+                                                                    bool apply_final_norm) {
+  if (layer_begin < 0 || layer_end < layer_begin || layer_end > config_.num_hidden_layers) {
+    throw std::invalid_argument("invalid Qwen3.5 layer range");
   }
-  return rms_norm(hidden, weight("model.language_model.norm.weight"));
+  auto out = hidden;
+  for (int64_t i = layer_begin; i < layer_end; ++i) {
+    std::string p = layer_prefix(i);
+    auto residual = out;
+    out = rms_norm(out, weight(p + "input_layernorm.weight"));
+    if (config_.layer_types.at(static_cast<size_t>(i)) == "full_attention") {
+      out = full_attention_tensor_parallel(out, i, tensor_group);
+    } else {
+      out = linear_attention_tensor_parallel(out, i, tensor_group);
+    }
+    out = residual + out;
+    residual = out;
+    out = rms_norm(out, weight(p + "post_attention_layernorm.weight"));
+    out = residual + mlp_tensor_parallel(out, i, tensor_group);
+  }
+  if (apply_final_norm) {
+    out = rms_norm(out, weight("model.language_model.norm.weight"));
+  }
+  return out;
 }
 
 torch::Tensor Qwen35TextModel::forward_logits(const torch::Tensor& input_ids, int64_t max_layers) {
