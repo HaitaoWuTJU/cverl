@@ -1,5 +1,6 @@
 #include "cverl/distributed/nccl_collectives.h"
 #include "cverl/distributed/parallel_ops.h"
+#include "cverl/distributed/weight_sync.h"
 
 #include <chrono>
 #include <cstdlib>
@@ -76,6 +77,21 @@ int main(int argc, char** argv) {
     auto id = cverl::distributed::read_nccl_unique_id_file(id_path);
     cverl::distributed::NcclCollectives comm(rank, world, static_cast<int>(device), id);
     auto group = full_group(world);
+
+    auto bcast_in = torch::full({4}, rank == 0 ? 7.0f : -1.0f,
+                                torch::TensorOptions().device(torch::kCUDA, static_cast<int>(device)).dtype(torch::kFloat32));
+    auto bcast = comm.broadcast(bcast_in.contiguous(), 0, group);
+    auto expected_bcast = torch::full({4}, 7.0f,
+                                      torch::TensorOptions().device(torch::kCUDA, static_cast<int>(device)).dtype(torch::kFloat32));
+    require_allclose(bcast, expected_bcast, "NCCL broadcast mismatch");
+
+    auto synced_param = torch::full({2, 3}, rank == 0 ? 3.0f : -5.0f,
+                                    torch::TensorOptions().device(torch::kCUDA, static_cast<int>(device)).dtype(torch::kFloat32));
+    cverl::distributed::broadcast_parameters_from_root(
+        {cverl::distributed::ParameterView{"synced_param", synced_param}}, comm, 0, group);
+    auto expected_param = torch::full({2, 3}, 3.0f,
+                                      torch::TensorOptions().device(torch::kCUDA, static_cast<int>(device)).dtype(torch::kFloat32));
+    require_allclose(synced_param, expected_param, "NCCL parameter broadcast mismatch");
 
     auto x = torch::full({4}, static_cast<float>(rank + 1),
                          torch::TensorOptions().device(torch::kCUDA, static_cast<int>(device)).dtype(torch::kFloat32));

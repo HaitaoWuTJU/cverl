@@ -330,20 +330,20 @@ Current limitations:
 - correctness is checked against Hugging Face CPU forward for hidden states and logits
 - CPU path is intended for validation, not performance
 
-The current runnable HF-weight RL smoke uses Qwen embeddings as the policy input
-and action head over a small vocabulary subset:
+The lightweight HF-weight RL regression path uses Qwen embeddings as the policy
+input and action head over a small vocabulary subset:
 
 ```sh
 ./build/hf_embedding_grpo_trainer ./models/Qwen3.5-0.8B --steps 8 --vocab-subset 64
 ```
 
-This verifies the path `HF safetensors -> LibTorch tensors -> GRPO/PPO training`.
-Full-policy RL training can now be built on top of `Qwen35TextModel`, but the
-current trainer still uses the smaller embedding policy smoke for fast CPU tests.
+This verifies the path `HF safetensors -> LibTorch tensors -> GRPO/PPO training`
+for fast CPU tests.
 
-For end-to-end RL on the actual Qwen3.5 weights, use `gsm8k_grpo_smoke
---policy qwen --model-dir ./models/Qwen3.5-0.8B` (see
-`docs/rollout-transport.md`). It wraps `Qwen35TextModel` in a
+For end-to-end RL on the actual Qwen3.5 weights, use `gsm8k_grpo_trainer
+--policy qwen --model-dir ./models/Qwen3.5-0.8B` or
+`examples/run_vllm_gsm8k_train.sh` (see `docs/vllm-rollout.md`). It wraps
+`Qwen35TextModel` in a
 `Qwen3_5CausalLmPolicy` nn::Module so AdamW + PPO autograd actually
 update the loaded fp32 parameters; `tests/torch/test_qwen3_5_grpo_step`
 verifies the param_delta is non-zero on H20 with mixed-correctness GRPO

@@ -13,6 +13,16 @@ void require_single_rank_group(const std::vector<int64_t>& group) {
 
 }  // namespace
 
+torch::Tensor SingleProcessCollectives::broadcast(const torch::Tensor& input,
+                                                  int64_t root,
+                                                  const std::vector<int64_t>& group) {
+  require_single_rank_group(group);
+  if (root != 0) {
+    throw std::invalid_argument("SingleProcessCollectives can only broadcast from root 0");
+  }
+  return input.clone();
+}
+
 torch::Tensor SingleProcessCollectives::all_reduce(const torch::Tensor& input,
                                                    ReduceOp /*op*/,
                                                    const std::vector<int64_t>& group) {

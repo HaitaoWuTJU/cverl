@@ -32,6 +32,7 @@ class NcclCollectives final : public Collectives {
   int64_t rank() const override { return rank_; }
   int64_t world_size() const override { return world_size_; }
   void barrier() override;
+  torch::Tensor broadcast(const torch::Tensor& input, int64_t root, const std::vector<int64_t>& group) override;
   torch::Tensor all_reduce(const torch::Tensor& input, ReduceOp op, const std::vector<int64_t>& group) override;
   torch::Tensor all_gather(const torch::Tensor& input, const std::vector<int64_t>& group, int64_t dim) override;
   torch::Tensor reduce_scatter(const torch::Tensor& input, ReduceOp op, const std::vector<int64_t>& group, int64_t dim) override;

@@ -53,7 +53,7 @@ gsm8k_rollout_pipeline \
   --reward-method strict
 ```
 
-`tools/rollout/gsm8k_grpo_smoke.cc` runs the full closed loop on CPU:
+`tools/rollout/gsm8k_grpo_trainer.cc` runs the full closed loop on CPU:
 GSM8K -> RolloutTransport -> rule reward -> Tokenizer -> CausalLmPolicy
 logprobs -> GRPO advantages -> PPO clipped step. KL penalty against a frozen
 reference policy is enabled with `--kl-coef > 0` and `--kl-penalty
@@ -66,7 +66,7 @@ layer stack for fast smoke tests). `--device cuda` moves the trainer
 policy + every trainer-side tensor onto GPU.
 
 ```
-gsm8k_grpo_smoke \
+gsm8k_grpo_trainer \
   --dataset path/to/gsm8k.jsonl \
   --transport loopback \
   --tokenizer hf --tokenizer-path /path/to/Qwen3.5/tokenizer.json \
@@ -78,10 +78,10 @@ gsm8k_grpo_smoke \
 ```
 
 `--policy tiny` keeps the bag-of-tokens TinyCausalPolicy used for CPU
-smoke / CI runs (`--hidden-dim` controls its width).
+trainer quick runs (`--hidden-dim` controls its width).
 
 ```
-gsm8k_grpo_smoke \
+gsm8k_grpo_trainer \
   --dataset path/to/gsm8k.jsonl \
   --transport loopback \
   --tokenizer hf --tokenizer-path /path/to/Qwen3.5/tokenizer.json \
@@ -94,7 +94,7 @@ gsm8k_grpo_smoke \
 
 ## Tokenizer backends
 
-All tokenizer-aware code (rollout batch builder, smoke loop) takes a
+All tokenizer-aware code (rollout batch builder, trainer loop) takes a
 `const cverl::text::Tokenizer&`. Two backends ship today:
 
 - `cverl::text::ByteTokenizer` — vocab=260, byte-per-id, dependency-free.
@@ -130,7 +130,7 @@ computation, PPO loss, optimizer step) does not change between transports.
   truncation, non-ASCII bytes.
 - `tests/rollout/test_rollout_batch.cc` — tokenized batch shape, left-padded
   prompts, right-padded responses, mask alignment, reward routing.
-- `tests/rollout/test_gsm8k_grpo_smoke.cc` — fake rollout response ->
+- `tests/rollout/test_gsm8k_grpo_trainer.cc` — fake rollout response ->
   TinyCausalPolicy logprobs -> one PPO step; asserts finite loss and that
   parameters actually moved.
 - `tests/torch/test_reference_policy_kl.cc` — `clone_as_reference` produces

@@ -1,6 +1,6 @@
 # vLLM Rollout Smoke
 
-End-to-end smoke for the cverl GRPO loop running against a real vLLM
+End-to-end trainer path for the cverl GRPO loop running against a real vLLM
 serving Qwen3.5-0.8B on H20:
 
 ```text
@@ -72,7 +72,7 @@ $VENV/bin/python -c "import torch, vllm, flashinfer; print(torch.__version__, to
 # 2.11.0+cu128 True 0.22.0
 ```
 
-## Running the smoke
+## Running the trainer
 
 ```bash
 VLLM_PYTHON=/home/$(id -un)/vllm-env/bin/python \
@@ -80,7 +80,7 @@ BUILD_DIR=/path/to/cverl-build/gpu-nccl \
 MODEL_PATH=/path/to/Qwen3.5-0.8B \
 PORT=8021 \
 QWEN_MAX_LAYERS=-1 PROMPTS=1 N=4 STEPS=8 KL_COEF=0.05 \
-examples/run_vllm_gsm8k_smoke.sh
+examples/run_vllm_gsm8k_train.sh
 ```
 
 What the script does:
@@ -90,7 +90,7 @@ What the script does:
    --gpu-memory-utilization 0.45 --trust-remote-code` (defaults that
    leave ~50 GiB on H20 for the trainer).
 2. Polls `/v1/models`, sends one `/v1/completions` probe.
-3. Runs `gsm8k_grpo_smoke --policy qwen --tokenizer hf --device cuda
+3. Runs `gsm8k_grpo_trainer --policy qwen --tokenizer hf --device cuda
    --endpoint chat --qwen-max-layers -1` on `${TRAINER_DEVICES:-1}` with
    a system prompt that asks for a `#### N` final-line answer.
 4. Trainer side has `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
@@ -146,7 +146,7 @@ on this box).
 | env var | default | effect |
 |--|--|--|
 | `VLLM_PYTHON` | `/home/$(id -un)/vllm-env/bin/python` | python with vllm installed |
-| `BUILD_DIR` | `${ROOT}/build-h20-nccl` | where `gsm8k_grpo_smoke` lives |
+| `BUILD_DIR` | `${ROOT}/build-h20-nccl` | where `gsm8k_grpo_trainer` lives |
 | `MODEL_PATH` | `${ROOT}/../models/Qwen3.5-0.8B` | safetensors + tokenizer.json |
 | `VLLM_DEVICES` / `TRAINER_DEVICES` | `0` / `1` | per-side CUDA device |
 | `GPU_MEMORY_UTILIZATION` | `0.45` | vLLM memory pool |
@@ -162,30 +162,13 @@ on this box).
 | `SYSTEM_PROMPT` | (math tutor `#### N` recipe) | chat template prompt |
 | `EXPORT_DIR` | empty | when set, export updated actor HF checkpoints every `EXPORT_EVERY` steps |
 | `EXPORT_EVERY` / `EXPORT_DTYPE` | `1` / `bfloat16` | checkpoint cadence and safetensors dtype |
-| `RELOAD_URL` | empty | optional rollout-server reload endpoint, e.g. `http://127.0.0.1:8000/update_weights_from_disk` |
-| `RELOAD_API_KEY` | empty | bearer token for the reload endpoint |
 
-## Online Weight Reload
+## Parameter Updates
 
-`gsm8k_grpo_smoke` can now write the updated Qwen actor after optimizer
-steps:
-
-```bash
-EXPORT_DIR=/tmp/cverl_actor_ckpts \
-RELOAD_URL=http://127.0.0.1:8000/update_weights_from_disk \
-examples/run_vllm_gsm8k_smoke.sh
-```
-
-The exported directory is a Hugging Face-style checkpoint with copied
-config/tokenizer files and a single `model.safetensors`. Reload sends:
-
-```json
-{"model_path": "/tmp/cverl_actor_ckpts/step_000001"}
-```
-
-Full checkpoint export requires `QWEN_MAX_LAYERS=-1`; truncated trainer
-runs do not contain enough weights for a rollout engine to reload as a
-complete model.
+Do not use HTTP for online parameter updates. `EXPORT_DIR` is only for debug
+checkpoints/offline inspection. Efficient online RL needs a vLLM worker plugin
+or colocated sidecar that exposes rollout-side GPU weight tensors, then syncs
+trainer weights through NCCL/CUDA IPC. See `docs/efficient-online-rl.md`.
 
 ## Notes vs. SGLang
 

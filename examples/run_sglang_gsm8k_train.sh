@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# End-to-end SGLang + cverl GRPO smoke on the H20 box.
+# End-to-end SGLang + cverl GRPO trainer on the H20 box.
 #
 # Pipeline:
 #   GSM8K JSONL -> SGLang HTTP rollout -> cverl C++ rule reward
 #                                       -> GRPO advantage
 #                                       -> Qwen3_5CausalLmPolicy fp32 PPO step
 #
-# The trainer side ("cverl gsm8k_grpo_smoke") talks to a stock SGLang server
+# The trainer side ("cverl gsm8k_grpo_trainer") talks to a stock SGLang server
 # over /v1/chat/completions; both ends share the same Qwen3.5 weights so the
 # PPO update is meaningful. SGLang lives on GPU 0 by default, the trainer on
 # GPU 1, so they don't fight for memory.
@@ -17,7 +17,7 @@
 #   SGLANG_PYTHON=/home/marvinhtwu/sglang-env/bin/python \
 #   BUILD_DIR=/home/marvinhtwu/cverl-build/gpu-nccl \
 #   MODEL_PATH=/path/to/Qwen3.5-0.8B \
-#   examples/run_sglang_gsm8k_smoke.sh
+#   examples/run_sglang_gsm8k_train.sh
 #
 # Required runtime extras for SGLang 0.5.9 on this node:
 #   pip install --no-cache-dir IPython decord2 nvidia-cudnn-cu12==9.16.0.29 \
@@ -28,7 +28,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-${ROOT_DIR}/build-h20-nccl}"
-DATASET="${DATASET:-${ROOT_DIR}/data/gsm8k-train-smoke.jsonl}"
+DATASET="${DATASET:-${ROOT_DIR}/data/gsm8k-train-bench.jsonl}"
 MODEL_PATH="${MODEL_PATH:-${ROOT_DIR}/../models/Qwen3.5-0.8B}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8011}"
@@ -63,7 +63,7 @@ EXPORT_DTYPE="${EXPORT_DTYPE:-bfloat16}"
 SGLANG_PYTHON="${SGLANG_PYTHON:-/home/marvinhtwu/sglang-env/bin/python}"
 
 # Trainer-side LD_LIBRARY_PATH: point at the conda env that built libcverl.a
-# so the right libtorch/cuda runtime gets loaded next to gsm8k_grpo_smoke.
+# so the right libtorch/cuda runtime gets loaded next to gsm8k_grpo_trainer.
 TRAINER_LIBS="${TRAINER_LIBS:-/apdcephfs_fsgm3/share_305110755/hunyuan/marvinhtwu/miniconda3/lib:/usr/local/cuda/lib64}"
 
 # GPU split: SGLang on GPU 0, trainer on GPU 1 by default.
@@ -75,8 +75,8 @@ if ! "${SGLANG_PYTHON}" -c "import sglang" >/dev/null 2>&1; then
   exit 1
 fi
 
-if [[ ! -x "${BUILD_DIR}/gsm8k_grpo_smoke" ]]; then
-  echo "missing ${BUILD_DIR}/gsm8k_grpo_smoke; build cverl first" >&2
+if [[ ! -x "${BUILD_DIR}/gsm8k_grpo_trainer" ]]; then
+  echo "missing ${BUILD_DIR}/gsm8k_grpo_trainer; build cverl first" >&2
   exit 1
 fi
 
@@ -132,7 +132,7 @@ if [[ -n "${EXPORT_DIR}" ]]; then
 fi
 LD_LIBRARY_PATH="${TRAINER_LIBS}:${LD_LIBRARY_PATH:-}" \
 CUDA_VISIBLE_DEVICES="${TRAINER_DEVICES}" \
-"${BUILD_DIR}/gsm8k_grpo_smoke" \
+"${BUILD_DIR}/gsm8k_grpo_trainer" \
   --dataset "${DATASET}" \
   --transport http \
   --base-url "http://${HOST}:${PORT}" \

@@ -148,6 +148,26 @@ void NcclCollectives::barrier() {
   (void)all_reduce(token, ReduceOp::Sum, group);
 }
 
+torch::Tensor NcclCollectives::broadcast(const torch::Tensor& input,
+                                         int64_t root,
+                                         const std::vector<int64_t>& group) {
+  require_all_rank_group(group, world_size_);
+  require_cuda_contiguous(input, "broadcast input");
+  if (root < 0 || root >= world_size_) {
+    throw std::invalid_argument("broadcast root out of range");
+  }
+  auto out = torch::empty_like(input);
+  void* send_recv = rank_ == root ? input.data_ptr() : out.data_ptr();
+  check_nccl(ncclBroadcast(send_recv, out.data_ptr(), input.numel(), nccl_dtype(input.scalar_type()),
+                           static_cast<int>(root), comm_, stream_),
+             "ncclBroadcast");
+  check_cuda(cudaStreamSynchronize(stream_), "cudaStreamSynchronize");
+  if (rank_ == root) {
+    out.copy_(input);
+  }
+  return out;
+}
+
 torch::Tensor NcclCollectives::all_reduce(const torch::Tensor& input, ReduceOp op, const std::vector<int64_t>& group) {
   require_all_rank_group(group, world_size_);
   require_cuda_contiguous(input, "all_reduce input");

@@ -1,6 +1,6 @@
 # SGLang Rollout Smoke
 
-End-to-end smoke for the cverl GRPO loop running against a real SGLang
+End-to-end trainer path for the cverl GRPO loop running against a real SGLang
 serving Qwen3.5-0.8B on H20:
 
 ```text
@@ -66,7 +66,7 @@ Verify:
 $SGENV/bin/python -c "import sglang, sgl_kernel, flashinfer; print('ok')"
 ```
 
-## Running the smoke
+## Running the trainer
 
 ```bash
 SGLANG_PYTHON=/home/$(id -un)/sglang-env/bin/python \
@@ -74,7 +74,7 @@ BUILD_DIR=/path/to/cverl/build-h20-nccl \
 MODEL_PATH=/path/to/Qwen3.5-0.8B \
 PORT=8011 \
 PROMPTS=4 N=4 STEPS=2 PPO_EPOCHS=1 KL_COEF=0.05 \
-examples/run_sglang_gsm8k_smoke.sh
+examples/run_sglang_gsm8k_train.sh
 ```
 
 What the script does:
@@ -87,7 +87,7 @@ What the script does:
    older `--linear-attn-backend flashinfer` flag was removed).
 2. Polls `/v1/models` until the server is ready.
 3. Sends one `/v1/completions` probe.
-4. Runs `gsm8k_grpo_smoke --policy qwen --tokenizer hf --device cuda
+4. Runs `gsm8k_grpo_trainer --policy qwen --tokenizer hf --device cuda
    --endpoint chat` on `${TRAINER_DEVICES:-1}` with a system prompt
    that asks for a `#### N` final-line answer (without it the base
    Qwen3.5 model rarely emits a parseable answer and reward is always
@@ -113,7 +113,7 @@ which is consistent with greedy Qwen3.5-0.8B math performance.
 | env var | default | effect |
 |--|--|--|
 | `SGLANG_PYTHON` | `/home/$(id -un)/sglang-env/bin/python` | python with sglang+sgl_kernel installed |
-| `BUILD_DIR` | `${ROOT}/build-h20-nccl` | where `gsm8k_grpo_smoke` lives |
+| `BUILD_DIR` | `${ROOT}/build-h20-nccl` | where `gsm8k_grpo_trainer` lives |
 | `MODEL_PATH` | `${ROOT}/../models/Qwen3.5-0.8B` | safetensors + tokenizer.json |
 | `SGLANG_DEVICES` / `TRAINER_DEVICES` | `0` / `1` | per-side CUDA device split |
 | `MEM_FRACTION_STATIC` | `0.45` | SGLang memory pool |
@@ -129,14 +129,11 @@ which is consistent with greedy Qwen3.5-0.8B math performance.
 | `SYSTEM_PROMPT` | (math tutor `#### N` recipe) | chat template prompt |
 | `EXPORT_DIR` | empty | when set, export updated actor HF checkpoints every `EXPORT_EVERY` steps |
 | `EXPORT_EVERY` / `EXPORT_DTYPE` | `1` / `bfloat16` | checkpoint cadence and safetensors dtype |
-| `RELOAD_URL` | empty | optional rollout-server reload endpoint, e.g. `http://127.0.0.1:30000/update_weights_from_disk` |
-| `RELOAD_API_KEY` | empty | bearer token for the reload endpoint |
 
-Set `EXPORT_DIR` to make the trainer emit a complete HF checkpoint after
-optimizer steps. Set `RELOAD_URL` as well to POST
-`{"model_path": ".../step_000001"}` to the rollout server after each export.
-This requires `QWEN_MAX_LAYERS=-1`; layer-truncated smoke runs cannot be
-reloaded as a full rollout model.
+`EXPORT_DIR` is for debug checkpoints/offline inspection only. Efficient online
+RL should update rollout weights through NCCL/CUDA IPC from a SGLang worker
+plugin or colocated sidecar, not through HTTP checkpoint reload. See
+`docs/efficient-online-rl.md`.
 
 ## Notes
 

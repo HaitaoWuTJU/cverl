@@ -131,6 +131,7 @@ add_library(cverl STATIC
   src/distributed/collectives.cc
   src/distributed/parallel_ops.cc
   src/distributed/topology.cc
+  src/distributed/weight_sync.cc
   src/model/hf_model_loader.cc
   src/model/qwen3_5_text.cc
   src/model/safetensors_writer.cc
@@ -292,6 +293,10 @@ if (CVERL_BUILD_TESTS)
   target_link_libraries(test_parallel_ops PRIVATE cverl)
   target_compile_options(test_parallel_ops PRIVATE ${TORCH_CXX_FLAGS})
 
+  add_executable(test_weight_sync tests/distributed/test_weight_sync.cc)
+  target_link_libraries(test_weight_sync PRIVATE cverl)
+  target_compile_options(test_weight_sync PRIVATE ${TORCH_CXX_FLAGS})
+
   if (CVERL_ENABLE_NCCL)
     add_executable(test_nccl_collectives tests/distributed/test_nccl_collectives.cc)
     target_link_libraries(test_nccl_collectives PRIVATE cverl)
@@ -324,6 +329,10 @@ if (CVERL_BUILD_TESTS)
 
   add_executable(gsm8k_rollout_pipeline tools/rollout/gsm8k_rollout_pipeline.cc)
   target_link_libraries(gsm8k_rollout_pipeline PRIVATE cverl)
+
+  add_executable(gsm8k_grpo_trainer tools/rollout/gsm8k_grpo_trainer.cc)
+  target_link_libraries(gsm8k_grpo_trainer PRIVATE cverl)
+  target_compile_options(gsm8k_grpo_trainer PRIVATE ${TORCH_CXX_FLAGS})
 
   add_executable(gsm8k_grpo_smoke tools/rollout/gsm8k_grpo_smoke.cc)
   target_link_libraries(gsm8k_grpo_smoke PRIVATE cverl)

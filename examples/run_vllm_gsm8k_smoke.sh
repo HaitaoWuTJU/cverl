@@ -55,8 +55,6 @@ TRAINER_DEVICE="${TRAINER_DEVICE:-cuda}"
 EXPORT_DIR="${EXPORT_DIR:-}"
 EXPORT_EVERY="${EXPORT_EVERY:-1}"
 EXPORT_DTYPE="${EXPORT_DTYPE:-bfloat16}"
-RELOAD_URL="${RELOAD_URL:-}"
-RELOAD_API_KEY="${RELOAD_API_KEY:-}"
 
 # vLLM lives in its own Python (torch 2.11.0+cu128 from pytorch.org via the
 # proxy + the 0.22.0+cu129 wheel from wheels.vllm.ai). Override via env.
@@ -125,13 +123,6 @@ TRAINER_EXTRA_ARGS=()
 if [[ -n "${EXPORT_DIR}" ]]; then
   TRAINER_EXTRA_ARGS+=(--export-dir "${EXPORT_DIR}" --export-every "${EXPORT_EVERY}" --export-dtype "${EXPORT_DTYPE}")
 fi
-if [[ -n "${RELOAD_URL}" ]]; then
-  TRAINER_EXTRA_ARGS+=(--reload-url "${RELOAD_URL}")
-fi
-if [[ -n "${RELOAD_API_KEY}" ]]; then
-  TRAINER_EXTRA_ARGS+=(--reload-api-key "${RELOAD_API_KEY}")
-fi
-
 LD_LIBRARY_PATH="${TRAINER_LIBS}:${LD_LIBRARY_PATH:-}" \
 PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" \
 CUDA_VISIBLE_DEVICES="${TRAINER_DEVICES}" \
