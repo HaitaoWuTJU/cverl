@@ -36,6 +36,8 @@ def main() -> int:
     parser.add_argument("--param-dtype", default="float32",
                         choices=("float32", "fp32", "bfloat16", "bf16", "float16", "fp16"),
                         help="dtype used to load live cverl trainable parameters")
+    parser.add_argument("--qwen-max-layers", type=int, default=-1,
+                        help="debug truncation only; -1 sends the full model")
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
     parser.add_argument("--master-address", default="127.0.0.1")
     parser.add_argument("--master-port", type=int, required=True)
@@ -62,7 +64,7 @@ def main() -> int:
     torch.cuda.set_device(device_index)
 
     policy = _cverl_vllm_bridge.QwenPolicy(
-        args.model_dir, args.tokenizer_path, args.device, args.param_dtype)
+        args.model_dir, args.tokenizer_path, args.device, args.param_dtype, args.qwen_max_layers)
     params = policy.named_parameters()
     update_info = policy.update_info(
         packed=args.packed,

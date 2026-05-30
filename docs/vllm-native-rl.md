@@ -65,3 +65,31 @@ broadcast by vLLM's NCCL packed weight-transfer path.
 `--param-dtype` accepts `float32`, `bfloat16`/`bf16`, and `float16`/`fp16`; the
 bridge exposes live tensors in that dtype and emits matching vLLM
 `update_info.dtype_names`.
+
+## Online GRPO Driver
+
+`tools/rollout/vllm_online_grpo.py` is the current end-to-end integration point.
+It keeps one live `_cverl_vllm_bridge.QwenPolicy` object for both PPO updates
+and NCCL weight sync, so the tensors sent to vLLM are the tensors AdamW just
+updated.
+
+```bash
+PYTHONPATH=build-h20-nccl:$PYTHONPATH \
+tools/rollout/vllm_online_grpo.py \
+  --dataset data/gsm8k-train-smoke.jsonl \
+  --model-dir ../models/Qwen3.5-0.8B \
+  --tokenizer-path ../models/Qwen3.5-0.8B/tokenizer.json \
+  --served-model-name /path/or/name/served/by/vllm \
+  --base-url http://127.0.0.1:8000 \
+  --device cuda:0 \
+  --param-dtype bfloat16 \
+  --steps 8 \
+  --prompts 4 \
+  --n 4 \
+  --world-size 2 \
+  --master-port 29577
+```
+
+For trainer-only validation without a vLLM server, use
+`--rollout-backend oracle --no-weight-sync`. This still exercises the live Qwen
+GRPO/PPO update path and is useful before enabling vLLM Native RL sync.
