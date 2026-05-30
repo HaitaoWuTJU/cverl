@@ -157,6 +157,7 @@ add_library(cverl STATIC
   src/core_algos_c_api.cc
   src/torch/causal_lm_policy.cc
   src/torch/core_algos_torch.cc
+  src/torch/fp32_master_adamw.cc
   src/torch/qwen3_5_causal_lm_policy.cc
   src/torch/simple_grpo_trainer.cc
   src/torch/tiny_causal_lm_policy.cc
@@ -248,6 +249,10 @@ if (CVERL_BUILD_TESTS)
   add_executable(test_torch_backend tests/torch/test_torch_backend.cc)
   target_link_libraries(test_torch_backend PRIVATE cverl)
   target_compile_options(test_torch_backend PRIVATE ${TORCH_CXX_FLAGS})
+
+  add_executable(test_fp32_master_adamw tests/torch/test_fp32_master_adamw.cc)
+  target_link_libraries(test_fp32_master_adamw PRIVATE cverl)
+  target_compile_options(test_fp32_master_adamw PRIVATE ${TORCH_CXX_FLAGS})
 
   add_executable(test_simple_grpo_trainer tests/torch/test_simple_grpo_trainer.cc)
   target_link_libraries(test_simple_grpo_trainer PRIVATE cverl)

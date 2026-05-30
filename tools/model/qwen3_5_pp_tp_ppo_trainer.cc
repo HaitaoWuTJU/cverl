@@ -16,6 +16,7 @@
 #include "cverl/model/hf_model_loader.h"
 #include "cverl/model/qwen3_5_text.h"
 #include "cverl/torch/core_algos_torch.h"
+#include "cverl/torch/fp32_master_adamw.h"
 #include "cverl/torch/tiny_causal_policy.h"
 
 namespace {
@@ -75,23 +76,6 @@ double grad_norm_sum(const std::vector<torch::Tensor>& params) {
     if (p.grad().defined()) {
       out += p.grad().detach().to(torch::kFloat32).norm().item<double>();
     }
-  }
-  return out;
-}
-
-double param_delta_sum(const std::vector<torch::Tensor>& before, const std::vector<torch::Tensor>& after) {
-  double out = 0.0;
-  for (size_t i = 0; i < before.size(); ++i) {
-    out += (after[i].detach().to(torch::kFloat32) - before[i].to(torch::kFloat32)).abs().sum().item<double>();
-  }
-  return out;
-}
-
-std::vector<torch::Tensor> clone_params(const std::vector<torch::Tensor>& params) {
-  std::vector<torch::Tensor> out;
-  out.reserve(params.size());
-  for (const auto& p : params) {
-    out.push_back(p.detach().clone());
   }
   return out;
 }
@@ -187,12 +171,13 @@ int main(int argc, char** argv) {
       model.set_weight_override(name, tensor);
       params.push_back(tensor);
     }
-    torch::optim::AdamW optimizer(
-        params,
-        torch::optim::AdamWOptions(lr)
-            .betas(std::make_tuple(0.9, 0.95))
-            .eps(1.0e-5)
-            .weight_decay(0.01));
+    cverl::torch_backend::Fp32MasterAdamWOptions optim_options;
+    optim_options.lr = lr;
+    optim_options.beta1 = 0.9;
+    optim_options.beta2 = 0.95;
+    optim_options.eps = 1.0e-8;
+    optim_options.weight_decay = 0.01;
+    cverl::torch_backend::Fp32MasterAdamW optimizer(params, optim_options);
 
     const std::vector<int64_t> hidden_shape{1, seq_len, model.config().hidden_size};
     const auto full_ranks = full_group(world_size);
@@ -200,7 +185,7 @@ int main(int argc, char** argv) {
 
     for (int64_t step = 0; step < steps; ++step) {
       optimizer.zero_grad();
-      auto before = clone_params(params);
+      auto master_before = cverl::torch_backend::clone_detached(optimizer.master_parameters());
       std::unordered_map<int64_t, torch::Tensor> stage_inputs;
       std::unordered_map<int64_t, torch::Tensor> stage_outputs;
       double loss_sum = 0.0;
@@ -272,7 +257,8 @@ int main(int argc, char** argv) {
 
       const double local_grad_norm = grad_norm_sum(params);
       optimizer.step();
-      const double local_param_delta = param_delta_sum(before, params);
+      const double local_param_delta =
+          cverl::torch_backend::parameter_delta_sum(master_before, optimizer.master_parameters());
 
       auto grad_tensor = torch::tensor({local_grad_norm}, torch::TensorOptions().device(device).dtype(torch::kFloat32));
       auto delta_tensor = torch::tensor({local_param_delta}, torch::TensorOptions().device(device).dtype(torch::kFloat32));
