@@ -1,9 +1,11 @@
 #include "cverl/torch/qwen3_5_causal_lm_policy.h"
 
 #include <algorithm>
+#include <filesystem>
 #include <stdexcept>
 
 #include "cverl/model/hf_model_loader.h"
+#include "cverl/model/safetensors_writer.h"
 
 namespace cverl::torch_backend {
 
@@ -118,6 +120,52 @@ std::shared_ptr<CausalLmPolicy> Qwen3_5CausalLmPolicy::clone_as_reference() cons
   ref->eval();
   ref->publish_overrides();
   return ref;
+}
+
+void Qwen3_5CausalLmPolicy::save_hf_checkpoint(const std::string& output_dir,
+                                               const std::string& dtype) const {
+  namespace fs = std::filesystem;
+  if (max_layers_ >= 0 && max_layers_ < config_.num_hidden_layers) {
+    throw std::runtime_error(
+        "Qwen3_5CausalLmPolicy HF export requires all layers; rerun with --qwen-max-layers -1");
+  }
+
+  fs::path out_root(output_dir);
+  fs::create_directories(out_root);
+  for (const auto& entry : fs::directory_iterator(out_root)) {
+    if (!entry.is_regular_file()) {
+      continue;
+    }
+    const fs::path stale = entry.path();
+    const std::string filename = stale.filename().string();
+    if (stale.extension() == ".safetensors" || filename == "model.safetensors.index.json") {
+      fs::remove(stale);
+    }
+  }
+  for (const auto& entry : fs::directory_iterator(model_dir_)) {
+    if (!entry.is_regular_file()) {
+      continue;
+    }
+    const fs::path src = entry.path();
+    const std::string filename = src.filename().string();
+    if (src.extension() == ".safetensors" || filename == "model.safetensors.index.json") {
+      continue;
+    }
+    fs::copy_file(src, out_root / filename, fs::copy_options::overwrite_existing);
+  }
+
+  std::unordered_map<std::string, torch::Tensor> tensors;
+  tensors.reserve(weight_names_.size());
+  auto named = const_cast<Qwen3_5CausalLmPolicy*>(this)->named_parameters(false);
+  for (size_t i = 0; i < weight_names_.size(); ++i) {
+    const auto& reg = registered_names_[i];
+    auto& tensor = named[reg];
+    if (!tensor.defined()) {
+      throw std::runtime_error("save_hf_checkpoint missing parameter: " + reg);
+    }
+    tensors.emplace(weight_names_[i], tensor);
+  }
+  cverl::write_safetensors((out_root / "model.safetensors").string(), tensors, dtype);
 }
 
 }  // namespace cverl::torch_backend

@@ -14,6 +14,11 @@ void CausalLmPolicy::to_device(torch::Device device) {
   this->to(device);
 }
 
+void CausalLmPolicy::save_hf_checkpoint(const std::string&,
+                                        const std::string&) const {
+  throw std::runtime_error("this CausalLmPolicy backend cannot export HF checkpoints");
+}
+
 std::shared_ptr<CausalLmPolicy> make_causal_lm_policy(const CausalLmPolicyOptions& options) {
   switch (options.kind) {
     case CausalLmPolicyOptions::Kind::kTiny:

@@ -160,6 +160,32 @@ on this box).
 | `STEPS` / `PPO_EPOCHS` / `PROMPTS` / `N` | `8 / 1 / 1 / 4` | trainer batch shape |
 | `MAX_TOKENS` / `MAX_PROMPT_TOKENS` / `MAX_RESPONSE_TOKENS` | `256 / 128 / 256` | length budgets |
 | `SYSTEM_PROMPT` | (math tutor `#### N` recipe) | chat template prompt |
+| `EXPORT_DIR` | empty | when set, export updated actor HF checkpoints every `EXPORT_EVERY` steps |
+| `EXPORT_EVERY` / `EXPORT_DTYPE` | `1` / `bfloat16` | checkpoint cadence and safetensors dtype |
+| `RELOAD_URL` | empty | optional rollout-server reload endpoint, e.g. `http://127.0.0.1:8000/update_weights_from_disk` |
+| `RELOAD_API_KEY` | empty | bearer token for the reload endpoint |
+
+## Online Weight Reload
+
+`gsm8k_grpo_smoke` can now write the updated Qwen actor after optimizer
+steps:
+
+```bash
+EXPORT_DIR=/tmp/cverl_actor_ckpts \
+RELOAD_URL=http://127.0.0.1:8000/update_weights_from_disk \
+examples/run_vllm_gsm8k_smoke.sh
+```
+
+The exported directory is a Hugging Face-style checkpoint with copied
+config/tokenizer files and a single `model.safetensors`. Reload sends:
+
+```json
+{"model_path": "/tmp/cverl_actor_ckpts/step_000001"}
+```
+
+Full checkpoint export requires `QWEN_MAX_LAYERS=-1`; truncated trainer
+runs do not contain enough weights for a rollout engine to reload as a
+complete model.
 
 ## Notes vs. SGLang
 

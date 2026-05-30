@@ -39,6 +39,9 @@ class Qwen3_5CausalLmPolicy : public CausalLmPolicy {
 
   void to_device(torch::Device device) override;
   std::shared_ptr<CausalLmPolicy> clone_as_reference() const override;
+  bool supports_hf_checkpoint_export() const override { return true; }
+  void save_hf_checkpoint(const std::string& output_dir,
+                          const std::string& dtype = "bfloat16") const override;
 
   const Qwen35TextConfig& config() const { return config_; }
   int64_t max_layers() const { return max_layers_; }

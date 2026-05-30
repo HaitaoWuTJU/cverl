@@ -48,6 +48,13 @@ class CausalLmPolicy : public torch::nn::Module {
   // Snapshot every parameter into a frozen reference policy of the same
   // backbone. Used to compute KL penalty against the initial policy.
   virtual std::shared_ptr<CausalLmPolicy> clone_as_reference() const = 0;
+
+  // Export the current policy in a Hugging Face checkpoint layout that
+  // rollout engines can reload from disk. Backends that are not HF-style LMs
+  // leave the default implementation unsupported.
+  virtual bool supports_hf_checkpoint_export() const { return false; }
+  virtual void save_hf_checkpoint(const std::string& output_dir,
+                                  const std::string& dtype = "bfloat16") const;
 };
 
 // Factory descriptor for `make_causal_lm_policy`.

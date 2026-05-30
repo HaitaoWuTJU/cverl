@@ -52,6 +52,11 @@ SYSTEM_PROMPT="${SYSTEM_PROMPT:-You are a math tutor. Solve the problem step by 
 POLICY="${POLICY:-qwen}"
 QWEN_MAX_LAYERS="${QWEN_MAX_LAYERS:--1}"
 TRAINER_DEVICE="${TRAINER_DEVICE:-cuda}"
+EXPORT_DIR="${EXPORT_DIR:-}"
+EXPORT_EVERY="${EXPORT_EVERY:-1}"
+EXPORT_DTYPE="${EXPORT_DTYPE:-bfloat16}"
+RELOAD_URL="${RELOAD_URL:-}"
+RELOAD_API_KEY="${RELOAD_API_KEY:-}"
 
 # vLLM lives in its own Python (torch 2.11.0+cu128 from pytorch.org via the
 # proxy + the 0.22.0+cu129 wheel from wheels.vllm.ai). Override via env.
@@ -116,6 +121,17 @@ curl -sf "http://${HOST}:${PORT}/v1/completions" \
   -d "{\"model\":\"${MODEL_PATH}\",\"prompt\":\"Question: What is 1+1? Answer with #### final number.\\n\",\"max_tokens\":32,\"temperature\":0,\"n\":1}" \
   >"${PROBE_FILE}"
 
+TRAINER_EXTRA_ARGS=()
+if [[ -n "${EXPORT_DIR}" ]]; then
+  TRAINER_EXTRA_ARGS+=(--export-dir "${EXPORT_DIR}" --export-every "${EXPORT_EVERY}" --export-dtype "${EXPORT_DTYPE}")
+fi
+if [[ -n "${RELOAD_URL}" ]]; then
+  TRAINER_EXTRA_ARGS+=(--reload-url "${RELOAD_URL}")
+fi
+if [[ -n "${RELOAD_API_KEY}" ]]; then
+  TRAINER_EXTRA_ARGS+=(--reload-api-key "${RELOAD_API_KEY}")
+fi
+
 LD_LIBRARY_PATH="${TRAINER_LIBS}:${LD_LIBRARY_PATH:-}" \
 PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" \
 CUDA_VISIBLE_DEVICES="${TRAINER_DEVICES}" \
@@ -145,4 +161,5 @@ CUDA_VISIBLE_DEVICES="${TRAINER_DEVICES}" \
   --temperature "${TEMPERATURE}" \
   --top-p "${TOP_P}" \
   --kl-coef "${KL_COEF}" \
-  --kl-penalty "${KL_PENALTY}"
+  --kl-penalty "${KL_PENALTY}" \
+  "${TRAINER_EXTRA_ARGS[@]}"

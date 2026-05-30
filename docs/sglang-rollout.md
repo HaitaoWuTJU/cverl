@@ -127,6 +127,16 @@ which is consistent with greedy Qwen3.5-0.8B math performance.
 | `STEPS` / `PPO_EPOCHS` / `PROMPTS` / `N` | `1 / 1 / 4 / 4` | trainer batch shape |
 | `MAX_TOKENS` / `MAX_PROMPT_TOKENS` / `MAX_RESPONSE_TOKENS` | `256` | length budgets |
 | `SYSTEM_PROMPT` | (math tutor `#### N` recipe) | chat template prompt |
+| `EXPORT_DIR` | empty | when set, export updated actor HF checkpoints every `EXPORT_EVERY` steps |
+| `EXPORT_EVERY` / `EXPORT_DTYPE` | `1` / `bfloat16` | checkpoint cadence and safetensors dtype |
+| `RELOAD_URL` | empty | optional rollout-server reload endpoint, e.g. `http://127.0.0.1:30000/update_weights_from_disk` |
+| `RELOAD_API_KEY` | empty | bearer token for the reload endpoint |
+
+Set `EXPORT_DIR` to make the trainer emit a complete HF checkpoint after
+optimizer steps. Set `RELOAD_URL` as well to POST
+`{"model_path": ".../step_000001"}` to the rollout server after each export.
+This requires `QWEN_MAX_LAYERS=-1`; layer-truncated smoke runs cannot be
+reloaded as a full rollout model.
 
 ## Notes
 

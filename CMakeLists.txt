@@ -133,6 +133,7 @@ add_library(cverl STATIC
   src/distributed/topology.cc
   src/model/hf_model_loader.cc
   src/model/qwen3_5_text.cc
+  src/model/safetensors_writer.cc
   src/reward/gsm8k.cc
   src/rollout/http_transport.cc
   src/rollout/rollout_batch.cc
@@ -232,6 +233,10 @@ if (CVERL_BUILD_TESTS)
   add_executable(test_hf_model_loader tests/model/test_hf_model_loader.cc)
   target_link_libraries(test_hf_model_loader PRIVATE cverl)
   target_compile_options(test_hf_model_loader PRIVATE ${TORCH_CXX_FLAGS})
+
+  add_executable(test_safetensors_writer tests/model/test_safetensors_writer.cc)
+  target_link_libraries(test_safetensors_writer PRIVATE cverl)
+  target_compile_options(test_safetensors_writer PRIVATE ${TORCH_CXX_FLAGS})
 
   add_executable(test_hf_dataset tests/data/test_hf_dataset.cc)
   target_link_libraries(test_hf_dataset PRIVATE cverl)

@@ -22,15 +22,19 @@
 #include "cverl/torch/core_algos_torch.h"
 #include "cverl/torch/tiny_causal_policy.h"
 
+#include <curl/curl.h>
+#include <nlohmann/json.hpp>
 #include <torch/torch.h>
 
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -69,6 +73,11 @@ struct Args {
   std::string model_dir;
   int64_t qwen_max_layers = -1;
   std::string device = "cpu";
+  std::string export_dir;
+  int64_t export_every = 0;
+  std::string export_dtype = "bfloat16";
+  std::string reload_url;
+  std::string reload_api_key;
 };
 
 const char* require_value(int& i, int argc, char** argv, const char* name) {
@@ -162,6 +171,16 @@ Args parse_args(int argc, char** argv) {
       args.qwen_max_layers = std::strtoll(require_value(i, argc, argv, "--qwen-max-layers"), nullptr, 10);
     } else if (a == "--device") {
       args.device = require_value(i, argc, argv, "--device");
+    } else if (a == "--export-dir") {
+      args.export_dir = require_value(i, argc, argv, "--export-dir");
+    } else if (a == "--export-every") {
+      args.export_every = std::strtoll(require_value(i, argc, argv, "--export-every"), nullptr, 10);
+    } else if (a == "--export-dtype") {
+      args.export_dtype = require_value(i, argc, argv, "--export-dtype");
+    } else if (a == "--reload-url") {
+      args.reload_url = require_value(i, argc, argv, "--reload-url");
+    } else if (a == "--reload-api-key") {
+      args.reload_api_key = require_value(i, argc, argv, "--reload-api-key");
     } else {
       throw std::invalid_argument("unknown argument: " + a);
     }
@@ -180,6 +199,15 @@ Args parse_args(int argc, char** argv) {
   }
   if (args.policy_kind == "qwen" && args.model_dir.empty()) {
     throw std::invalid_argument("--policy qwen requires --model-dir");
+  }
+  if (!args.export_dir.empty() && args.export_every == 0) {
+    args.export_every = 1;
+  }
+  if (args.export_every < 0) {
+    throw std::invalid_argument("--export-every must be >= 0");
+  }
+  if (!args.reload_url.empty() && args.export_dir.empty()) {
+    throw std::invalid_argument("--reload-url requires --export-dir");
   }
   return args;
 }
@@ -200,6 +228,75 @@ std::unique_ptr<cverl::rollout::RolloutTransport> build_transport(const Args& ar
     return std::make_unique<cverl::rollout::HttpRolloutTransport>(std::move(opts));
   }
   throw std::invalid_argument("unsupported transport: " + args.transport);
+}
+
+size_t curl_write_string(char* ptr, size_t size, size_t nmemb, void* userdata) {
+  auto* out = static_cast<std::string*>(userdata);
+  size_t total = size * nmemb;
+  out->append(ptr, total);
+  return total;
+}
+
+void post_weight_reload(const std::string& url,
+                        const std::string& api_key,
+                        const std::string& model_path) {
+  static const CURLcode global_rc = curl_global_init(CURL_GLOBAL_DEFAULT);
+  if (global_rc != CURLE_OK) {
+    throw std::runtime_error(std::string("curl_global_init failed: ") + curl_easy_strerror(global_rc));
+  }
+  CURL* curl = curl_easy_init();
+  if (curl == nullptr) {
+    throw std::runtime_error("curl_easy_init failed");
+  }
+  curl_slist* headers = nullptr;
+  try {
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    headers = curl_slist_append(headers, "Accept: application/json");
+    std::string auth;
+    if (!api_key.empty()) {
+      auth = "Authorization: Bearer " + api_key;
+      headers = curl_slist_append(headers, auth.c_str());
+    }
+
+    nlohmann::json body{{"model_path", model_path}};
+    std::string payload = body.dump();
+    std::string out;
+    long http_status = 0;
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload.data());
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(payload.size()));
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_string);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &out);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 600L);
+    CURLcode rc = curl_easy_perform(curl);
+    if (rc != CURLE_OK) {
+      throw std::runtime_error(std::string("weight reload HTTP error: ") + curl_easy_strerror(rc));
+    }
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_status);
+    if (http_status < 200 || http_status >= 300) {
+      std::ostringstream oss;
+      oss << "weight reload " << url << " returned status " << http_status << ": " << out;
+      throw std::runtime_error(oss.str());
+    }
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+  } catch (...) {
+    if (headers != nullptr) {
+      curl_slist_free_all(headers);
+    }
+    curl_easy_cleanup(curl);
+    throw;
+  }
+}
+
+std::string step_export_path(const std::string& export_dir, int64_t step) {
+  std::ostringstream name;
+  name << "step_" << std::setw(6) << std::setfill('0') << step;
+  return (std::filesystem::path(export_dir) / name.str()).string();
 }
 
 }  // namespace
@@ -374,6 +471,19 @@ int main(int argc, char** argv) {
         auto params_after = policy->parameters();
         for (size_t i = 0; i < params_before.size(); ++i) {
           param_delta += (params_after[i].detach() - params_before[i]).abs().sum().item<double>();
+        }
+      }
+
+      if (!args.export_dir.empty() && args.export_every > 0 && step % args.export_every == 0) {
+        if (!policy->supports_hf_checkpoint_export()) {
+          throw std::runtime_error("--export-dir is only supported by HF-style policies such as --policy qwen");
+        }
+        const std::string path = step_export_path(args.export_dir, step);
+        policy->save_hf_checkpoint(path, args.export_dtype);
+        std::cerr << "exported_hf_checkpoint=" << path << "\n";
+        if (!args.reload_url.empty()) {
+          post_weight_reload(args.reload_url, args.reload_api_key, path);
+          std::cerr << "reloaded_rollout_weights=" << path << "\n";
         }
       }
 
