@@ -4,12 +4,14 @@
 The cverl Qwen policy is constructed by the C++/LibTorch pybind bridge. The
 sender passes those live torch.Tensor handles to vLLM's
 NCCLWeightTransferEngine.trainer_send_weights, so the payload is NCCL broadcast
-from GPU memory. No HF checkpoint export/reload is used.
+from GPU memory. By default, metadata uses HF checkpoint names so vLLM can reuse
+its mature model-specific weight loader to map into packed kernel parameters.
 """
 
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import sys
 
@@ -47,6 +49,8 @@ def main() -> int:
     parser.add_argument("--packed", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--packed-buffer-size-bytes", type=int, default=1024 * 1024 * 1024)
     parser.add_argument("--packed-num-buffers", type=int, default=2)
+    parser.add_argument("--checkpoint-format", action=argparse.BooleanOptionalAction, default=True,
+                        help="send HF checkpoint names and let vLLM map them into kernel-format parameters")
     parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument("--skip-server-init", action="store_true")
     parser.add_argument("--skip-update-metadata", action="store_true")
@@ -72,6 +76,7 @@ def main() -> int:
         packed_num_buffers=args.packed_num_buffers,
     )
     update_info["dtype_names"] = [normalize_dtype_name(x) for x in update_info["dtype_names"]]
+    update_info["is_checkpoint_format"] = args.checkpoint_format
 
     if args.dry_run:
         print(json.dumps({
@@ -91,43 +96,56 @@ def main() -> int:
         NCCLWeightTransferEngine,
     )
 
-    if not args.skip_server_init:
-        init_payload = {
-            "init_info": {
-                "master_address": args.master_address,
-                "master_port": args.master_port,
-                "rank_offset": args.rank_offset,
-                "world_size": args.world_size,
+    server_init = None
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        if not args.skip_server_init:
+            init_payload = {
+                "init_info": {
+                    "master_address": args.master_address,
+                    "master_port": args.master_port,
+                    "rank_offset": args.rank_offset,
+                    "world_size": args.world_size,
+                }
             }
-        }
-        print(json.dumps(post_json(args.base_url, "/init_weight_transfer_engine", init_payload, args.timeout), indent=2))
+            server_init = executor.submit(
+                post_json, args.base_url, "/init_weight_transfer_engine", init_payload, args.timeout)
 
-    if not args.skip_pause:
-        print(json.dumps(post_json(args.base_url, "/pause?mode=wait", {}, args.timeout), indent=2))
-
-    if not args.skip_update_metadata:
-        print(json.dumps(post_json(args.base_url, "/update_weights", {"update_info": dict(update_info)}, args.timeout), indent=2))
-
-    group = NCCLWeightTransferEngine.trainer_init(
-        dict(
-            master_address=args.master_address,
-            master_port=args.master_port,
-            world_size=args.world_size,
+        group = NCCLWeightTransferEngine.trainer_init(
+            dict(
+                master_address=args.master_address,
+                master_port=args.master_port,
+                world_size=args.world_size,
+            )
         )
-    )
-    NCCLWeightTransferEngine.trainer_send_weights(
-        iter(params),
-        NCCLTrainerSendWeightsArgs(
-            group=group,
-            src=0,
-            packed=args.packed,
-            packed_buffer_size_bytes=args.packed_buffer_size_bytes,
-            packed_num_buffers=args.packed_num_buffers,
-        ),
-    )
+        if server_init is not None:
+            print(json.dumps(server_init.result(), indent=2))
 
-    if not args.skip_pause:
-        print(json.dumps(post_json(args.base_url, "/resume", {}, args.timeout), indent=2))
+        if not args.skip_pause:
+            print(json.dumps(post_json(args.base_url, "/pause?mode=wait", {}, args.timeout), indent=2))
+
+        server_update = None
+        if not args.skip_update_metadata:
+            server_update = executor.submit(
+                post_json, args.base_url, "/update_weights", {"update_info": dict(update_info)}, args.timeout)
+
+        NCCLWeightTransferEngine.trainer_send_weights(
+            iter(params),
+            NCCLTrainerSendWeightsArgs(
+                group=group,
+                src=0,
+                packed=args.packed,
+                packed_buffer_size_bytes=args.packed_buffer_size_bytes,
+                packed_num_buffers=args.packed_num_buffers,
+            ),
+        )
+        if server_update is not None:
+            print(json.dumps(server_update.result(), indent=2))
+
+        if not args.skip_pause:
+            print(json.dumps(post_json(args.base_url, "/resume", {}, args.timeout), indent=2))
+    finally:
+        executor.shutdown(wait=False)
 
     print(json.dumps({"sent": len(params), "packed": args.packed}, indent=2))
     return 0

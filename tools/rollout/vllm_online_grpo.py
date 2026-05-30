@@ -13,6 +13,7 @@ The weight payload path is NCCL, not checkpoint export/reload.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import random
 import sys
@@ -122,6 +123,7 @@ class VllmNcclSync:
             packed_num_buffers=self.args.packed_num_buffers,
         )
         update_info["dtype_names"] = [normalize_dtype_name(x) for x in update_info["dtype_names"]]
+        update_info["is_checkpoint_format"] = self.args.checkpoint_format
 
         if not self.initialized:
             init_payload = {
@@ -132,28 +134,44 @@ class VllmNcclSync:
                     "world_size": self.args.world_size,
                 }
             }
-            post_json(self.args.base_url, "/init_weight_transfer_engine", init_payload, self.args.timeout)
-            self.group = NCCLWeightTransferEngine.trainer_init(
-                {
-                    "master_address": self.args.master_address,
-                    "master_port": self.args.master_port,
-                    "world_size": self.args.world_size,
-                }
-            )
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                server_init = executor.submit(
+                    post_json,
+                    self.args.base_url,
+                    "/init_weight_transfer_engine",
+                    init_payload,
+                    self.args.timeout,
+                )
+                self.group = NCCLWeightTransferEngine.trainer_init(
+                    {
+                        "master_address": self.args.master_address,
+                        "master_port": self.args.master_port,
+                        "world_size": self.args.world_size,
+                    }
+                )
+                server_init.result()
             self.initialized = True
 
         post_json(self.args.base_url, "/pause?mode=wait", {}, self.args.timeout)
-        post_json(self.args.base_url, "/update_weights", {"update_info": dict(update_info)}, self.args.timeout)
-        NCCLWeightTransferEngine.trainer_send_weights(
-            iter(params),
-            NCCLTrainerSendWeightsArgs(
-                group=self.group,
-                src=0,
-                packed=self.args.packed,
-                packed_buffer_size_bytes=self.args.packed_buffer_size_bytes,
-                packed_num_buffers=self.args.packed_num_buffers,
-            ),
-        )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            server_update = executor.submit(
+                post_json,
+                self.args.base_url,
+                "/update_weights",
+                {"update_info": dict(update_info)},
+                self.args.timeout,
+            )
+            NCCLWeightTransferEngine.trainer_send_weights(
+                iter(params),
+                NCCLTrainerSendWeightsArgs(
+                    group=self.group,
+                    src=0,
+                    packed=self.args.packed,
+                    packed_buffer_size_bytes=self.args.packed_buffer_size_bytes,
+                    packed_num_buffers=self.args.packed_num_buffers,
+                ),
+            )
+            server_update.result()
         post_json(self.args.base_url, "/resume", {}, self.args.timeout)
 
 
@@ -200,6 +218,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--packed", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--packed-buffer-size-bytes", type=int, default=1024 * 1024 * 1024)
     parser.add_argument("--packed-num-buffers", type=int, default=2)
+    parser.add_argument("--checkpoint-format", action=argparse.BooleanOptionalAction, default=True,
+                        help="send HF checkpoint names and let vLLM map them into kernel-format parameters")
     return parser.parse_args()
 
 
