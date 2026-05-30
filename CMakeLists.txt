@@ -146,6 +146,7 @@ add_library(cverl STATIC
   src/distributed/topology.cc
   src/distributed/weight_sync.cc
   src/model/hf_model_loader.cc
+  src/model/qwen_linear_attention_cuda_stub.cc
   src/model/qwen3_5_text.cc
   src/model/safetensors_writer.cc
   src/reward/gsm8k.cc
@@ -204,9 +205,11 @@ if (CVERL_ENABLE_CUDA)
   find_package(CUDAToolkit REQUIRED)
   target_sources(cverl PRIVATE
     cuda/core_algos_cuda.cu
+    cuda/qwen_linear_attention_cuda.cu
     src/rollout/gpu_ipc_rollout_batch.cc
   )
   target_link_libraries(cverl PUBLIC CUDA::cudart)
+  target_compile_definitions(cverl PUBLIC CVERL_ENABLE_CUDA=1)
 endif()
 
 if (CVERL_ENABLE_NCCL)

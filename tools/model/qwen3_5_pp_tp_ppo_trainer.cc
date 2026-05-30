@@ -228,6 +228,46 @@ torch::Tensor qwen_megatron_tp_shard(const std::string& name,
   return full.contiguous();
 }
 
+bool qwen_tp_replicated_parameter(const std::string& name) {
+  if (name == "model.language_model.norm.weight") {
+    return true;
+  }
+  if (name.find("input_layernorm.weight") != std::string::npos ||
+      name.find("post_attention_layernorm.weight") != std::string::npos ||
+      name.find(".self_attn.q_norm.weight") != std::string::npos ||
+      name.find(".self_attn.k_norm.weight") != std::string::npos ||
+      name.find(".linear_attn.norm.weight") != std::string::npos) {
+    return true;
+  }
+  return false;
+}
+
+void sync_tp_replicated_gradients(const std::vector<std::string>& names,
+                                  const std::vector<torch::Tensor>& params,
+                                  cverl::distributed::ParallelGroup& tp_group) {
+  if (tp_group.world_size == 1) {
+    return;
+  }
+  if (tp_group.collectives == nullptr) {
+    throw std::runtime_error("TP replicated gradient sync requires collectives");
+  }
+  if (names.size() != params.size()) {
+    throw std::runtime_error("TP replicated gradient sync name/param size mismatch");
+  }
+  for (size_t i = 0; i < params.size(); ++i) {
+    if (!qwen_tp_replicated_parameter(names[i])) {
+      continue;
+    }
+    auto& p = params[i];
+    if (!p.defined() || !p.grad().defined()) {
+      continue;
+    }
+    auto synced = tp_group.collectives->all_reduce(
+        p.grad().contiguous(), cverl::distributed::ReduceOp::Mean, tp_group.ranks);
+    p.mutable_grad().copy_(synced);
+  }
+}
+
 struct PpPpoBatch {
   std::vector<torch::Tensor> token_ids;
   std::vector<torch::Tensor> advantages;
@@ -802,6 +842,7 @@ int main(int argc, char** argv) {
     const auto jsonl_batches =
         load_jsonl_token_batches(jsonl_input, tokenizer_json, seq_len, jsonl_max_examples, device);
     std::vector<torch::Tensor> params;
+    std::vector<std::string> param_names;
     const auto rank_weight_names = stage_required_weight_names(
         model, layers, range.begin, range.end, peers.is_first_stage, peers.is_last_stage);
     for (const auto& name : rank_weight_names) {
@@ -812,6 +853,7 @@ int main(int argc, char** argv) {
       tensor.set_requires_grad(true);
       model.set_weight_override(name, tensor);
       params.push_back(tensor);
+      param_names.push_back(name);
     }
     cverl::torch_backend::Fp32MasterAdamWOptions optim_options;
     optim_options.lr = lr;
@@ -947,6 +989,7 @@ int main(int argc, char** argv) {
         }
       }
 
+      sync_tp_replicated_gradients(param_names, params, tp_group);
       const double local_grad_norm = optimizer.grad_norm_sum();
       if (!skip_optimizer_step) {
         optimizer.step();

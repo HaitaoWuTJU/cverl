@@ -1,6 +1,8 @@
 #include "cverl/model/qwen3_5_text.h"
+#include "cverl/model/qwen_linear_attention_cuda.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <regex>
@@ -8,6 +10,7 @@
 
 #include <torch/nn/functional/conv.h>
 #include <torch/nn/functional/embedding.h>
+#include <torch/csrc/autograd/custom_function.h>
 
 namespace cverl {
 namespace {
@@ -120,6 +123,111 @@ torch::Tensor all_reduce_sum_preserve_local_grad(const torch::Tensor& local,
   }
   auto reduced = tensor_group.collectives->all_reduce(local.contiguous(), distributed::ReduceOp::Sum, tensor_group.ranks);
   return local + (reduced - local).detach();
+}
+
+int64_t linear_attention_chunk_size() {
+  const char* env = std::getenv("CVERL_LINEAR_ATTN_CHUNK_SIZE");
+  if (env == nullptr || *env == '\0') {
+    return 16;
+  }
+  int64_t value = std::stoll(env);
+  if (value <= 0) {
+    throw std::invalid_argument("CVERL_LINEAR_ATTN_CHUNK_SIZE must be positive");
+  }
+  return value;
+}
+
+torch::Tensor linear_attention_chunked_recurrent(const torch::Tensor& query,
+                                                 const torch::Tensor& key,
+                                                 const torch::Tensor& value,
+                                                 const torch::Tensor& beta,
+                                                 const torch::Tensor& g,
+                                                 int64_t kd,
+                                                 int64_t vd) {
+  const int64_t bsz = query.size(0);
+  const int64_t heads = query.size(1);
+  const int64_t seq = query.size(2);
+  auto state = torch::zeros({bsz, heads, kd, vd}, torch::TensorOptions().dtype(torch::kFloat32).device(query.device()));
+  std::vector<torch::Tensor> chunk_outputs;
+  const int64_t chunk_size = linear_attention_chunk_size();
+  chunk_outputs.reserve(static_cast<size_t>((seq + chunk_size - 1) / chunk_size));
+  for (int64_t begin = 0; begin < seq; begin += chunk_size) {
+    const int64_t end = std::min(seq, begin + chunk_size);
+    std::vector<torch::Tensor> outs;
+    outs.reserve(static_cast<size_t>(end - begin));
+    for (int64_t t = begin; t < end; ++t) {
+      auto qt = query.index({Slice(), Slice(), t});
+      auto kt = key.index({Slice(), Slice(), t});
+      auto vt = value.index({Slice(), Slice(), t});
+      auto gt = torch::exp(g.index({Slice(), Slice(), t})).unsqueeze(-1).unsqueeze(-1);
+      auto bt = beta.index({Slice(), Slice(), t}).unsqueeze(-1);
+      state = state * gt;
+      auto kv_mem = (state * kt.unsqueeze(-1)).sum(-2);
+      auto delta = (vt - kv_mem) * bt;
+      state = state + kt.unsqueeze(-1) * delta.unsqueeze(-2);
+      outs.push_back((state * qt.unsqueeze(-1)).sum(-2));
+    }
+    chunk_outputs.push_back(torch::stack(outs, 2));
+  }
+  return torch::cat(chunk_outputs, 2);
+}
+
+bool use_cuda_linear_attention_kernel(const torch::Tensor& query, int64_t kd, int64_t vd) {
+  const char* env = std::getenv("CVERL_LINEAR_ATTN_BACKEND");
+  const std::string backend = env == nullptr ? "cuda" : std::string(env);
+  if (backend == "eager" || backend == "chunked") {
+    return false;
+  }
+  if (backend != "cuda" && backend != "auto") {
+    throw std::invalid_argument("CVERL_LINEAR_ATTN_BACKEND must be cuda|auto|chunked|eager");
+  }
+  return qwen_linear_attention_cuda_available() && query.is_cuda() && query.scalar_type() == torch::kFloat32 &&
+         kd == 128 && vd == 128;
+}
+
+class QwenLinearAttentionCudaFunction
+    : public torch::autograd::Function<QwenLinearAttentionCudaFunction> {
+ public:
+  static torch::Tensor forward(torch::autograd::AutogradContext* ctx,
+                               torch::Tensor query,
+                               torch::Tensor key,
+                               torch::Tensor value,
+                               torch::Tensor beta,
+                               torch::Tensor g) {
+    auto result = qwen_linear_attention_cuda_forward(
+        query.contiguous(), key.contiguous(), value.contiguous(), beta.contiguous(), g.contiguous());
+    auto out = std::get<0>(result);
+    auto states = std::get<1>(result);
+    ctx->save_for_backward({query, key, value, beta, g, states});
+    return out;
+  }
+
+  static torch::autograd::tensor_list backward(torch::autograd::AutogradContext* ctx,
+                                               torch::autograd::tensor_list grad_outputs) {
+    auto saved = ctx->get_saved_variables();
+    auto grads = qwen_linear_attention_cuda_backward(
+        grad_outputs[0].contiguous(),
+        saved[0].contiguous(),
+        saved[1].contiguous(),
+        saved[2].contiguous(),
+        saved[3].contiguous(),
+        saved[4].contiguous(),
+        saved[5].contiguous());
+    return {grads[0], grads[1], grads[2], grads[3], grads[4]};
+  }
+};
+
+torch::Tensor linear_attention_recurrent(const torch::Tensor& query,
+                                         const torch::Tensor& key,
+                                         const torch::Tensor& value,
+                                         const torch::Tensor& beta,
+                                         const torch::Tensor& g,
+                                         int64_t kd,
+                                         int64_t vd) {
+  if (use_cuda_linear_attention_kernel(query, kd, vd)) {
+    return QwenLinearAttentionCudaFunction::apply(query, key, value, beta, g);
+  }
+  return linear_attention_chunked_recurrent(query, key, value, beta, g, kd, vd);
 }
 
 std::string layer_prefix(int64_t layer_idx) {
@@ -425,23 +533,10 @@ torch::Tensor Qwen35TextModel::linear_attention(const torch::Tensor& x, int64_t 
   beta = beta.transpose(1, 2).contiguous().to(torch::kFloat32);
   g = g.transpose(1, 2).contiguous().to(torch::kFloat32);
 
-  auto state = torch::zeros({bsz, vh, kd, vd}, torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
-  std::vector<torch::Tensor> outs;
-  outs.reserve(static_cast<size_t>(seq));
-  for (int64_t t = 0; t < seq; ++t) {
-    auto qt = query.index({Slice(), Slice(), t});
-    auto kt = key.index({Slice(), Slice(), t});
-    auto vt = value.index({Slice(), Slice(), t});
-    auto gt = torch::exp(g.index({Slice(), Slice(), t})).unsqueeze(-1).unsqueeze(-1);
-    auto bt = beta.index({Slice(), Slice(), t}).unsqueeze(-1);
-    state = state * gt;
-    auto kv_mem = (state * kt.unsqueeze(-1)).sum(-2);
-    auto delta = (vt - kv_mem) * bt;
-    state = state + kt.unsqueeze(-1) * delta.unsqueeze(-2);
-    outs.push_back((state * qt.unsqueeze(-1)).sum(-2));
-  }
-
-  auto core = torch::stack(outs, 2).transpose(1, 2).contiguous().reshape({bsz * seq * vh, vd});
+  auto core = linear_attention_recurrent(query, key, value, beta, g, kd, vd)
+                  .transpose(1, 2)
+                  .contiguous()
+                  .reshape({bsz * seq * vh, vd});
   auto zg = z.reshape({bsz * seq * vh, vd});
   core = rms_norm_gated(core, zg, weight(p + "norm.weight")).reshape({bsz, seq, value_dim});
   return dense(core, weight(p + "out_proj.weight"));
@@ -527,23 +622,10 @@ torch::Tensor Qwen35TextModel::linear_attention_tensor_parallel(const torch::Ten
   beta = beta.transpose(1, 2).contiguous().to(torch::kFloat32);
   g = g.transpose(1, 2).contiguous().to(torch::kFloat32);
 
-  auto state = torch::zeros({bsz, vh_local, kd, vd}, torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
-  std::vector<torch::Tensor> outs;
-  outs.reserve(static_cast<size_t>(seq));
-  for (int64_t t = 0; t < seq; ++t) {
-    auto qt = query.index({Slice(), Slice(), t});
-    auto kt = key.index({Slice(), Slice(), t});
-    auto vt = value.index({Slice(), Slice(), t});
-    auto gt = torch::exp(g.index({Slice(), Slice(), t})).unsqueeze(-1).unsqueeze(-1);
-    auto bt = beta.index({Slice(), Slice(), t}).unsqueeze(-1);
-    state = state * gt;
-    auto kv_mem = (state * kt.unsqueeze(-1)).sum(-2);
-    auto delta = (vt - kv_mem) * bt;
-    state = state + kt.unsqueeze(-1) * delta.unsqueeze(-2);
-    outs.push_back((state * qt.unsqueeze(-1)).sum(-2));
-  }
-
-  auto core = torch::stack(outs, 2).transpose(1, 2).contiguous().reshape({bsz * seq * vh_local, vd});
+  auto core = linear_attention_recurrent(query, key, value, beta, g, kd, vd)
+                  .transpose(1, 2)
+                  .contiguous()
+                  .reshape({bsz * seq * vh_local, vd});
   auto zg = z.reshape({bsz * seq * vh_local, vd});
   core = rms_norm_gated(core, zg, weight(p + "norm.weight")).reshape({bsz, seq, value_local_dim});
   auto out_weight_shard = local_or_shard_dim(
