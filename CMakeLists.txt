@@ -54,7 +54,28 @@ if (NOT nlohmann_json_FOUND)
 endif()
 
 # libcurl powers the HTTP rollout transport.
-find_package(CURL REQUIRED)
+find_package(CURL QUIET)
+if (NOT CURL_FOUND)
+  find_path(CURL_INCLUDE_DIR curl/curl.h
+    HINTS
+      "$ENV{CONDA_PREFIX}/include"
+      "$ENV{HOME}/miniconda3/include"
+      "$ENV{HOME}/miniconda3/envs/verl-cpu/include"
+      /root/miniconda3/include
+      /usr/include
+  )
+  find_library(CURL_LIBRARY NAMES curl libcurl
+    HINTS
+      "$ENV{CONDA_PREFIX}/lib"
+      "$ENV{HOME}/miniconda3/lib"
+      "$ENV{HOME}/miniconda3/envs/verl-cpu/lib"
+      /root/miniconda3/lib
+      /usr/lib64 /usr/lib
+  )
+  if (NOT CURL_INCLUDE_DIR OR NOT CURL_LIBRARY)
+    message(FATAL_ERROR "libcurl is required for HTTP rollout transport")
+  endif()
+endif()
 
 # PCRE2 powers the byte-level BPE pre-tokenizer regex (Unicode property
 # classes \p{L}/\p{N} required by GPT-2 / Qwen3 patterns; std::regex does
@@ -144,7 +165,12 @@ endif()
 if (nlohmann_json_FOUND)
   target_link_libraries(cverl PUBLIC nlohmann_json::nlohmann_json)
 endif()
-target_link_libraries(cverl PUBLIC CURL::libcurl)
+if (CURL_FOUND)
+  target_link_libraries(cverl PUBLIC CURL::libcurl)
+else()
+  target_include_directories(cverl PUBLIC ${CURL_INCLUDE_DIR})
+  target_link_libraries(cverl PUBLIC ${CURL_LIBRARY})
+endif()
 target_link_libraries(cverl PUBLIC Threads::Threads)
 # librt provides POSIX shared memory + named semaphores on Linux.
 target_link_libraries(cverl PUBLIC rt)
