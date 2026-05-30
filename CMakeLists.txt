@@ -136,7 +136,9 @@ add_library(cverl STATIC
   src/hf_downloader.cc
   src/data/hf_dataset.cc
   src/distributed/collectives.cc
+  src/distributed/context_parallel.cc
   src/distributed/parallel_ops.cc
+  src/distributed/pipeline.cc
   src/distributed/topology.cc
   src/distributed/weight_sync.cc
   src/model/hf_model_loader.cc
@@ -363,6 +365,10 @@ if (CVERL_BUILD_TESTS)
   add_executable(cverl_gsm8k_grpo_bench tools/bench/cverl_gsm8k_grpo_bench.cc)
   target_link_libraries(cverl_gsm8k_grpo_bench PRIVATE cverl)
   target_compile_options(cverl_gsm8k_grpo_bench PRIVATE ${TORCH_CXX_FLAGS})
+
+  add_executable(cverl_parallel_plan tools/distributed/cverl_parallel_plan.cc)
+  target_link_libraries(cverl_parallel_plan PRIVATE cverl)
+  target_compile_options(cverl_parallel_plan PRIVATE ${TORCH_CXX_FLAGS})
 
   add_executable(vllm_weight_manifest tools/rollout/vllm_weight_manifest.cc)
   target_link_libraries(vllm_weight_manifest PRIVATE cverl)

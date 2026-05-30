@@ -15,6 +15,14 @@ Current examples:
   on GPU0-1 and cverl trainer/sender on GPU2, with GPU3 left free for the next
   trainer DP/TP step.
 
+Useful distributed planning command:
+
+```bash
+./build/cverl_parallel_plan --dp 2 --pp 2 --cp 2 --tp 2 \
+  --world-size 16 --local-world-size 4 --gpus-per-node 4 \
+  --micro-batches 4 --num-layers 24 --all-ranks
+```
+
 HTTP is still treated as a debug/control surface. The online vLLM script uses
 HTTP for OpenAI-compatible generation while the weight payload uses Native RL
 NCCL; the next optimization boundary is replacing generation transport with a

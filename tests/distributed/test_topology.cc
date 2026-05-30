@@ -1,4 +1,6 @@
 #include "cverl/distributed/collectives.h"
+#include "cverl/distributed/context_parallel.h"
+#include "cverl/distributed/pipeline.h"
 #include "cverl/distributed/topology.h"
 
 #include <cstdlib>
@@ -46,12 +48,13 @@ cverl::distributed::ClusterSpec make_spec() {
   cverl::distributed::ClusterSpec spec;
   spec.parallel.data_parallel = 2;
   spec.parallel.pipeline_parallel = 2;
+  spec.parallel.context_parallel = 2;
   spec.parallel.tensor_parallel = 4;
   spec.parallel.micro_batches = 4;
-  spec.world_size = 16;
-  spec.rank = 6;
+  spec.world_size = 32;
+  spec.rank = 13;
   spec.local_world_size = 8;
-  spec.local_rank = 6;
+  spec.local_rank = 5;
   spec.gpus_per_node = 8;
   spec.network.socket_ifnames = {"eth0", "ib0"};
   spec.network.ib_hcas = {"mlx5_0", "mlx5_1"};
@@ -64,11 +67,17 @@ void test_rank_mapping() {
   auto info = topology.local_rank_info();
   require(info.data_rank == 0, "data rank");
   require(info.pipeline_rank == 1, "pipeline rank");
-  require(info.tensor_rank == 2, "tensor rank");
-  require_vec_eq(info.tensor_group, {4, 5, 6, 7}, "tensor group");
-  require_vec_eq(info.pipeline_group, {2, 6}, "pipeline group");
-  require_vec_eq(info.data_group, {6, 14}, "data group");
-  require(topology.global_rank(1, 1, 2) == 14, "global rank");
+  require(info.context_rank == 1, "context rank");
+  require(info.tensor_rank == 1, "tensor rank");
+  require_vec_eq(info.tensor_group, {12, 13, 14, 15}, "tensor group");
+  require_vec_eq(info.pipeline_group, {5, 13}, "pipeline group");
+  require_vec_eq(info.context_group, {9, 13}, "context group");
+  require_vec_eq(info.data_group, {13, 29}, "data group");
+  require_vec_eq(info.model_group,
+                 {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
+                 "model group");
+  require(topology.global_rank(1, 1, 1, 1) == 29, "global rank");
+  require(topology.global_rank(1, 1, 1) == 25, "legacy global rank uses context rank 0");
 }
 
 void test_nccl_env() {
@@ -127,6 +136,7 @@ void test_invalid_configs() {
   spec.parallel.tensor_parallel = 16;
   spec.parallel.data_parallel = 1;
   spec.parallel.pipeline_parallel = 1;
+  spec.parallel.context_parallel = 1;
   spec.world_size = 16;
   failed = false;
   try {
@@ -148,7 +158,8 @@ void test_invalid_configs() {
 
   cverl::distributed::Topology topology(make_spec());
   require_throws([&]() { (void)topology.global_rank(2, 0, 0); }, "global rank out-of-range rejected");
-  require_throws([&]() { (void)topology.rank_info(16); }, "rank_info out-of-range rejected");
+  require_throws([&]() { (void)topology.global_rank(0, 0, 2, 0); }, "context rank out-of-range rejected");
+  require_throws([&]() { (void)topology.rank_info(32); }, "rank_info out-of-range rejected");
   require_throws([&]() { (void)topology.pipeline_layer_range(1, 2); }, "pipeline rank out-of-range rejected");
   require_throws([&]() { (void)topology.pipeline_layer_range(-1, 0); }, "negative layer count rejected");
 }
@@ -176,6 +187,7 @@ void test_cluster_spec_from_env() {
   dims.data_parallel = 2;
   dims.tensor_parallel = 2;
   dims.pipeline_parallel = 1;
+  dims.context_parallel = 1;
   dims.micro_batches = 1;
   auto spec = cverl::distributed::cluster_spec_from_env(dims);
   require(spec.world_size == 4, "env world size");
@@ -188,6 +200,36 @@ void test_cluster_spec_from_env() {
   auto info = topology.local_rank_info();
   require_vec_eq(info.tensor_group, {2, 3}, "env tensor group");
   require_vec_eq(info.data_group, {1, 3}, "env data group");
+}
+
+void test_pipeline_peers() {
+  cverl::distributed::Topology topology(make_spec());
+  auto info = topology.local_rank_info();
+  auto peers = cverl::distributed::pipeline_peers(topology, info);
+  require(!peers.is_first_stage, "rank 13 is not first PP stage");
+  require(peers.is_last_stage, "rank 13 is last PP stage");
+  require(peers.previous_rank == 5, "previous PP peer");
+  require(peers.next_rank == -1, "no next PP peer");
+  require(cverl::distributed::pipeline_warmup_micro_batches(topology, info) == 0, "last stage warmup");
+
+  auto first = topology.rank_info(5);
+  peers = cverl::distributed::pipeline_peers(topology, first);
+  require(peers.is_first_stage, "rank 5 is first PP stage");
+  require(!peers.is_last_stage, "rank 5 is not last PP stage");
+  require(peers.next_rank == 13, "next PP peer");
+  require(cverl::distributed::pipeline_warmup_micro_batches(topology, first) == 1, "first stage warmup");
+}
+
+void test_context_parallel_slice() {
+  auto x = torch::arange(2 * 8 * 3, torch::kFloat32).view({2, 8, 3});
+  auto left = cverl::distributed::context_parallel_slice(x, 0, 2, 1);
+  auto right = cverl::distributed::context_parallel_slice(x, 1, 2, 1);
+  require(torch::allclose(left, x.index({torch::indexing::Slice(), torch::indexing::Slice(0, 4)})),
+          "context slice left");
+  require(torch::allclose(right, x.index({torch::indexing::Slice(), torch::indexing::Slice(4, 8)})),
+          "context slice right");
+  require_throws([&]() { (void)cverl::distributed::context_parallel_slice(x, 0, 3, 1); },
+                 "non-divisible context slice rejected");
 }
 
 void test_dtype_names() {
@@ -206,6 +248,8 @@ int main() {
     test_invalid_configs();
     test_single_process_collectives();
     test_cluster_spec_from_env();
+    test_pipeline_peers();
+    test_context_parallel_slice();
     test_dtype_names();
   } catch (const std::exception& e) {
     std::cerr << "test_topology failed: " << e.what() << "\n";

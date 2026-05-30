@@ -7,7 +7,7 @@ initial integration surface.
 
 ## Parallel Axes
 
-`cverl::distributed::Topology` uses three orthogonal axes:
+`cverl::distributed::Topology` uses four orthogonal axes:
 
 - Data parallelism (`DP`): independent replicas over different prompt/response
   batches. Gradients are reduced across the DP group.
@@ -16,15 +16,22 @@ initial integration surface.
   collectives use NVLink/NVSwitch rather than inter-node fabric.
 - Pipeline parallelism (`PP`): split transformer layers into stages. Activation
   tensors move point-to-point between adjacent stages.
+- Context parallelism (`CP`): shard the sequence/context dimension for long
+  contexts. CP ranks keep the same model-layer ownership and exchange sequence
+  shards through all-gather/ring-attention style collectives.
 
 The default rank mapping is:
 
 ```text
-global_rank = ((data_rank * pipeline_parallel) + pipeline_rank) * tensor_parallel + tensor_rank
+global_rank = (((data_rank * pipeline_parallel) + pipeline_rank)
+               * context_parallel + context_rank)
+              * tensor_parallel + tensor_rank
 ```
 
-This makes each TP group contiguous in rank space. Launchers should map
-contiguous ranks onto GPUs connected by NVLink/NVSwitch.
+This keeps each TP group contiguous in rank space. Launchers should map
+contiguous TP ranks onto GPUs connected by NVLink/NVSwitch. CP groups should
+also stay within a node for short/medium contexts; for very long contexts they
+can span nodes only when the attention implementation overlaps communication.
 
 ## Communication Patterns
 
@@ -43,6 +50,12 @@ Expected collectives by parallel axis:
   - send/recv activations in forward
   - send/recv activation gradients in backward
   - schedule with enough micro-batches to keep stages occupied
+- CP:
+  - shard sequence tensors before attention
+  - all-gather or ring-exchange context shards where attention needs remote
+    tokens
+  - reduce-scatter sequence gradients when full-context activations were
+    materialized
 
 `include/cverl/distributed/collectives.h` is intentionally an interface. CPU
 tests use `SingleProcessCollectives`; CUDA/NCCL builds can enable
@@ -135,3 +148,20 @@ system NCCL libraries.
 The current CPU environment can validate topology, rank groups, config, and
 single-process collectives. Actual NCCL throughput, stream overlap, and NIC
 binding must be validated on the target GPU cluster.
+
+## Implemented Runtime Primitives
+
+Current code exposes the distributed shape directly:
+
+- `Topology`: DP/PP/CP/TP rank mapping, data/tensor/pipeline/context/model
+  groups, and per-stage layer ranges.
+- `parallel_ops`: TP row/column parallel projections, Qwen MLP/attention TP
+  paths, and DP gradient sync.
+- `pipeline`: PP peer selection plus forward/backward activation send/recv
+  wrappers on the `Collectives` interface.
+- `context_parallel`: sequence-dimension shard/gather helpers used as the
+  base for CP attention.
+
+The next efficiency step is replacing CP all-gather with a ring-attention
+kernel and replacing PP blocking send/recv with stream-aware batched
+send/recv in `NcclCollectives`.
