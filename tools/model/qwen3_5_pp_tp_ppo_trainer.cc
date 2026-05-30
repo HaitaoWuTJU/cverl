@@ -4,6 +4,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -591,6 +592,10 @@ int main(int argc, char** argv) {
     const std::string rollout_dir = arg_str(argc, argv, "--rollout-dir", "");
     const std::string rollout_ipc_json = arg_str(argc, argv, "--rollout-ipc-json", "");
     const std::string rollout_ipc_dir = arg_str(argc, argv, "--rollout-ipc-dir", "");
+    const std::string rollout_nccl_id_file = arg_str(argc, argv, "--rollout-nccl-id-file", "");
+    const int64_t rollout_nccl_world_size = arg_i64(argc, argv, "--rollout-nccl-world-size", 0);
+    const int64_t rollout_nccl_rank_offset = arg_i64(argc, argv, "--rollout-nccl-rank-offset", 0);
+    const int64_t rollout_nccl_source_rank = arg_i64(argc, argv, "--rollout-nccl-source-rank", 0);
     const std::string tokenizer_json =
         arg_str(argc, argv, "--tokenizer-json", (std::filesystem::path(model_dir) / "tokenizer.json").string());
     const int64_t jsonl_max_examples = arg_i64(argc, argv, "--jsonl-max-examples", 16);
@@ -643,6 +648,19 @@ int main(int argc, char** argv) {
     cverl::distributed::NcclCollectives full_comm(global_rank, world_size, static_cast<int>(device_idx), full_id);
     cverl::distributed::NcclCollectives tp_comm(info.tensor_rank, tp_size, static_cast<int>(device_idx), tp_id);
     cverl::distributed::ParallelGroup tp_group{info.tensor_rank, tp_size, full_group(tp_size), &tp_comm};
+    std::unique_ptr<cverl::distributed::NcclCollectives> rollout_data_comm;
+    if (!rollout_nccl_id_file.empty()) {
+      if (rollout_nccl_world_size <= world_size) {
+        throw std::invalid_argument("rollout NCCL world must include rollout ranks plus trainer ranks");
+      }
+      const int64_t rollout_data_rank = rollout_nccl_rank_offset + global_rank;
+      if (rollout_data_rank < 0 || rollout_data_rank >= rollout_nccl_world_size) {
+        throw std::invalid_argument("rollout NCCL data rank out of range");
+      }
+      auto rollout_id = cverl::distributed::read_nccl_unique_id_file(rollout_nccl_id_file);
+      rollout_data_comm = std::make_unique<cverl::distributed::NcclCollectives>(
+          rollout_data_rank, rollout_nccl_world_size, static_cast<int>(device_idx), rollout_id);
+    }
 
     cverl::HfModelLoader loader(model_dir);
     cverl::Qwen35TextModel model(std::move(loader));
@@ -689,7 +707,21 @@ int main(int argc, char** argv) {
       const std::string rollout_path = rollout_json_path_for_step(rollout_json, rollout_dir, step);
       const std::string rollout_ipc_path = rollout_ipc_path_for_step(rollout_ipc_json, rollout_ipc_dir, step);
       const PpPpoBatch* active_rollout = nullptr;
-      if (!rollout_ipc_path.empty()) {
+      if (rollout_data_comm != nullptr) {
+        if (peers.is_first_stage || peers.is_last_stage) {
+          cverl::rollout::NCCLGpuBatchReceiver receiver(*rollout_data_comm, static_cast<int>(device_idx));
+          auto gpu_batch = receiver.recv(rollout_nccl_source_rank);
+          if (gpu_batch.descriptor.step != step + 1) {
+            throw std::runtime_error("rollout NCCL batch step mismatch");
+          }
+          rollout_batch = convert_gpu_rollout_batch(gpu_batch, prompt_len, response_len);
+          active_rollout = &rollout_batch;
+          mean_reward = rollout_batch.mean_reward;
+          success_rate = rollout_batch.success_rate;
+          adv_abs_sum = rollout_batch.adv_abs_sum;
+        }
+        rollout_data_comm->barrier();
+      } else if (!rollout_ipc_path.empty()) {
         rollout_batch = load_rollout_ipc_batch(
             rollout_ipc_path, prompt_len, response_len, step + 1, static_cast<int32_t>(device_idx));
         active_rollout = &rollout_batch;

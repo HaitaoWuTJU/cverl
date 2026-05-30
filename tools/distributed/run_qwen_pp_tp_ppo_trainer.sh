@@ -22,6 +22,10 @@ ROLLOUT_JSON="${ROLLOUT_JSON:-}"
 ROLLOUT_DIR="${ROLLOUT_DIR:-}"
 ROLLOUT_IPC_JSON="${ROLLOUT_IPC_JSON:-}"
 ROLLOUT_IPC_DIR="${ROLLOUT_IPC_DIR:-}"
+ROLLOUT_NCCL_ID_FILE="${ROLLOUT_NCCL_ID_FILE:-}"
+ROLLOUT_NCCL_WORLD_SIZE="${ROLLOUT_NCCL_WORLD_SIZE:-0}"
+ROLLOUT_NCCL_RANK_OFFSET="${ROLLOUT_NCCL_RANK_OFFSET:-0}"
+ROLLOUT_NCCL_SOURCE_RANK="${ROLLOUT_NCCL_SOURCE_RANK:-0}"
 JSONL_MAX_EXAMPLES="${JSONL_MAX_EXAMPLES:-16}"
 TOKENIZER_JSON="${TOKENIZER_JSON:-${MODEL_DIR}/tokenizer.json}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-}"
@@ -69,6 +73,10 @@ for ((rank = 0; rank < WORLD_SIZE; ++rank)); do
       --rollout-dir "${ROLLOUT_DIR}" \
       --rollout-ipc-json "${ROLLOUT_IPC_JSON}" \
       --rollout-ipc-dir "${ROLLOUT_IPC_DIR}" \
+      --rollout-nccl-id-file "${ROLLOUT_NCCL_ID_FILE}" \
+      --rollout-nccl-world-size "${ROLLOUT_NCCL_WORLD_SIZE}" \
+      --rollout-nccl-rank-offset "${ROLLOUT_NCCL_RANK_OFFSET}" \
+      --rollout-nccl-source-rank "${ROLLOUT_NCCL_SOURCE_RANK}" \
       --jsonl-max-examples "${JSONL_MAX_EXAMPLES}" \
       --tokenizer-json "${TOKENIZER_JSON}" \
       --checkpoint-dir "${CHECKPOINT_DIR}" \

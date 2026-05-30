@@ -366,6 +366,10 @@ if (CVERL_BUILD_TESTS)
     target_link_libraries(test_nccl_gpu_batch_transport PRIVATE cverl)
     target_compile_options(test_nccl_gpu_batch_transport PRIVATE ${TORCH_CXX_FLAGS})
 
+    add_executable(nccl_rollout_batch_source tools/rollout/nccl_rollout_batch_source.cc)
+    target_link_libraries(nccl_rollout_batch_source PRIVATE cverl)
+    target_compile_options(nccl_rollout_batch_source PRIVATE ${TORCH_CXX_FLAGS})
+
     add_executable(qwen3_5_tp_smoke tools/model/qwen3_5_tp_smoke.cc)
     target_link_libraries(qwen3_5_tp_smoke PRIVATE cverl)
     target_compile_options(qwen3_5_tp_smoke PRIVATE ${TORCH_CXX_FLAGS})
