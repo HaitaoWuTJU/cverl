@@ -26,6 +26,8 @@ test: all
 	./$(BUILD_DIR)/test_rollout_batch
 	./$(BUILD_DIR)/test_gsm8k_grpo_smoke
 	./$(BUILD_DIR)/test_reference_policy_kl
+	./$(BUILD_DIR)/test_qwen3_5_causal_lm_policy
+	./$(BUILD_DIR)/test_qwen3_5_grpo_step
 	./$(BUILD_DIR)/test_distributed_topology
 	./$(BUILD_DIR)/test_parallel_ops
 

@@ -127,6 +127,49 @@ void Qwen35TextModel::to(torch::Device device) {
   }
 }
 
+void Qwen35TextModel::set_weight_override(const std::string& name, torch::Tensor tensor) {
+  weights_[name] = std::move(tensor);
+}
+
+std::vector<std::string> Qwen35TextModel::required_weight_names(int64_t max_layers) const {
+  int64_t layers = max_layers < 0 ? config_.num_hidden_layers
+                                  : std::min(max_layers, config_.num_hidden_layers);
+  std::vector<std::string> names;
+  names.reserve(static_cast<size_t>(8 + layers * 25));
+  names.emplace_back("model.language_model.embed_tokens.weight");
+  names.emplace_back("model.language_model.norm.weight");
+  for (int64_t i = 0; i < layers; ++i) {
+    std::string p = layer_prefix(i);
+    names.emplace_back(p + "input_layernorm.weight");
+    names.emplace_back(p + "post_attention_layernorm.weight");
+    if (config_.layer_types.at(static_cast<size_t>(i)) == "full_attention") {
+      std::string sa = p + "self_attn.";
+      names.emplace_back(sa + "q_proj.weight");
+      names.emplace_back(sa + "k_proj.weight");
+      names.emplace_back(sa + "v_proj.weight");
+      names.emplace_back(sa + "o_proj.weight");
+      names.emplace_back(sa + "q_norm.weight");
+      names.emplace_back(sa + "k_norm.weight");
+    } else {
+      std::string la = p + "linear_attn.";
+      names.emplace_back(la + "in_proj_qkv.weight");
+      names.emplace_back(la + "in_proj_z.weight");
+      names.emplace_back(la + "in_proj_b.weight");
+      names.emplace_back(la + "in_proj_a.weight");
+      names.emplace_back(la + "conv1d.weight");
+      names.emplace_back(la + "A_log");
+      names.emplace_back(la + "dt_bias");
+      names.emplace_back(la + "norm.weight");
+      names.emplace_back(la + "out_proj.weight");
+    }
+    std::string mp = p + "mlp.";
+    names.emplace_back(mp + "gate_proj.weight");
+    names.emplace_back(mp + "up_proj.weight");
+    names.emplace_back(mp + "down_proj.weight");
+  }
+  return names;
+}
+
 torch::Tensor Qwen35TextModel::weight(const std::string& name) {
   auto it = weights_.find(name);
   if (it != weights_.end()) {

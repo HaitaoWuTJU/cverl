@@ -54,18 +54,38 @@ gsm8k_rollout_pipeline \
 ```
 
 `tools/rollout/gsm8k_grpo_smoke.cc` runs the full closed loop on CPU:
-GSM8K -> RolloutTransport -> rule reward -> Tokenizer -> TinyCausalPolicy
+GSM8K -> RolloutTransport -> rule reward -> Tokenizer -> CausalLmPolicy
 logprobs -> GRPO advantages -> PPO clipped step. KL penalty against a frozen
 reference policy is enabled with `--kl-coef > 0` and `--kl-penalty
 {k1,abs,k2,k3}`. The tokenizer is selected via `--tokenizer {byte,hf}`;
 `hf` requires `--tokenizer-path /path/to/tokenizer.json` and uses
-HfBpeTokenizer (pure C++ HF byte-level BPE).
+HfBpeTokenizer (pure C++ HF byte-level BPE). The trainer policy is
+selected via `--policy {tiny,qwen}`; `qwen` requires `--model-dir
+/path/to/Qwen3.5-0.8B` (optional `--qwen-max-layers N` truncates the
+layer stack for fast smoke tests). `--device cuda` moves the trainer
+policy + every trainer-side tensor onto GPU.
 
 ```
 gsm8k_grpo_smoke \
   --dataset path/to/gsm8k.jsonl \
   --transport loopback \
   --tokenizer hf --tokenizer-path /path/to/Qwen3.5/tokenizer.json \
+  --policy qwen --model-dir /path/to/Qwen3.5-0.8B --qwen-max-layers 2 \
+  --device cuda \
+  --prompts 4 --n 4 --steps 4 \
+  --max-prompt-tokens 96 --max-response-tokens 64 \
+  --kl-coef 0.05 --kl-penalty k2
+```
+
+`--policy tiny` keeps the bag-of-tokens TinyCausalPolicy used for CPU
+smoke / CI runs (`--hidden-dim` controls its width).
+
+```
+gsm8k_grpo_smoke \
+  --dataset path/to/gsm8k.jsonl \
+  --transport loopback \
+  --tokenizer hf --tokenizer-path /path/to/Qwen3.5/tokenizer.json \
+  --policy tiny \
   --prompts 4 --n 4 --steps 4 \
   --max-prompt-tokens 96 --max-response-tokens 64 \
   --hidden-dim 16 \
@@ -119,5 +139,17 @@ computation, PPO loss, optimizer step) does not change between transports.
 - `tests/text/test_hf_bpe_tokenizer.cc` — round-trips a synthetic HF
   tokenizer.json + cross-validates encode/decode against fixtures generated
   by Python `tokenizers`.
+- `tests/torch/test_qwen3_5_causal_lm_policy.cc` — `Qwen3_5CausalLmPolicy`
+  forward bit-matches `Qwen35TextModel::forward_logits` on the concatenated
+  `[prompt, response]` sequence, every registered nn::Module parameter
+  receives a non-zero gradient, and `clone_as_reference` produces a frozen
+  decoupled copy. Skipped when `CVERL_QWEN_MODEL_DIR` is unset.
+- `tests/torch/test_qwen3_5_grpo_step.cc` — fake rollout response with
+  mixed-correctness samples per group -> HfBpeTokenizer ->
+  Qwen3_5CausalLmPolicy on CUDA -> non-zero GRPO advantages -> one PPO step;
+  asserts the Qwen fp32 parameters actually moved. Skipped when no model
+  dir is available.
 
-All tests are wired into `make test` and run on CPU only.
+All tests are wired into `make test`. Tests that require Qwen3.5 weights
+are skipped (return 0) when `CVERL_QWEN_MODEL_DIR` is unset, so CPU CI
+runs without the model still pass.

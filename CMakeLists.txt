@@ -142,8 +142,11 @@ add_library(cverl STATIC
   src/text/byte_tokenizer.cc
   src/text/hf_bpe_tokenizer.cc
   src/core_algos_c_api.cc
+  src/torch/causal_lm_policy.cc
   src/torch/core_algos_torch.cc
+  src/torch/qwen3_5_causal_lm_policy.cc
   src/torch/simple_grpo_trainer.cc
+  src/torch/tiny_causal_lm_policy.cc
   src/torch/tiny_causal_policy.cc
 )
 target_include_directories(cverl PUBLIC include)
@@ -267,6 +270,14 @@ if (CVERL_BUILD_TESTS)
   add_executable(test_reference_policy_kl tests/torch/test_reference_policy_kl.cc)
   target_link_libraries(test_reference_policy_kl PRIVATE cverl)
   target_compile_options(test_reference_policy_kl PRIVATE ${TORCH_CXX_FLAGS})
+
+  add_executable(test_qwen3_5_causal_lm_policy tests/torch/test_qwen3_5_causal_lm_policy.cc)
+  target_link_libraries(test_qwen3_5_causal_lm_policy PRIVATE cverl)
+  target_compile_options(test_qwen3_5_causal_lm_policy PRIVATE ${TORCH_CXX_FLAGS})
+
+  add_executable(test_qwen3_5_grpo_step tests/torch/test_qwen3_5_grpo_step.cc)
+  target_link_libraries(test_qwen3_5_grpo_step PRIVATE cverl)
+  target_compile_options(test_qwen3_5_grpo_step PRIVATE ${TORCH_CXX_FLAGS})
 
   add_executable(test_distributed_topology tests/distributed/test_topology.cc)
   target_link_libraries(test_distributed_topology PRIVATE cverl)

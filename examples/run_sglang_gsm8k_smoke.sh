@@ -93,7 +93,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" python -m sglang.launch_server \
+SGLANG_DEVICES="${SGLANG_DEVICES:-${CUDA_VISIBLE_DEVICES:-0}}"
+TRAINER_DEVICES="${TRAINER_DEVICES:-1}"
+
+CUDA_VISIBLE_DEVICES="${SGLANG_DEVICES}" python -m sglang.launch_server \
   --model-path "${MODEL_PATH}" \
   --host "${HOST}" \
   --port "${PORT}" \
@@ -124,7 +127,7 @@ curl -sf "http://${HOST}:${PORT}/v1/completions" \
   -d "{\"model\":\"${MODEL_PATH}\",\"prompt\":\"Question: What is 1+1? Answer with #### final number.\\n\",\"max_tokens\":32,\"temperature\":0,\"n\":1}" \
   >/tmp/cverl_sglang_completion.json
 
-"${BUILD_DIR}/gsm8k_grpo_smoke" \
+CUDA_VISIBLE_DEVICES="${TRAINER_DEVICES}" "${BUILD_DIR}/gsm8k_grpo_smoke" \
   --dataset "${DATASET}" \
   --transport http \
   --base-url "http://${HOST}:${PORT}" \
@@ -132,14 +135,20 @@ curl -sf "http://${HOST}:${PORT}/v1/completions" \
   --model "${MODEL_PATH}" \
   --prompts "${PROMPTS}" \
   --n "${N}" \
-  --steps 1 \
-  --ppo-epochs 1 \
+  --steps "${STEPS:-1}" \
+  --ppo-epochs "${PPO_EPOCHS:-1}" \
   --max-tokens "${MAX_TOKENS}" \
-  --max-prompt-tokens 256 \
-  --max-response-tokens 256 \
-  --hidden-dim 32 \
-  --tokenizer byte \
-  --reward-method flexible \
-  --temperature 0.9 \
-  --top-p 0.95 \
-  --kl-coef 0.01
+  --max-prompt-tokens "${MAX_PROMPT_TOKENS:-256}" \
+  --max-response-tokens "${MAX_RESPONSE_TOKENS:-256}" \
+  --tokenizer hf \
+  --tokenizer-path "${MODEL_PATH}/tokenizer.json" \
+  --policy "${POLICY:-qwen}" \
+  --model-dir "${MODEL_PATH}" \
+  --qwen-max-layers "${QWEN_MAX_LAYERS:-2}" \
+  --device "${TRAINER_DEVICE:-cuda}" \
+  --weight-decay "${WEIGHT_DECAY:-0.0}" \
+  --lr "${LR:-3e-5}" \
+  --reward-method "${REWARD_METHOD:-flexible}" \
+  --temperature "${TEMPERATURE:-0.9}" \
+  --top-p "${TOP_P:-0.95}" \
+  --kl-coef "${KL_COEF:-0.0}"

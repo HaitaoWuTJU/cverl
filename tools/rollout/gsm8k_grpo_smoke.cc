@@ -18,6 +18,7 @@
 #include "cverl/text/byte_tokenizer.h"
 #include "cverl/text/hf_bpe_tokenizer.h"
 #include "cverl/text/tokenizer.h"
+#include "cverl/torch/causal_lm_policy.h"
 #include "cverl/torch/core_algos_torch.h"
 #include "cverl/torch/tiny_causal_policy.h"
 
@@ -57,12 +58,17 @@ struct Args {
   double top_p = 1.0;
   double clip_ratio = 0.2;
   double learning_rate = 3.0e-3;
+  double weight_decay = 0.0;
   double kl_coef = 0.0;
   cverl_kl_penalty_t kl_penalty_mode = CVERL_KL_K1;
   uint64_t seed = 17;
   cverl::reward::Gsm8kExtractionMethod reward_method = cverl::reward::Gsm8kExtractionMethod::Strict;
   std::string tokenizer_kind = "byte";
   std::string tokenizer_path;
+  std::string policy_kind = "tiny";
+  std::string model_dir;
+  int64_t qwen_max_layers = -1;
+  std::string device = "cpu";
 };
 
 const char* require_value(int& i, int argc, char** argv, const char* name) {
@@ -116,6 +122,8 @@ Args parse_args(int argc, char** argv) {
       args.clip_ratio = std::strtod(require_value(i, argc, argv, "--clip-ratio"), nullptr);
     } else if (a == "--lr") {
       args.learning_rate = std::strtod(require_value(i, argc, argv, "--lr"), nullptr);
+    } else if (a == "--weight-decay") {
+      args.weight_decay = std::strtod(require_value(i, argc, argv, "--weight-decay"), nullptr);
     } else if (a == "--kl-coef") {
       args.kl_coef = std::strtod(require_value(i, argc, argv, "--kl-coef"), nullptr);
     } else if (a == "--kl-penalty") {
@@ -146,6 +154,14 @@ Args parse_args(int argc, char** argv) {
       args.tokenizer_kind = require_value(i, argc, argv, "--tokenizer");
     } else if (a == "--tokenizer-path") {
       args.tokenizer_path = require_value(i, argc, argv, "--tokenizer-path");
+    } else if (a == "--policy") {
+      args.policy_kind = require_value(i, argc, argv, "--policy");
+    } else if (a == "--model-dir") {
+      args.model_dir = require_value(i, argc, argv, "--model-dir");
+    } else if (a == "--qwen-max-layers") {
+      args.qwen_max_layers = std::strtoll(require_value(i, argc, argv, "--qwen-max-layers"), nullptr, 10);
+    } else if (a == "--device") {
+      args.device = require_value(i, argc, argv, "--device");
     } else {
       throw std::invalid_argument("unknown argument: " + a);
     }
@@ -158,6 +174,12 @@ Args parse_args(int argc, char** argv) {
   }
   if (args.transport == "http" && args.base_url.empty()) {
     throw std::invalid_argument("--transport http requires --base-url");
+  }
+  if (args.policy_kind != "tiny" && args.policy_kind != "qwen") {
+    throw std::invalid_argument("--policy must be tiny|qwen");
+  }
+  if (args.policy_kind == "qwen" && args.model_dir.empty()) {
+    throw std::invalid_argument("--policy qwen requires --model-dir");
   }
   return args;
 }
@@ -215,16 +237,35 @@ int main(int argc, char** argv) {
     cverl::reward::Gsm8kRewardOptions reward_opts;
     reward_opts.method = args.reward_method;
 
-    cverl::torch_backend::TinyCausalPolicy policy(
-        vocab_size,
-        args.hidden_dim,
-        pad_id);
-    torch::optim::AdamW optimizer(policy->parameters(), torch::optim::AdamWOptions(args.learning_rate));
+    cverl::torch_backend::CausalLmPolicyOptions policy_opts;
+    policy_opts.pad_id = pad_id;
+    if (args.policy_kind == "tiny") {
+      policy_opts.kind = cverl::torch_backend::CausalLmPolicyOptions::Kind::kTiny;
+      policy_opts.tiny_vocab_size = vocab_size;
+      policy_opts.tiny_hidden_dim = args.hidden_dim;
+    } else {
+      policy_opts.kind = cverl::torch_backend::CausalLmPolicyOptions::Kind::kQwen3_5;
+      policy_opts.qwen_model_dir = args.model_dir;
+      policy_opts.qwen_max_layers = args.qwen_max_layers;
+    }
+    auto policy = cverl::torch_backend::make_causal_lm_policy(policy_opts);
+    torch::Device run_device(torch::kCPU);
+    if (args.device == "cuda") {
+      run_device = torch::Device(torch::kCUDA, 0);
+    } else if (args.device != "cpu") {
+      throw std::invalid_argument("--device must be cpu|cuda");
+    }
+    policy->to_device(run_device);
+
+    torch::optim::AdamW optimizer(
+        policy->parameters(),
+        torch::optim::AdamWOptions(args.learning_rate).weight_decay(args.weight_decay));
 
     // Snapshot the initial policy as the frozen reference for KL penalty.
     // For real RLHF runs this is typically the SFT model loaded separately,
     // but for the smoke loop the initial policy is fine.
-    auto ref_policy = cverl::torch_backend::clone_as_reference(policy);
+    auto ref_policy = policy->clone_as_reference();
+    ref_policy->to_device(run_device);
 
     std::cout << "step,transport,total_seq,mean_reward,success_rate,no_answer,loss,pg_loss,kl_loss,ppo_kl,clipfrac,param_delta,seconds\n";
 
@@ -260,10 +301,19 @@ int main(int argc, char** argv) {
       auto batch = cverl::rollout::build_gsm8k_rollout_batch(
           resp, prompts, ground_truths, reward_opts, *tokenizer, batch_opts);
 
+      // RolloutBatch tensors are built on CPU; move every trainer-side tensor
+      // onto the active device before any forward / loss math so policies
+      // running on CUDA don't pay a host->device hop on every op.
+      auto prompt_ids = batch.prompt_ids.to(run_device);
+      auto response_ids = batch.response_ids.to(run_device);
+      auto response_mask = batch.response_mask.to(run_device);
+      auto token_rewards = batch.token_rewards.to(run_device);
+      auto group_ids = batch.group_ids.to(run_device);
+
       // GRPO advantages from the rule reward.
       torch::Tensor returns;
       torch::Tensor advantages = cverl::torch_backend::grpo_outcome_advantage(
-          batch.token_rewards, batch.response_mask, batch.group_ids, 1.0e-6, true, &returns);
+          token_rewards, response_mask, group_ids, 1.0e-6, true, &returns);
 
       // Old log probs under the current policy (frozen for this step) and
       // reference log probs (frozen forever) for KL penalty.
@@ -271,11 +321,11 @@ int main(int argc, char** argv) {
       torch::Tensor ref_log_probs;
       {
         torch::NoGradGuard no_grad;
-        torch::Tensor logits = policy->forward(batch.prompt_ids, batch.response_ids);
-        old_log_probs = cverl::torch_backend::response_log_probs(logits, batch.response_ids).detach();
+        torch::Tensor logits = policy->forward(prompt_ids, response_ids);
+        old_log_probs = cverl::torch_backend::response_log_probs(logits, response_ids).detach();
         if (args.kl_coef > 0.0) {
-          torch::Tensor ref_logits = ref_policy->forward(batch.prompt_ids, batch.response_ids);
-          ref_log_probs = cverl::torch_backend::response_log_probs(ref_logits, batch.response_ids).detach();
+          torch::Tensor ref_logits = ref_policy->forward(prompt_ids, response_ids);
+          ref_log_probs = cverl::torch_backend::response_log_probs(ref_logits, response_ids).detach();
         }
       }
 
@@ -294,17 +344,17 @@ int main(int argc, char** argv) {
       double last_kl = 0.0;
       double last_clipfrac = 0.0;
       for (int64_t epoch = 0; epoch < args.ppo_epochs; ++epoch) {
-        torch::Tensor logits = policy->forward(batch.prompt_ids, batch.response_ids);
-        torch::Tensor log_probs = cverl::torch_backend::response_log_probs(logits, batch.response_ids);
+        torch::Tensor logits = policy->forward(prompt_ids, response_ids);
+        torch::Tensor log_probs = cverl::torch_backend::response_log_probs(logits, response_ids);
         auto loss = cverl::torch_backend::ppo_clipped_loss(
-            old_log_probs, log_probs, advantages, batch.response_mask,
+            old_log_probs, log_probs, advantages, response_mask,
             args.clip_ratio, -1.0, -1.0, 3.0, CVERL_LOSS_AGG_TOKEN_MEAN);
         torch::Tensor total_loss = loss.pg_loss;
         torch::Tensor kl_loss_value = torch::zeros({}, total_loss.options());
         if (args.kl_coef > 0.0) {
           torch::Tensor kl_token = cverl::torch_backend::kl_penalty(
               log_probs, ref_log_probs, args.kl_penalty_mode);
-          kl_loss_value = cverl::torch_backend::masked_mean(kl_token, batch.response_mask);
+          kl_loss_value = cverl::torch_backend::masked_mean(kl_token, response_mask);
           total_loss = total_loss + args.kl_coef * kl_loss_value;
         }
         optimizer.zero_grad();

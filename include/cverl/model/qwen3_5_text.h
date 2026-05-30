@@ -36,6 +36,7 @@ class Qwen35TextModel {
   explicit Qwen35TextModel(HfModelLoader loader);
 
   const Qwen35TextConfig& config() const { return config_; }
+  const HfModelLoader& loader() const { return loader_; }
   void to(torch::Device device);
   torch::Tensor forward_hidden(const torch::Tensor& input_ids, int64_t max_layers = -1);
   torch::Tensor forward_logits(const torch::Tensor& input_ids, int64_t max_layers = -1);
@@ -51,6 +52,19 @@ class Qwen35TextModel {
   torch::Tensor linear_attention_tensor_parallel(const torch::Tensor& x,
                                                  int64_t layer_idx,
                                                  const distributed::ParallelGroup& tensor_group);
+
+  // List every tensor name that the forward path is expected to look up,
+  // for `max_layers` first transformer blocks (or all layers if -1). Useful
+  // for higher-level wrappers (CausalLmPolicy etc) that need to materialize
+  // every weight up-front and attach autograd / optimizer state to them.
+  std::vector<std::string> required_weight_names(int64_t max_layers = -1) const;
+
+  // Replace the lazy safetensors-backed weight cache for the given name with
+  // a caller-owned tensor. Subsequent forward calls will use this tensor
+  // directly (no copy). This is how `Qwen3_5CausalLmPolicy` injects its
+  // registered nn::Module parameters into the forward graph so backward()
+  // reaches them.
+  void set_weight_override(const std::string& name, torch::Tensor tensor);
 
  private:
   torch::Tensor weight(const std::string& name);
