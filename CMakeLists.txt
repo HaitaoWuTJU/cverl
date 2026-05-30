@@ -352,6 +352,10 @@ if (CVERL_BUILD_TESTS)
     add_executable(qwen3_5_pp_tp_train_smoke tools/model/qwen3_5_pp_tp_train_smoke.cc)
     target_link_libraries(qwen3_5_pp_tp_train_smoke PRIVATE cverl)
     target_compile_options(qwen3_5_pp_tp_train_smoke PRIVATE ${TORCH_CXX_FLAGS})
+
+    add_executable(qwen3_5_pp_tp_ppo_trainer tools/model/qwen3_5_pp_tp_ppo_trainer.cc)
+    target_link_libraries(qwen3_5_pp_tp_ppo_trainer PRIVATE cverl)
+    target_compile_options(qwen3_5_pp_tp_ppo_trainer PRIVATE ${TORCH_CXX_FLAGS})
   endif()
 
   add_executable(minimal_ppo_step tools/torch/minimal_ppo_step.cc)

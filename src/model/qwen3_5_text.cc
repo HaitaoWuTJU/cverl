@@ -266,9 +266,8 @@ torch::Tensor Qwen35TextModel::full_attention(const torch::Tensor& x, int64_t la
   auto mask = torch::ones({s, s}, torch::TensorOptions().dtype(torch::kBool).device(x.device())).triu(1);
   attn = attn.masked_fill(mask.unsqueeze(0).unsqueeze(0), -1.0e9);
   attn = torch::softmax(attn.to(torch::kFloat32), -1);
-  attn = attn.to(v.scalar_type());
-  auto out = torch::matmul(attn, v).transpose(1, 2).contiguous().reshape({b, s, h * d});
-  out = out * torch::sigmoid(gate);
+  auto out = torch::matmul(attn, v.to(torch::kFloat32)).transpose(1, 2).contiguous().reshape({b, s, h * d});
+  out = (out * torch::sigmoid(gate.to(torch::kFloat32))).to(x.scalar_type());
   return dense(out, weight(p + "o_proj.weight"));
 }
 
@@ -316,9 +315,8 @@ torch::Tensor Qwen35TextModel::full_attention_tensor_parallel(const torch::Tenso
   auto mask = torch::ones({s, s}, torch::TensorOptions().dtype(torch::kBool).device(x.device())).triu(1);
   attn = attn.masked_fill(mask.unsqueeze(0).unsqueeze(0), -1.0e9);
   attn = torch::softmax(attn.to(torch::kFloat32), -1);
-  attn = attn.to(v.scalar_type());
-  auto local = torch::matmul(attn, v).transpose(1, 2).contiguous().reshape({b, s, h_local * d});
-  local = local * torch::sigmoid(gate);
+  auto local = torch::matmul(attn, v.to(torch::kFloat32)).transpose(1, 2).contiguous().reshape({b, s, h_local * d});
+  local = (local * torch::sigmoid(gate.to(torch::kFloat32))).to(x.scalar_type());
   auto o_weight_shard = distributed::shard_dim(weight(p + "o_proj.weight"), 1, tensor_group.rank, tensor_group.world_size);
   auto partial = dense(local, o_weight_shard);
   if (tensor_group.world_size == 1) {
@@ -503,6 +501,10 @@ torch::Tensor Qwen35TextModel::token_embeddings(const torch::Tensor& input_ids) 
   return embed(input_ids);
 }
 
+torch::Tensor Qwen35TextModel::lm_head_logits(const torch::Tensor& hidden) {
+  return torch::matmul(hidden.to(torch::kFloat32), weight("model.language_model.embed_tokens.weight").to(torch::kFloat32).transpose(0, 1));
+}
+
 torch::Tensor Qwen35TextModel::forward_hidden_tensor_parallel(const torch::Tensor& input_ids,
                                                               const distributed::ParallelGroup& tensor_group,
                                                               int64_t max_layers) {
@@ -542,7 +544,7 @@ torch::Tensor Qwen35TextModel::forward_hidden_range_tensor_parallel(const torch:
 
 torch::Tensor Qwen35TextModel::forward_logits(const torch::Tensor& input_ids, int64_t max_layers) {
   auto hidden = forward_hidden(input_ids, max_layers);
-  return dense(hidden, weight("model.language_model.embed_tokens.weight"));
+  return lm_head_logits(hidden);
 }
 
 }  // namespace cverl
