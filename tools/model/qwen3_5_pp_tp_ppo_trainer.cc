@@ -128,7 +128,7 @@ std::vector<std::string> stage_required_weight_names(const cverl::Qwen35TextMode
       continue;
     }
     if (name == "model.language_model.embed_tokens.weight") {
-      if (is_first_stage) {
+      if (is_first_stage || is_last_stage) {
         out.push_back(name);
       }
       continue;
@@ -168,6 +168,9 @@ torch::Tensor qwen_megatron_tp_shard(const std::string& name,
                                      int64_t tp_size) {
   if (tp_size == 1) {
     return full.contiguous();
+  }
+  if (name == "model.language_model.embed_tokens.weight") {
+    return shard_dim_if_needed(full, 0, tp_rank, tp_size);
   }
   int64_t layer = -1;
   if (!layer_index_from_weight_name(name, &layer)) {
@@ -875,7 +878,7 @@ int main(int argc, char** argv) {
           if (peers.is_first_stage) {
             auto ids = make_token_ids(
                 seq_len, action.micro_batch, step, vary_tokens_by_step, active_rollout, jsonl_batches, model.config(), device);
-            input = model.token_embeddings(ids);
+            input = model.token_embeddings_tensor_parallel(ids, tp_group);
           } else {
             auto like = torch::empty(hidden_shape, torch::TensorOptions().device(device).dtype(dtype));
             input = full_comm.recv_like(like, peers.previous_rank).detach().set_requires_grad(true);
@@ -895,10 +898,9 @@ int main(int argc, char** argv) {
           if (peers.is_last_stage) {
             auto ids = make_token_ids(
                 seq_len, action.micro_batch, step, vary_tokens_by_step, active_rollout, jsonl_batches, model.config(), device);
-            auto logits = model.lm_head_logits(out_it->second).to(torch::kFloat32);
-            auto response_logits = logits.slice(1, prompt_len - 1, prompt_len + response_len - 1);
             auto response_ids = ids.slice(1, prompt_len, prompt_len + response_len);
-            auto log_probs = cverl::torch_backend::response_log_probs(response_logits, response_ids);
+            auto response_hidden = out_it->second.slice(1, prompt_len - 1, prompt_len + response_len - 1);
+            auto log_probs = model.response_log_probs_tensor_parallel(response_hidden, response_ids, tp_group);
             torch::Tensor old_log_probs = log_probs.detach();
             torch::Tensor advantages;
             torch::Tensor response_mask;

@@ -39,7 +39,12 @@ class Qwen35TextModel {
   const HfModelLoader& loader() const { return loader_; }
   void to(torch::Device device);
   torch::Tensor token_embeddings(const torch::Tensor& input_ids);
+  torch::Tensor token_embeddings_tensor_parallel(const torch::Tensor& input_ids,
+                                                 const distributed::ParallelGroup& tensor_group);
   torch::Tensor lm_head_logits(const torch::Tensor& hidden);
+  torch::Tensor response_log_probs_tensor_parallel(const torch::Tensor& hidden,
+                                                   const torch::Tensor& response_ids,
+                                                   const distributed::ParallelGroup& tensor_group);
   torch::Tensor forward_hidden(const torch::Tensor& input_ids, int64_t max_layers = -1);
   torch::Tensor forward_logits(const torch::Tensor& input_ids, int64_t max_layers = -1);
   torch::Tensor forward_hidden_tensor_parallel(const torch::Tensor& input_ids,

@@ -110,6 +110,18 @@ torch::Tensor local_or_shard_dim(const torch::Tensor& tensor,
   throw std::invalid_argument("unexpected TP tensor shape for " + name);
 }
 
+torch::Tensor all_reduce_sum_preserve_local_grad(const torch::Tensor& local,
+                                                 const distributed::ParallelGroup& tensor_group) {
+  if (tensor_group.world_size == 1) {
+    return local;
+  }
+  if (tensor_group.collectives == nullptr) {
+    throw std::invalid_argument("TP all-reduce requires collectives");
+  }
+  auto reduced = tensor_group.collectives->all_reduce(local.contiguous(), distributed::ReduceOp::Sum, tensor_group.ranks);
+  return local + (reduced - local).detach();
+}
+
 std::string layer_prefix(int64_t layer_idx) {
   return "model.language_model.layers." + std::to_string(layer_idx) + ".";
 }
@@ -272,7 +284,7 @@ torch::Tensor Qwen35TextModel::mlp_tensor_parallel(const torch::Tensor& x,
   if (tensor_group.collectives == nullptr) {
     throw std::invalid_argument("Qwen3.5 MLP TP requires collectives");
   }
-  return tensor_group.collectives->all_reduce(partial.contiguous(), distributed::ReduceOp::Sum, tensor_group.ranks);
+  return all_reduce_sum_preserve_local_grad(partial.contiguous(), tensor_group);
 }
 
 torch::Tensor Qwen35TextModel::full_attention(const torch::Tensor& x, int64_t layer_idx) {
@@ -373,7 +385,7 @@ torch::Tensor Qwen35TextModel::full_attention_tensor_parallel(const torch::Tenso
   if (tensor_group.collectives == nullptr) {
     throw std::invalid_argument("Qwen3.5 full attention TP requires collectives");
   }
-  return tensor_group.collectives->all_reduce(partial.contiguous(), distributed::ReduceOp::Sum, tensor_group.ranks);
+  return all_reduce_sum_preserve_local_grad(partial.contiguous(), tensor_group);
 }
 
 torch::Tensor Qwen35TextModel::linear_attention(const torch::Tensor& x, int64_t layer_idx) {
@@ -543,7 +555,7 @@ torch::Tensor Qwen35TextModel::linear_attention_tensor_parallel(const torch::Ten
   if (tensor_group.collectives == nullptr) {
     throw std::invalid_argument("Qwen3.5 linear attention TP requires collectives");
   }
-  return tensor_group.collectives->all_reduce(partial.contiguous(), distributed::ReduceOp::Sum, tensor_group.ranks);
+  return all_reduce_sum_preserve_local_grad(partial.contiguous(), tensor_group);
 }
 
 torch::Tensor Qwen35TextModel::forward_hidden(const torch::Tensor& input_ids, int64_t max_layers) {
@@ -570,14 +582,77 @@ torch::Tensor Qwen35TextModel::token_embeddings(const torch::Tensor& input_ids) 
   return embed(input_ids);
 }
 
+torch::Tensor Qwen35TextModel::token_embeddings_tensor_parallel(const torch::Tensor& input_ids,
+                                                                const distributed::ParallelGroup& tensor_group) {
+  auto emb = weight("model.language_model.embed_tokens.weight");
+  if (tensor_group.world_size == 1) {
+    return embed(input_ids);
+  }
+  if (tensor_group.collectives == nullptr) {
+    throw std::invalid_argument("Qwen3.5 vocab-parallel embedding requires collectives");
+  }
+  if (config_.vocab_size % tensor_group.world_size != 0) {
+    throw std::invalid_argument("Qwen3.5 vocab size must be divisible by TP size");
+  }
+  const int64_t vocab_local = config_.vocab_size / tensor_group.world_size;
+  if (emb.size(0) != vocab_local) {
+    emb = emb.narrow(0, tensor_group.rank * vocab_local, vocab_local).contiguous();
+  }
+  const int64_t start = tensor_group.rank * vocab_local;
+  const int64_t end = start + vocab_local;
+  auto ids = input_ids.to(torch::TensorOptions().dtype(torch::kLong).device(emb.device()));
+  auto mask = (ids >= start) * (ids < end);
+  auto local_ids = (ids - start).clamp(0, vocab_local - 1);
+  auto local = torch::nn::functional::embedding(local_ids, emb);
+  local = local * mask.unsqueeze(-1).to(local.scalar_type());
+  return all_reduce_sum_preserve_local_grad(local.contiguous(), tensor_group);
+}
+
 torch::Tensor Qwen35TextModel::lm_head_logits(const torch::Tensor& hidden) {
   return torch::matmul(hidden.to(torch::kFloat32), weight("model.language_model.embed_tokens.weight").to(torch::kFloat32).transpose(0, 1));
+}
+
+torch::Tensor Qwen35TextModel::response_log_probs_tensor_parallel(const torch::Tensor& hidden,
+                                                                  const torch::Tensor& response_ids,
+                                                                  const distributed::ParallelGroup& tensor_group) {
+  auto emb = weight("model.language_model.embed_tokens.weight");
+  if (tensor_group.world_size == 1) {
+    return torch::log_softmax(torch::matmul(hidden.to(torch::kFloat32), emb.to(torch::kFloat32).transpose(0, 1)), -1)
+        .gather(-1, response_ids.unsqueeze(-1))
+        .squeeze(-1);
+  }
+  if (tensor_group.collectives == nullptr) {
+    throw std::invalid_argument("Qwen3.5 vocab-parallel logprob requires collectives");
+  }
+  if (config_.vocab_size % tensor_group.world_size != 0) {
+    throw std::invalid_argument("Qwen3.5 vocab size must be divisible by TP size");
+  }
+  const int64_t vocab_local = config_.vocab_size / tensor_group.world_size;
+  if (emb.size(0) != vocab_local) {
+    emb = emb.narrow(0, tensor_group.rank * vocab_local, vocab_local).contiguous();
+  }
+  auto local_logits = torch::matmul(hidden.to(torch::kFloat32), emb.to(torch::kFloat32).transpose(0, 1));
+  auto local_max = std::get<0>(local_logits.max(-1, true)).contiguous();
+  auto global_max =
+      tensor_group.collectives->all_reduce(local_max, distributed::ReduceOp::Max, tensor_group.ranks);
+  auto local_exp_sum = torch::exp(local_logits - global_max).sum(-1, true).contiguous();
+  auto global_exp_sum = all_reduce_sum_preserve_local_grad(local_exp_sum, tensor_group);
+
+  const int64_t start = tensor_group.rank * vocab_local;
+  const int64_t end = start + vocab_local;
+  auto ids = response_ids.to(torch::TensorOptions().dtype(torch::kLong).device(hidden.device()));
+  auto mask = (ids >= start) * (ids < end);
+  auto local_ids = (ids - start).clamp(0, vocab_local - 1);
+  auto local_target = local_logits.gather(-1, local_ids.unsqueeze(-1)).squeeze(-1);
+  local_target = local_target * mask.to(local_target.scalar_type());
+  auto target = all_reduce_sum_preserve_local_grad(local_target.contiguous(), tensor_group);
+  return target - global_max.squeeze(-1) - torch::log(global_exp_sum.squeeze(-1));
 }
 
 torch::Tensor Qwen35TextModel::forward_hidden_tensor_parallel(const torch::Tensor& input_ids,
                                                               const distributed::ParallelGroup& tensor_group,
                                                               int64_t max_layers) {
-  auto hidden = embed(input_ids);
+  auto hidden = token_embeddings_tensor_parallel(input_ids, tensor_group);
   int64_t layers = max_layers < 0 ? config_.num_hidden_layers : std::min(max_layers, config_.num_hidden_layers);
   return forward_hidden_range_tensor_parallel(hidden, 0, layers, tensor_group, true);
 }
