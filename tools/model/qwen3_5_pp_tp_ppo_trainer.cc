@@ -94,6 +94,137 @@ std::vector<torch::Tensor> clone_params(const std::vector<torch::Tensor>& params
   return out;
 }
 
+bool layer_index_from_weight_name(const std::string& name, int64_t* layer_index) {
+  const std::string marker = "model.language_model.layers.";
+  const size_t pos = name.find(marker);
+  if (pos == std::string::npos) {
+    return false;
+  }
+  const size_t begin = pos + marker.size();
+  size_t end = begin;
+  while (end < name.size() && name[end] >= '0' && name[end] <= '9') {
+    ++end;
+  }
+  if (end == begin || end >= name.size() || name[end] != '.') {
+    throw std::runtime_error("invalid Qwen layer weight name: " + name);
+  }
+  *layer_index = std::stoll(name.substr(begin, end - begin));
+  return true;
+}
+
+std::vector<std::string> stage_required_weight_names(const cverl::Qwen35TextModel& model,
+                                                     int64_t max_layers,
+                                                     int64_t layer_begin,
+                                                     int64_t layer_end,
+                                                     bool is_first_stage,
+                                                     bool is_last_stage) {
+  std::vector<std::string> out;
+  for (const auto& name : model.required_weight_names(max_layers)) {
+    int64_t layer_index = -1;
+    if (layer_index_from_weight_name(name, &layer_index)) {
+      if (layer_index >= layer_begin && layer_index < layer_end) {
+        out.push_back(name);
+      }
+      continue;
+    }
+    if (name == "model.language_model.embed_tokens.weight") {
+      if (is_first_stage) {
+        out.push_back(name);
+      }
+      continue;
+    }
+    if (name == "model.language_model.norm.weight") {
+      if (is_last_stage) {
+        out.push_back(name);
+      }
+      continue;
+    }
+    out.push_back(name);
+  }
+  return out;
+}
+
+torch::Tensor shard_dim_if_needed(const torch::Tensor& tensor,
+                                  int64_t dim,
+                                  int64_t rank,
+                                  int64_t world_size) {
+  if (world_size == 1) {
+    return tensor.contiguous();
+  }
+  if (dim < 0) {
+    dim += tensor.dim();
+  }
+  if (dim < 0 || dim >= tensor.dim() || tensor.size(dim) % world_size != 0) {
+    throw std::runtime_error("cannot shard tensor for TP");
+  }
+  const int64_t shard = tensor.size(dim) / world_size;
+  return tensor.narrow(dim, rank * shard, shard).contiguous();
+}
+
+torch::Tensor qwen_megatron_tp_shard(const std::string& name,
+                                     const torch::Tensor& full,
+                                     const cverl::Qwen35TextConfig& cfg,
+                                     int64_t tp_rank,
+                                     int64_t tp_size) {
+  if (tp_size == 1) {
+    return full.contiguous();
+  }
+  int64_t layer = -1;
+  if (!layer_index_from_weight_name(name, &layer)) {
+    return full.contiguous();
+  }
+  if (name.find(".mlp.gate_proj.weight") != std::string::npos ||
+      name.find(".mlp.up_proj.weight") != std::string::npos) {
+    return shard_dim_if_needed(full, 0, tp_rank, tp_size);
+  }
+  if (name.find(".mlp.down_proj.weight") != std::string::npos) {
+    return shard_dim_if_needed(full, 1, tp_rank, tp_size);
+  }
+
+  const std::string layer_type = cfg.layer_types.at(static_cast<size_t>(layer));
+  if (layer_type == "full_attention") {
+    if (name.find(".self_attn.q_proj.weight") != std::string::npos ||
+        name.find(".self_attn.k_proj.weight") != std::string::npos ||
+        name.find(".self_attn.v_proj.weight") != std::string::npos) {
+      return shard_dim_if_needed(full, 0, tp_rank, tp_size);
+    }
+    if (name.find(".self_attn.o_proj.weight") != std::string::npos) {
+      return shard_dim_if_needed(full, 1, tp_rank, tp_size);
+    }
+    return full.contiguous();
+  }
+
+  if (name.find(".linear_attn.in_proj_qkv.weight") != std::string::npos ||
+      name.find(".linear_attn.conv1d.weight") != std::string::npos) {
+    const int64_t key_dim = cfg.linear_num_key_heads * cfg.linear_key_head_dim;
+    const int64_t value_dim = cfg.linear_num_value_heads * cfg.linear_value_head_dim;
+    if (key_dim % tp_size != 0 || value_dim % tp_size != 0) {
+      throw std::runtime_error("linear attention dimensions are not divisible by TP size");
+    }
+    const int64_t key_local = key_dim / tp_size;
+    const int64_t value_local = value_dim / tp_size;
+    const int64_t key_begin = tp_rank * key_local;
+    const int64_t value_begin = tp_rank * value_local;
+    auto q = full.narrow(0, key_begin, key_local);
+    auto k = full.narrow(0, key_dim + key_begin, key_local);
+    auto v = full.narrow(0, key_dim * 2 + value_begin, value_local);
+    return torch::cat(std::vector<torch::Tensor>{q, k, v}, 0).contiguous();
+  }
+  if (name.find(".linear_attn.in_proj_z.weight") != std::string::npos) {
+    return shard_dim_if_needed(full, 0, tp_rank, tp_size);
+  }
+  if (name.find(".linear_attn.in_proj_b.weight") != std::string::npos ||
+      name.find(".linear_attn.in_proj_a.weight") != std::string::npos ||
+      name.find(".linear_attn.A_log") != std::string::npos ||
+      name.find(".linear_attn.dt_bias") != std::string::npos) {
+    return shard_dim_if_needed(full, 0, tp_rank, tp_size);
+  }
+  if (name.find(".linear_attn.out_proj.weight") != std::string::npos) {
+    return shard_dim_if_needed(full, 1, tp_rank, tp_size);
+  }
+  return full.contiguous();
+}
+
 struct PpPpoBatch {
   std::vector<torch::Tensor> token_ids;
   std::vector<torch::Tensor> advantages;
@@ -584,7 +715,7 @@ int main(int argc, char** argv) {
     const double lr = arg_f64(argc, argv, "--lr", 1.0e-8);
     const double clip_ratio = arg_f64(argc, argv, "--clip-ratio", 0.2);
     const double advantage_scale = arg_f64(argc, argv, "--advantage-scale", 1.0);
-    const bool use_master_weights = arg_bool(argc, argv, "--master-weights", true);
+    const bool use_master_weights = arg_bool(argc, argv, "--master-weights", false);
     const bool skip_optimizer_step = arg_bool(argc, argv, "--skip-optimizer-step", false);
     const bool vary_tokens_by_step = arg_bool(argc, argv, "--vary-tokens-by-step", false);
     const std::string jsonl_input = arg_str(argc, argv, "--jsonl-input", "");
@@ -668,9 +799,11 @@ int main(int argc, char** argv) {
     const auto jsonl_batches =
         load_jsonl_token_batches(jsonl_input, tokenizer_json, seq_len, jsonl_max_examples, device);
     std::vector<torch::Tensor> params;
-    for (const auto& name : model.required_weight_names(layers)) {
-      auto tensor = model.loader()
-                        .load_tensor(name)
+    const auto rank_weight_names = stage_required_weight_names(
+        model, layers, range.begin, range.end, peers.is_first_stage, peers.is_last_stage);
+    for (const auto& name : rank_weight_names) {
+      auto full_tensor = model.loader().load_tensor(name).to(dtype);
+      auto tensor = qwen_megatron_tp_shard(name, full_tensor, model.config(), info.tensor_rank, tp_size)
                         .to(torch::TensorOptions().device(device).dtype(dtype))
                         .contiguous();
       tensor.set_requires_grad(true);

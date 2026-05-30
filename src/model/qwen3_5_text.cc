@@ -82,6 +82,34 @@ torch::Tensor repeat_kv(const torch::Tensor& x, int64_t n_rep) {
   return x.index({Slice(), Slice(), None, Slice(), Slice()}).expand({b, h, n_rep, s, d}).reshape({b, h * n_rep, s, d});
 }
 
+torch::Tensor local_or_shard_dim(const torch::Tensor& tensor,
+                                 int64_t dim,
+                                 int64_t full_size,
+                                 int64_t rank,
+                                 int64_t world_size,
+                                 const std::string& name) {
+  if (world_size == 1) {
+    return tensor;
+  }
+  if (dim < 0) {
+    dim += tensor.dim();
+  }
+  if (dim < 0 || dim >= tensor.dim()) {
+    throw std::invalid_argument("invalid TP shard dim for " + name);
+  }
+  if (full_size % world_size != 0) {
+    throw std::invalid_argument("full tensor dimension is not divisible by TP size for " + name);
+  }
+  const int64_t local_size = full_size / world_size;
+  if (tensor.size(dim) == local_size) {
+    return tensor;
+  }
+  if (tensor.size(dim) == full_size) {
+    return tensor.narrow(dim, rank * local_size, local_size).contiguous();
+  }
+  throw std::invalid_argument("unexpected TP tensor shape for " + name);
+}
+
 std::string layer_prefix(int64_t layer_idx) {
   return "model.language_model.layers." + std::to_string(layer_idx) + ".";
 }
@@ -226,12 +254,25 @@ torch::Tensor Qwen35TextModel::mlp_tensor_parallel(const torch::Tensor& x,
                                                    int64_t layer_idx,
                                                    const distributed::ParallelGroup& tensor_group) {
   std::string p = layer_prefix(layer_idx) + "mlp.";
-  return distributed::tensor_parallel_mlp_swiglu(
-      x,
-      weight(p + "gate_proj.weight"),
-      weight(p + "up_proj.weight"),
-      weight(p + "down_proj.weight"),
-      tensor_group);
+  auto gate_weight = local_or_shard_dim(
+      weight(p + "gate_proj.weight"), 0, config_.intermediate_size, tensor_group.rank, tensor_group.world_size,
+      p + "gate_proj.weight");
+  auto up_weight = local_or_shard_dim(
+      weight(p + "up_proj.weight"), 0, config_.intermediate_size, tensor_group.rank, tensor_group.world_size,
+      p + "up_proj.weight");
+  auto down_weight = local_or_shard_dim(
+      weight(p + "down_proj.weight"), 1, config_.intermediate_size, tensor_group.rank, tensor_group.world_size,
+      p + "down_proj.weight");
+  auto gate = dense(x, gate_weight);
+  auto up = dense(x, up_weight);
+  auto partial = dense(torch::silu(gate) * up, down_weight);
+  if (tensor_group.world_size == 1) {
+    return partial;
+  }
+  if (tensor_group.collectives == nullptr) {
+    throw std::invalid_argument("Qwen3.5 MLP TP requires collectives");
+  }
+  return tensor_group.collectives->all_reduce(partial.contiguous(), distributed::ReduceOp::Sum, tensor_group.ranks);
 }
 
 torch::Tensor Qwen35TextModel::full_attention(const torch::Tensor& x, int64_t layer_idx) {
@@ -287,16 +328,22 @@ torch::Tensor Qwen35TextModel::full_attention_tensor_parallel(const torch::Tenso
   int64_t h = config_.num_attention_heads;
   int64_t h_local = h / tensor_group.world_size;
   int64_t kvh = config_.num_key_value_heads;
+  int64_t kvh_local = kvh / tensor_group.world_size;
   int64_t d = config_.head_dim;
 
-  auto q_weight = distributed::shard_dim(weight(p + "q_proj.weight"), 0, tensor_group.rank, tensor_group.world_size);
+  auto q_weight = local_or_shard_dim(
+      weight(p + "q_proj.weight"), 0, h * d * 2, tensor_group.rank, tensor_group.world_size, p + "q_proj.weight");
   auto qg = dense(x, q_weight).view({b, s, h_local, d * 2});
   auto chunks = qg.chunk(2, -1);
   auto q = rms_norm(chunks[0], weight(p + "q_norm.weight")).transpose(1, 2);
   auto gate = chunks[1].reshape({b, s, h_local * d});
 
-  auto k = rms_norm(dense(x, weight(p + "k_proj.weight")).view({b, s, kvh, d}), weight(p + "k_norm.weight")).transpose(1, 2);
-  auto v = dense(x, weight(p + "v_proj.weight")).view({b, s, kvh, d}).transpose(1, 2);
+  auto k_weight = local_or_shard_dim(
+      weight(p + "k_proj.weight"), 0, kvh * d, tensor_group.rank, tensor_group.world_size, p + "k_proj.weight");
+  auto v_weight = local_or_shard_dim(
+      weight(p + "v_proj.weight"), 0, kvh * d, tensor_group.rank, tensor_group.world_size, p + "v_proj.weight");
+  auto k = rms_norm(dense(x, k_weight).view({b, s, kvh_local, d}), weight(p + "k_norm.weight")).transpose(1, 2);
+  auto v = dense(x, v_weight).view({b, s, kvh_local, d}).transpose(1, 2);
 
   auto rope = rotary_embeddings(b, s, x.device(), x.scalar_type());
   auto cos = rope.first.unsqueeze(1);
@@ -309,15 +356,16 @@ torch::Tensor Qwen35TextModel::full_attention_tensor_parallel(const torch::Tenso
   q = torch::cat(std::vector<torch::Tensor>{q_rot * cos + rotate_half(q_rot) * sin, q_pass}, -1);
   k = torch::cat(std::vector<torch::Tensor>{k_rot * cos + rotate_half(k_rot) * sin, k_pass}, -1);
 
-  k = repeat_kv(k, h / kvh).narrow(1, tensor_group.rank * h_local, h_local).contiguous();
-  v = repeat_kv(v, h / kvh).narrow(1, tensor_group.rank * h_local, h_local).contiguous();
+  k = repeat_kv(k, h / kvh).contiguous();
+  v = repeat_kv(v, h / kvh).contiguous();
   auto attn = torch::matmul(q, k.transpose(2, 3)) * (1.0 / std::sqrt(static_cast<double>(d)));
   auto mask = torch::ones({s, s}, torch::TensorOptions().dtype(torch::kBool).device(x.device())).triu(1);
   attn = attn.masked_fill(mask.unsqueeze(0).unsqueeze(0), -1.0e9);
   attn = torch::softmax(attn.to(torch::kFloat32), -1);
   auto local = torch::matmul(attn, v.to(torch::kFloat32)).transpose(1, 2).contiguous().reshape({b, s, h_local * d});
   local = (local * torch::sigmoid(gate.to(torch::kFloat32))).to(x.scalar_type());
-  auto o_weight_shard = distributed::shard_dim(weight(p + "o_proj.weight"), 1, tensor_group.rank, tensor_group.world_size);
+  auto o_weight_shard = local_or_shard_dim(
+      weight(p + "o_proj.weight"), 1, h * d, tensor_group.rank, tensor_group.world_size, p + "o_proj.weight");
   auto partial = dense(local, o_weight_shard);
   if (tensor_group.world_size == 1) {
     return partial;
@@ -411,16 +459,28 @@ torch::Tensor Qwen35TextModel::linear_attention_tensor_parallel(const torch::Ten
   int64_t key_begin = tensor_group.rank * key_local_dim;
   int64_t value_begin = tensor_group.rank * value_local_dim;
 
-  auto q_weight = weight(p + "in_proj_qkv.weight").narrow(0, key_begin, key_local_dim);
-  auto k_weight = weight(p + "in_proj_qkv.weight").narrow(0, key_dim + key_begin, key_local_dim);
-  auto v_weight = weight(p + "in_proj_qkv.weight").narrow(0, key_dim * 2 + value_begin, value_local_dim);
-  auto qkv_weight = torch::cat(std::vector<torch::Tensor>{q_weight, k_weight, v_weight}, 0).contiguous();
+  auto qkv_full_or_local = weight(p + "in_proj_qkv.weight");
+  torch::Tensor qkv_weight;
+  if (qkv_full_or_local.size(0) == conv_local_dim) {
+    qkv_weight = qkv_full_or_local;
+  } else {
+    auto q_weight = qkv_full_or_local.narrow(0, key_begin, key_local_dim);
+    auto k_weight = qkv_full_or_local.narrow(0, key_dim + key_begin, key_local_dim);
+    auto v_weight = qkv_full_or_local.narrow(0, key_dim * 2 + value_begin, value_local_dim);
+    qkv_weight = torch::cat(std::vector<torch::Tensor>{q_weight, k_weight, v_weight}, 0).contiguous();
+  }
   auto mixed = dense(x, qkv_weight).transpose(1, 2);
 
-  auto conv_q = weight(p + "conv1d.weight").narrow(0, key_begin, key_local_dim);
-  auto conv_k = weight(p + "conv1d.weight").narrow(0, key_dim + key_begin, key_local_dim);
-  auto conv_v = weight(p + "conv1d.weight").narrow(0, key_dim * 2 + value_begin, value_local_dim);
-  auto conv_weight = torch::cat(std::vector<torch::Tensor>{conv_q, conv_k, conv_v}, 0).contiguous();
+  auto conv_full_or_local = weight(p + "conv1d.weight");
+  torch::Tensor conv_weight;
+  if (conv_full_or_local.size(0) == conv_local_dim) {
+    conv_weight = conv_full_or_local;
+  } else {
+    auto conv_q = conv_full_or_local.narrow(0, key_begin, key_local_dim);
+    auto conv_k = conv_full_or_local.narrow(0, key_dim + key_begin, key_local_dim);
+    auto conv_v = conv_full_or_local.narrow(0, key_dim * 2 + value_begin, value_local_dim);
+    conv_weight = torch::cat(std::vector<torch::Tensor>{conv_q, conv_k, conv_v}, 0).contiguous();
+  }
   auto conv_opts = torch::nn::functional::Conv1dFuncOptions().padding(config_.linear_conv_kernel_dim - 1).groups(conv_local_dim);
   mixed = torch::nn::functional::conv1d(mixed, conv_weight, conv_opts);
   mixed = torch::silu(mixed.index({Slice(), Slice(), Slice(0, seq)})).transpose(1, 2);
@@ -429,11 +489,19 @@ torch::Tensor Qwen35TextModel::linear_attention_tensor_parallel(const torch::Ten
   auto query = qkv[0].reshape({bsz, seq, kh_local, kd});
   auto key = qkv[1].reshape({bsz, seq, kh_local, kd});
   auto value = qkv[2].reshape({bsz, seq, vh_local, vd});
-  auto z = dense(x, weight(p + "in_proj_z.weight").narrow(0, value_begin, value_local_dim)).reshape({bsz, seq, vh_local, vd});
-  auto beta = torch::sigmoid(dense(x, weight(p + "in_proj_b.weight").narrow(0, tensor_group.rank * vh_local, vh_local)));
-  auto a = dense(x, weight(p + "in_proj_a.weight").narrow(0, tensor_group.rank * vh_local, vh_local));
-  auto a_log = weight(p + "A_log").narrow(0, tensor_group.rank * vh_local, vh_local);
-  auto dt_bias = weight(p + "dt_bias").narrow(0, tensor_group.rank * vh_local, vh_local);
+  auto z_weight = local_or_shard_dim(
+      weight(p + "in_proj_z.weight"), 0, value_dim, tensor_group.rank, tensor_group.world_size, p + "in_proj_z.weight");
+  auto b_weight = local_or_shard_dim(
+      weight(p + "in_proj_b.weight"), 0, vh, tensor_group.rank, tensor_group.world_size, p + "in_proj_b.weight");
+  auto a_weight = local_or_shard_dim(
+      weight(p + "in_proj_a.weight"), 0, vh, tensor_group.rank, tensor_group.world_size, p + "in_proj_a.weight");
+  auto a_log = local_or_shard_dim(
+      weight(p + "A_log"), 0, vh, tensor_group.rank, tensor_group.world_size, p + "A_log");
+  auto dt_bias = local_or_shard_dim(
+      weight(p + "dt_bias"), 0, vh, tensor_group.rank, tensor_group.world_size, p + "dt_bias");
+  auto z = dense(x, z_weight).reshape({bsz, seq, vh_local, vd});
+  auto beta = torch::sigmoid(dense(x, b_weight));
+  auto a = dense(x, a_weight);
   auto g = -torch::exp(a_log) * torch::softplus(a + dt_bias);
 
   if (vh_local / kh_local > 1) {
@@ -466,7 +534,8 @@ torch::Tensor Qwen35TextModel::linear_attention_tensor_parallel(const torch::Ten
   auto core = torch::stack(outs, 2).transpose(1, 2).contiguous().reshape({bsz * seq * vh_local, vd});
   auto zg = z.reshape({bsz * seq * vh_local, vd});
   core = rms_norm_gated(core, zg, weight(p + "norm.weight")).reshape({bsz, seq, value_local_dim});
-  auto out_weight_shard = distributed::shard_dim(weight(p + "out_proj.weight"), 1, tensor_group.rank, tensor_group.world_size);
+  auto out_weight_shard = local_or_shard_dim(
+      weight(p + "out_proj.weight"), 1, value_dim, tensor_group.rank, tensor_group.world_size, p + "out_proj.weight");
   auto partial = dense(core, out_weight_shard);
   if (tensor_group.world_size == 1) {
     return partial;
