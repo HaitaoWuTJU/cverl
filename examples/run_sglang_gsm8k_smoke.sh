@@ -1,4 +1,29 @@
 #!/usr/bin/env bash
+# End-to-end SGLang + cverl GRPO smoke on the H20 box.
+#
+# Pipeline:
+#   GSM8K JSONL -> SGLang HTTP rollout -> cverl C++ rule reward
+#                                       -> GRPO advantage
+#                                       -> Qwen3_5CausalLmPolicy fp32 PPO step
+#
+# The trainer side ("cverl gsm8k_grpo_smoke") talks to a stock SGLang server
+# over /v1/chat/completions; both ends share the same Qwen3.5 weights so the
+# PPO update is meaningful. SGLang lives on GPU 0 by default, the trainer on
+# GPU 1, so they don't fight for memory.
+#
+# Quick run with the H20 defaults (sglang lives in /home/marvinhtwu/sglang-env
+# in our setup):
+#
+#   SGLANG_PYTHON=/home/marvinhtwu/sglang-env/bin/python \
+#   BUILD_DIR=/home/marvinhtwu/cverl-build/gpu-nccl \
+#   MODEL_PATH=/path/to/Qwen3.5-0.8B \
+#   examples/run_sglang_gsm8k_smoke.sh
+#
+# Required runtime extras for SGLang 0.5.9 on this node:
+#   pip install --no-cache-dir IPython decord2 nvidia-cudnn-cu12==9.16.0.29 \
+#                              flashinfer_python==0.6.3 flashinfer_cubin==0.6.3
+# (the cuDNN upgrade silences the 9.10 vs Conv3D-bug check; we set
+# SGLANG_DISABLE_CUDNN_CHECK=1 below regardless.)
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -6,16 +31,44 @@ BUILD_DIR="${BUILD_DIR:-${ROOT_DIR}/build-h20-nccl}"
 DATASET="${DATASET:-${ROOT_DIR}/data/gsm8k-train-smoke.jsonl}"
 MODEL_PATH="${MODEL_PATH:-${ROOT_DIR}/../models/Qwen3.5-0.8B}"
 HOST="${HOST:-127.0.0.1}"
-PORT="${PORT:-8001}"
+PORT="${PORT:-8011}"
 DTYPE="${DTYPE:-bfloat16}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.45}"
+CONTEXT_LENGTH="${CONTEXT_LENGTH:-1024}"
 PROMPTS="${PROMPTS:-4}"
 N="${N:-4}"
+STEPS="${STEPS:-1}"
+PPO_EPOCHS="${PPO_EPOCHS:-1}"
 MAX_TOKENS="${MAX_TOKENS:-256}"
-PATCH_SGLANG_ACTIVATION_JIT="${PATCH_SGLANG_ACTIVATION_JIT:-0}"
+MAX_PROMPT_TOKENS="${MAX_PROMPT_TOKENS:-256}"
+MAX_RESPONSE_TOKENS="${MAX_RESPONSE_TOKENS:-256}"
+LR="${LR:-3e-5}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-0.0}"
+KL_COEF="${KL_COEF:-0.0}"
+KL_PENALTY="${KL_PENALTY:-k2}"
+TEMPERATURE="${TEMPERATURE:-1.1}"
+TOP_P="${TOP_P:-0.95}"
+REWARD_METHOD="${REWARD_METHOD:-flexible}"
+ENDPOINT="${ENDPOINT:-chat}"
+SYSTEM_PROMPT="${SYSTEM_PROMPT:-You are a math tutor. Solve the problem step by step, then on the very last line write '#### N' where N is the final numeric answer with no units.}"
+POLICY="${POLICY:-qwen}"
+QWEN_MAX_LAYERS="${QWEN_MAX_LAYERS:-2}"
+TRAINER_DEVICE="${TRAINER_DEVICE:-cuda}"
 
-if ! python -c "import sglang" >/dev/null 2>&1; then
-  echo "sglang is not importable in the active Python environment" >&2
+# SGLang server runs in its own Python (torch 2.9.1 + sgl_kernel 0.3.21).
+# Default to the env we built under /home/marvinhtwu; override SGLANG_PYTHON.
+SGLANG_PYTHON="${SGLANG_PYTHON:-/home/marvinhtwu/sglang-env/bin/python}"
+
+# Trainer-side LD_LIBRARY_PATH: point at the conda env that built libcverl.a
+# so the right libtorch/cuda runtime gets loaded next to gsm8k_grpo_smoke.
+TRAINER_LIBS="${TRAINER_LIBS:-/apdcephfs_fsgm3/share_305110755/hunyuan/marvinhtwu/miniconda3/lib:/usr/local/cuda/lib64}"
+
+# GPU split: SGLang on GPU 0, trainer on GPU 1 by default.
+SGLANG_DEVICES="${SGLANG_DEVICES:-${CUDA_VISIBLE_DEVICES:-0}}"
+TRAINER_DEVICES="${TRAINER_DEVICES:-1}"
+
+if ! "${SGLANG_PYTHON}" -c "import sglang" >/dev/null 2>&1; then
+  echo "sglang not importable in ${SGLANG_PYTHON}" >&2
   exit 1
 fi
 
@@ -24,67 +77,11 @@ if [[ ! -x "${BUILD_DIR}/gsm8k_grpo_smoke" ]]; then
   exit 1
 fi
 
-if [[ "${PATCH_SGLANG_ACTIVATION_JIT}" == "1" ]]; then
-  python - <<'PY'
-from pathlib import Path
-import sglang
-
-root = Path(sglang.__file__).resolve().parent
-path = root / "jit_kernel/csrc/elementwise/activation.cuh"
-text = path.read_text()
-old = '''  template <ActivationKind kAct, bool kFilterExpert>
-  static constexpr auto activation_kernel = act_and_mul_kernel<T, kAct, kUsePDL, kFilterExpert>;
-
-  static_assert(device::kMaxVecBytes % sizeof(T) == 0, "unsupported data type");
-
-  template <bool kFilterExpert>
-  static auto select_kernel(const std::string& type)
-      -> decltype(activation_kernel<ActivationKind::kSiLU, kFilterExpert>) {
-    using namespace host;
-    if (type == "silu") {
-      return activation_kernel<ActivationKind::kSiLU, kFilterExpert>;
-    } else if (type == "gelu") {
-      return activation_kernel<ActivationKind::kGELU, kFilterExpert>;
-    } else if (type == "gelu_tanh") {
-      return activation_kernel<ActivationKind::kGELUTanh, kFilterExpert>;
-    } else {
-      Panic("unsupported activation type: ", type);
-    }
-    return nullptr;
-  }
-'''
-new = '''  static_assert(device::kMaxVecBytes % sizeof(T) == 0, "unsupported data type");
-
-  template <ActivationKind kAct, bool kFilterExpert>
-  using KernelFn = decltype(&act_and_mul_kernel<T, kAct, kUsePDL, kFilterExpert>);
-
-  template <bool kFilterExpert>
-  static auto select_kernel(const std::string& type) -> KernelFn<ActivationKind::kSiLU, kFilterExpert> {
-    using namespace host;
-    if (type == "silu") {
-      return &act_and_mul_kernel<T, ActivationKind::kSiLU, kUsePDL, kFilterExpert>;
-    } else if (type == "gelu") {
-      return &act_and_mul_kernel<T, ActivationKind::kGELU, kUsePDL, kFilterExpert>;
-    } else if (type == "gelu_tanh") {
-      return &act_and_mul_kernel<T, ActivationKind::kGELUTanh, kUsePDL, kFilterExpert>;
-    } else {
-      Panic("unsupported activation type: ", type);
-    }
-    return nullptr;
-  }
-'''
-if old in text:
-    path.write_text(text.replace(old, new))
-    print(f"patched {path}")
-else:
-    print(f"activation JIT patch already applied or source changed: {path}")
-PY
-  rm -rf /root/.cache/tvm-ffi/sgl_kernel_jit_activation_* 2>/dev/null || true
-fi
-
-LOG_FILE="${LOG_FILE:-/tmp/cverl_sglang.log}"
-PID_FILE="${PID_FILE:-/tmp/cverl_sglang.pid}"
-rm -f "${LOG_FILE}" "${PID_FILE}"
+LOG_FILE="${LOG_FILE:-/tmp/cverl_sglang_${UID}.log}"
+PID_FILE="${PID_FILE:-/tmp/cverl_sglang_${UID}.pid}"
+MODELS_FILE="${MODELS_FILE:-/tmp/cverl_sglang_models_${UID}.json}"
+PROBE_FILE="${PROBE_FILE:-/tmp/cverl_sglang_completion_${UID}.json}"
+rm -f "${LOG_FILE}" "${PID_FILE}" "${MODELS_FILE}" "${PROBE_FILE}" 2>/dev/null || true
 
 cleanup() {
   if [[ -f "${PID_FILE}" ]] && kill -0 "$(cat "${PID_FILE}")" 2>/dev/null; then
@@ -93,26 +90,24 @@ cleanup() {
 }
 trap cleanup EXIT
 
-SGLANG_DEVICES="${SGLANG_DEVICES:-${CUDA_VISIBLE_DEVICES:-0}}"
-TRAINER_DEVICES="${TRAINER_DEVICES:-1}"
-
-CUDA_VISIBLE_DEVICES="${SGLANG_DEVICES}" python -m sglang.launch_server \
+CUDA_VISIBLE_DEVICES="${SGLANG_DEVICES}" \
+SGLANG_DISABLE_CUDNN_CHECK=1 \
+"${SGLANG_PYTHON}" -m sglang.launch_server \
   --model-path "${MODEL_PATH}" \
   --host "${HOST}" \
   --port "${PORT}" \
   --trust-remote-code \
-  --context-length 2048 \
+  --context-length "${CONTEXT_LENGTH}" \
   --dtype "${DTYPE}" \
   --mem-fraction-static "${MEM_FRACTION_STATIC}" \
   --disable-cuda-graph \
   --sampling-backend pytorch \
-  --linear-attn-backend flashinfer \
   --mamba-backend flashinfer \
   >"${LOG_FILE}" 2>&1 &
 echo $! > "${PID_FILE}"
 
 for _ in $(seq 1 120); do
-  if curl -sf "http://${HOST}:${PORT}/v1/models" >/tmp/cverl_sglang_models.json; then
+  if curl -sf "http://${HOST}:${PORT}/v1/models" -o "${MODELS_FILE}"; then
     break
   fi
   if ! kill -0 "$(cat "${PID_FILE}")" 2>/dev/null; then
@@ -122,33 +117,38 @@ for _ in $(seq 1 120); do
   sleep 5
 done
 
+# Sanity probe.
 curl -sf "http://${HOST}:${PORT}/v1/completions" \
   -H "Content-Type: application/json" \
   -d "{\"model\":\"${MODEL_PATH}\",\"prompt\":\"Question: What is 1+1? Answer with #### final number.\\n\",\"max_tokens\":32,\"temperature\":0,\"n\":1}" \
-  >/tmp/cverl_sglang_completion.json
+  >"${PROBE_FILE}"
 
-CUDA_VISIBLE_DEVICES="${TRAINER_DEVICES}" "${BUILD_DIR}/gsm8k_grpo_smoke" \
+LD_LIBRARY_PATH="${TRAINER_LIBS}:${LD_LIBRARY_PATH:-}" \
+CUDA_VISIBLE_DEVICES="${TRAINER_DEVICES}" \
+"${BUILD_DIR}/gsm8k_grpo_smoke" \
   --dataset "${DATASET}" \
   --transport http \
   --base-url "http://${HOST}:${PORT}" \
-  --endpoint completions \
+  --endpoint "${ENDPOINT}" \
   --model "${MODEL_PATH}" \
+  --system-prompt "${SYSTEM_PROMPT}" \
   --prompts "${PROMPTS}" \
   --n "${N}" \
-  --steps "${STEPS:-1}" \
-  --ppo-epochs "${PPO_EPOCHS:-1}" \
+  --steps "${STEPS}" \
+  --ppo-epochs "${PPO_EPOCHS}" \
   --max-tokens "${MAX_TOKENS}" \
-  --max-prompt-tokens "${MAX_PROMPT_TOKENS:-256}" \
-  --max-response-tokens "${MAX_RESPONSE_TOKENS:-256}" \
+  --max-prompt-tokens "${MAX_PROMPT_TOKENS}" \
+  --max-response-tokens "${MAX_RESPONSE_TOKENS}" \
   --tokenizer hf \
   --tokenizer-path "${MODEL_PATH}/tokenizer.json" \
-  --policy "${POLICY:-qwen}" \
+  --policy "${POLICY}" \
   --model-dir "${MODEL_PATH}" \
-  --qwen-max-layers "${QWEN_MAX_LAYERS:-2}" \
-  --device "${TRAINER_DEVICE:-cuda}" \
-  --weight-decay "${WEIGHT_DECAY:-0.0}" \
-  --lr "${LR:-3e-5}" \
-  --reward-method "${REWARD_METHOD:-flexible}" \
-  --temperature "${TEMPERATURE:-0.9}" \
-  --top-p "${TOP_P:-0.95}" \
-  --kl-coef "${KL_COEF:-0.0}"
+  --qwen-max-layers "${QWEN_MAX_LAYERS}" \
+  --device "${TRAINER_DEVICE}" \
+  --weight-decay "${WEIGHT_DECAY}" \
+  --lr "${LR}" \
+  --reward-method "${REWARD_METHOD}" \
+  --temperature "${TEMPERATURE}" \
+  --top-p "${TOP_P}" \
+  --kl-coef "${KL_COEF}" \
+  --kl-penalty "${KL_PENALTY}"
