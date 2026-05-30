@@ -20,6 +20,7 @@
 #include "cverl/model/hf_model_loader.h"
 #include "cverl/model/qwen3_5_text.h"
 #include "cverl/reward/gsm8k.h"
+#include "cverl/rollout/gpu_ipc_rollout_batch.h"
 #include "cverl/rollout/rollout_batch.h"
 #include "cverl/rollout/transport.h"
 #include "cverl/text/hf_bpe_tokenizer.h"
@@ -95,6 +96,7 @@ struct PpPpoBatch {
   std::vector<torch::Tensor> token_ids;
   std::vector<torch::Tensor> advantages;
   std::vector<torch::Tensor> response_masks;
+  std::vector<torch::Tensor> old_log_probs;
   int64_t rows = 0;
   double mean_reward = 0.0;
   double success_rate = 0.0;
@@ -150,6 +152,20 @@ std::string rollout_json_path_for_step(const std::string& rollout_json,
   char name[64];
   std::snprintf(name, sizeof(name), "rollout_step_%06lld.json", static_cast<long long>(step + 1));
   return (std::filesystem::path(rollout_dir) / name).string();
+}
+
+std::string rollout_ipc_path_for_step(const std::string& rollout_ipc_json,
+                                      const std::string& rollout_ipc_dir,
+                                      int64_t step) {
+  if (!rollout_ipc_json.empty()) {
+    return rollout_ipc_json;
+  }
+  if (rollout_ipc_dir.empty()) {
+    return "";
+  }
+  char name[64];
+  std::snprintf(name, sizeof(name), "rollout_ipc_step_%06lld.json", static_cast<long long>(step + 1));
+  return (std::filesystem::path(rollout_ipc_dir) / name).string();
 }
 
 void save_rank_checkpoint(const std::string& checkpoint_dir,
@@ -237,12 +253,21 @@ PpPpoBatch load_rollout_ppo_batch(const std::string& path,
                                   const std::string& tokenizer_json,
                                   int64_t prompt_len,
                                   int64_t response_len,
+                                  int64_t expected_step,
                                   torch::Device device) {
   std::ifstream in(path);
   if (!in) {
     throw std::runtime_error("failed to open rollout JSON: " + path);
   }
   nlohmann::json doc = nlohmann::json::parse(in);
+  if (doc.contains("step")) {
+    const int64_t actual_step = doc.at("step").get<int64_t>();
+    if (actual_step != expected_step) {
+      throw std::runtime_error(
+          "rollout batch step mismatch for " + path + ": expected " +
+          std::to_string(expected_step) + ", got " + std::to_string(actual_step));
+    }
+  }
   auto prompts = json_string_vector(doc, "prompts");
   auto answers = json_string_vector(doc, "answers");
   auto responses = json_string_vector(doc, "responses");
@@ -298,6 +323,126 @@ PpPpoBatch load_rollout_ppo_batch(const std::string& path,
     out.response_masks.push_back(response_mask.index({i}).view({1, response_len}));
   }
   return out;
+}
+
+cverl::rollout::GpuRolloutTensorKind parse_ipc_kind(const std::string& kind) {
+  if (kind == "prompt_ids") return cverl::rollout::GpuRolloutTensorKind::PromptIds;
+  if (kind == "response_ids") return cverl::rollout::GpuRolloutTensorKind::ResponseIds;
+  if (kind == "response_mask") return cverl::rollout::GpuRolloutTensorKind::ResponseMask;
+  if (kind == "old_log_probs") return cverl::rollout::GpuRolloutTensorKind::OldLogProbs;
+  if (kind == "rewards") return cverl::rollout::GpuRolloutTensorKind::Rewards;
+  if (kind == "advantages") return cverl::rollout::GpuRolloutTensorKind::Advantages;
+  if (kind == "group_ids") return cverl::rollout::GpuRolloutTensorKind::GroupIds;
+  throw std::invalid_argument("unknown rollout IPC tensor kind: " + kind);
+}
+
+cverl::rollout::GpuIpcDType parse_ipc_dtype(const std::string& dtype) {
+  if (dtype == "int64") return cverl::rollout::GpuIpcDType::Int64;
+  if (dtype == "float32") return cverl::rollout::GpuIpcDType::Float32;
+  if (dtype == "uint8") return cverl::rollout::GpuIpcDType::UInt8;
+  if (dtype == "bfloat16") return cverl::rollout::GpuIpcDType::BFloat16;
+  if (dtype == "float16") return cverl::rollout::GpuIpcDType::Float16;
+  throw std::invalid_argument("unknown rollout IPC tensor dtype: " + dtype);
+}
+
+torch::Tensor find_ipc_tensor(const std::unordered_map<std::string, torch::Tensor>& tensors,
+                              const std::string& name) {
+  auto it = tensors.find(name);
+  if (it == tensors.end()) {
+    throw std::runtime_error("rollout IPC manifest missing tensor: " + name);
+  }
+  return it->second;
+}
+
+PpPpoBatch load_rollout_ipc_batch(const std::string& path,
+                                  int64_t expected_prompt_len,
+                                  int64_t expected_response_len,
+                                  int64_t expected_step,
+                                  int32_t device_index) {
+#ifndef CVERL_ENABLE_CUDA
+  (void)path;
+  (void)expected_prompt_len;
+  (void)expected_response_len;
+  (void)expected_step;
+  (void)device_index;
+  throw std::runtime_error("rollout CUDA IPC requires CVERL_ENABLE_CUDA=ON");
+#else
+  std::ifstream in(path);
+  if (!in) {
+    throw std::runtime_error("failed to open rollout IPC manifest: " + path);
+  }
+  nlohmann::json doc = nlohmann::json::parse(in);
+  const int64_t step = doc.value("step", expected_step);
+  if (step != expected_step) {
+    throw std::runtime_error("rollout IPC step mismatch for " + path);
+  }
+  const int64_t batch = doc.at("batch").get<int64_t>();
+  const int64_t prompt_len = doc.at("prompt_len").get<int64_t>();
+  const int64_t response_len = doc.at("response_len").get<int64_t>();
+  if (prompt_len != expected_prompt_len || response_len != expected_response_len) {
+    throw std::runtime_error("rollout IPC prompt/response length mismatch for " + path);
+  }
+
+  std::unordered_map<std::string, torch::Tensor> tensors;
+  for (const auto& item : doc.at("tensors")) {
+    cverl::rollout::GpuIpcTensorHandle handle;
+    const std::string kind_name = item.at("kind").get<std::string>();
+    handle.kind = parse_ipc_kind(kind_name);
+    handle.dtype = parse_ipc_dtype(item.at("dtype").get<std::string>());
+    handle.device_index = item.value("device_index", device_index);
+    const auto shape = item.at("shape").get<std::vector<int64_t>>();
+    const auto strides = item.value("strides", std::vector<int64_t>{});
+    handle.ndim = static_cast<int32_t>(shape.size());
+    if (handle.ndim <= 0 || handle.ndim > 4) {
+      throw std::runtime_error("invalid rollout IPC tensor rank for " + kind_name);
+    }
+    handle.numel = 1;
+    for (int32_t i = 0; i < handle.ndim; ++i) {
+      handle.sizes[static_cast<size_t>(i)] = shape[static_cast<size_t>(i)];
+      handle.strides[static_cast<size_t>(i)] =
+          strides.empty() ? (i + 1 == handle.ndim ? 1 : 0) : strides[static_cast<size_t>(i)];
+      handle.numel *= static_cast<uint64_t>(shape[static_cast<size_t>(i)]);
+    }
+    if (strides.empty()) {
+      int64_t stride = 1;
+      for (int32_t i = handle.ndim - 1; i >= 0; --i) {
+        handle.strides[static_cast<size_t>(i)] = stride;
+        stride *= handle.sizes[static_cast<size_t>(i)];
+      }
+    }
+    cverl::rollout::cuda_ipc_handle_from_hex(item.at("handle").get<std::string>(), &handle);
+    tensors.emplace(kind_name, cverl::rollout::import_cuda_ipc_tensor(handle, device_index));
+  }
+
+  auto prompt_ids = find_ipc_tensor(tensors, "prompt_ids");
+  auto response_ids = find_ipc_tensor(tensors, "response_ids");
+  auto response_mask = find_ipc_tensor(tensors, "response_mask").to(torch::kFloat32);
+  auto advantages = find_ipc_tensor(tensors, "advantages").to(torch::kFloat32);
+  torch::Tensor old_log_probs;
+  auto old_it = tensors.find("old_log_probs");
+  if (old_it != tensors.end()) {
+    old_log_probs = old_it->second.to(torch::kFloat32);
+  }
+
+  PpPpoBatch out;
+  out.rows = batch;
+  out.mean_reward = doc.value("mean_reward", 0.0);
+  out.success_rate = doc.value("success_rate", 0.0);
+  out.adv_abs_sum = advantages.abs().sum().item<double>();
+  out.token_ids.reserve(static_cast<size_t>(batch));
+  out.advantages.reserve(static_cast<size_t>(batch));
+  out.response_masks.reserve(static_cast<size_t>(batch));
+  out.old_log_probs.reserve(static_cast<size_t>(batch));
+  for (int64_t i = 0; i < batch; ++i) {
+    out.token_ids.push_back(torch::cat({prompt_ids.index({i}), response_ids.index({i})}, 0).view({1, prompt_len + response_len}));
+    out.advantages.push_back(advantages.index({i}).view({1, response_len}));
+    out.response_masks.push_back(response_mask.index({i}).view({1, response_len}));
+    if (old_log_probs.defined()) {
+      out.old_log_probs.push_back(old_log_probs.index({i}).view({1, response_len}));
+    }
+  }
+  return out;
+#endif
 }
 
 std::vector<torch::Tensor> load_jsonl_token_batches(const std::string& jsonl_path,
@@ -402,6 +547,8 @@ int main(int argc, char** argv) {
     const std::string jsonl_input = arg_str(argc, argv, "--jsonl-input", "");
     const std::string rollout_json = arg_str(argc, argv, "--rollout-json", "");
     const std::string rollout_dir = arg_str(argc, argv, "--rollout-dir", "");
+    const std::string rollout_ipc_json = arg_str(argc, argv, "--rollout-ipc-json", "");
+    const std::string rollout_ipc_dir = arg_str(argc, argv, "--rollout-ipc-dir", "");
     const std::string tokenizer_json =
         arg_str(argc, argv, "--tokenizer-json", (std::filesystem::path(model_dir) / "tokenizer.json").string());
     const int64_t jsonl_max_examples = arg_i64(argc, argv, "--jsonl-max-examples", 16);
@@ -498,9 +645,17 @@ int main(int argc, char** argv) {
       double adv_abs_sum = 0.0;
       PpPpoBatch rollout_batch;
       const std::string rollout_path = rollout_json_path_for_step(rollout_json, rollout_dir, step);
+      const std::string rollout_ipc_path = rollout_ipc_path_for_step(rollout_ipc_json, rollout_ipc_dir, step);
       const PpPpoBatch* active_rollout = nullptr;
-      if (!rollout_path.empty()) {
-        rollout_batch = load_rollout_ppo_batch(rollout_path, tokenizer_json, prompt_len, response_len, device);
+      if (!rollout_ipc_path.empty()) {
+        rollout_batch = load_rollout_ipc_batch(
+            rollout_ipc_path, prompt_len, response_len, step + 1, static_cast<int32_t>(device_idx));
+        active_rollout = &rollout_batch;
+        mean_reward = rollout_batch.mean_reward;
+        success_rate = rollout_batch.success_rate;
+        adv_abs_sum = rollout_batch.adv_abs_sum;
+      } else if (!rollout_path.empty()) {
+        rollout_batch = load_rollout_ppo_batch(rollout_path, tokenizer_json, prompt_len, response_len, step + 1, device);
         active_rollout = &rollout_batch;
         mean_reward = rollout_batch.mean_reward;
         success_rate = rollout_batch.success_rate;
@@ -537,13 +692,16 @@ int main(int argc, char** argv) {
             auto response_logits = logits.slice(1, prompt_len - 1, prompt_len + response_len - 1);
             auto response_ids = ids.slice(1, prompt_len, prompt_len + response_len);
             auto log_probs = cverl::torch_backend::response_log_probs(response_logits, response_ids);
-            auto old_log_probs = log_probs.detach();
+            torch::Tensor old_log_probs = log_probs.detach();
             torch::Tensor advantages;
             torch::Tensor response_mask;
             if (active_rollout != nullptr) {
               const int64_t idx = action.micro_batch % active_rollout->rows;
               advantages = active_rollout->advantages[static_cast<size_t>(idx)];
               response_mask = active_rollout->response_masks[static_cast<size_t>(idx)];
+              if (!active_rollout->old_log_probs.empty()) {
+                old_log_probs = active_rollout->old_log_probs[static_cast<size_t>(idx)];
+              }
             } else {
               advantages = torch::ones_like(log_probs) * advantage_scale;
               response_mask = torch::ones_like(log_probs);

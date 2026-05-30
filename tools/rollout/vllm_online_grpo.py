@@ -266,19 +266,23 @@ def main() -> int:
                 args.temperature, args.top_p, args.seed + step * 100003, args.timeout)
         t1 = time.perf_counter()
 
+        rollout_doc = None
         if args.dump_rollout_dir:
-            dump_dir = Path(args.dump_rollout_dir)
-            dump_dir.mkdir(parents=True, exist_ok=True)
-            tmp_path = dump_dir / f"rollout_step_{step:06d}.json.tmp"
-            out_path = dump_dir / f"rollout_step_{step:06d}.json"
-            tmp_path.write_text(json.dumps({
+            rollout_doc = {
                 "step": step,
                 "prompts": prompts,
                 "answers": answers,
                 "responses": responses,
                 "prompt_indices": prompt_indices,
                 "sample_indices": sample_indices,
-            }, ensure_ascii=False))
+            }
+
+        if args.dump_rollout_dir:
+            dump_dir = Path(args.dump_rollout_dir)
+            dump_dir.mkdir(parents=True, exist_ok=True)
+            tmp_path = dump_dir / f"rollout_step_{step:06d}.json.tmp"
+            out_path = dump_dir / f"rollout_step_{step:06d}.json"
+            tmp_path.write_text(json.dumps(rollout_doc, ensure_ascii=False))
             tmp_path.replace(out_path)
 
         if args.skip_train:

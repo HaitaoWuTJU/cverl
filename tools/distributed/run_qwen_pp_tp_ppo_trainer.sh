@@ -20,6 +20,8 @@ VARY_TOKENS_BY_STEP="${VARY_TOKENS_BY_STEP:-false}"
 JSONL_INPUT="${JSONL_INPUT:-}"
 ROLLOUT_JSON="${ROLLOUT_JSON:-}"
 ROLLOUT_DIR="${ROLLOUT_DIR:-}"
+ROLLOUT_IPC_JSON="${ROLLOUT_IPC_JSON:-}"
+ROLLOUT_IPC_DIR="${ROLLOUT_IPC_DIR:-}"
 JSONL_MAX_EXAMPLES="${JSONL_MAX_EXAMPLES:-16}"
 TOKENIZER_JSON="${TOKENIZER_JSON:-${MODEL_DIR}/tokenizer.json}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-}"
@@ -65,6 +67,8 @@ for ((rank = 0; rank < WORLD_SIZE; ++rank)); do
       --jsonl-input "${JSONL_INPUT}" \
       --rollout-json "${ROLLOUT_JSON}" \
       --rollout-dir "${ROLLOUT_DIR}" \
+      --rollout-ipc-json "${ROLLOUT_IPC_JSON}" \
+      --rollout-ipc-dir "${ROLLOUT_IPC_DIR}" \
       --jsonl-max-examples "${JSONL_MAX_EXAMPLES}" \
       --tokenizer-json "${TOKENIZER_JSON}" \
       --checkpoint-dir "${CHECKPOINT_DIR}" \

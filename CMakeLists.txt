@@ -198,9 +198,12 @@ target_compile_definitions(cverl PRIVATE
 
 if (CVERL_ENABLE_CUDA)
   enable_language(CUDA)
+  find_package(CUDAToolkit REQUIRED)
   target_sources(cverl PRIVATE
     cuda/core_algos_cuda.cu
+    src/rollout/gpu_ipc_rollout_batch.cc
   )
+  target_link_libraries(cverl PUBLIC CUDA::cudart)
 endif()
 
 if (CVERL_ENABLE_NCCL)
@@ -311,6 +314,12 @@ if (CVERL_BUILD_TESTS)
   add_executable(test_rollout_batch tests/rollout/test_rollout_batch.cc)
   target_link_libraries(test_rollout_batch PRIVATE cverl)
   target_compile_options(test_rollout_batch PRIVATE ${TORCH_CXX_FLAGS})
+
+  if (CVERL_ENABLE_CUDA)
+    add_executable(test_gpu_ipc_rollout_batch tests/rollout/test_gpu_ipc_rollout_batch.cc)
+    target_link_libraries(test_gpu_ipc_rollout_batch PRIVATE cverl)
+    target_compile_options(test_gpu_ipc_rollout_batch PRIVATE ${TORCH_CXX_FLAGS})
+  endif()
 
   add_executable(test_gsm8k_grpo_trainer tests/rollout/test_gsm8k_grpo_trainer.cc)
   target_link_libraries(test_gsm8k_grpo_trainer PRIVATE cverl)
