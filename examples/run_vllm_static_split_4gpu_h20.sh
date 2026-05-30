@@ -21,6 +21,7 @@ ROLLOUT_BACKEND="${ROLLOUT_BACKEND:-vllm}"
 VLLM_GPUS="${VLLM_GPUS:-0,1}"
 VLLM_TP_SIZE="${VLLM_TP_SIZE:-2}"
 VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.90}"
+VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-}"
 TRAINER_GPUS="${TRAINER_GPUS:-2,3}"
 PP_SIZE="${PP_SIZE:-2}"
 TP_SIZE="${TP_SIZE:-1}"
@@ -58,6 +59,11 @@ cmake -S "${ROOT_DIR}" -B "${BUILD_DIR}" \
 cmake --build "${BUILD_DIR}" -j "${JOBS:-8}" --target qwen3_5_pp_tp_ppo_trainer _cverl_vllm_bridge
 
 if [[ "${ROLLOUT_BACKEND}" == "vllm" ]]; then
+  VLLM_MAX_MODEL_LEN_ARGS=()
+  if [[ -n "${VLLM_MAX_MODEL_LEN}" ]]; then
+    VLLM_MAX_MODEL_LEN_ARGS=(--max-model-len "${VLLM_MAX_MODEL_LEN}")
+  fi
+
   VLLM_SERVER_DEV_MODE=1 \
   NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME}" \
   CUDA_VISIBLE_DEVICES="${VLLM_GPUS}" \
@@ -68,6 +74,7 @@ if [[ "${ROLLOUT_BACKEND}" == "vllm" ]]; then
     --dtype "${VLLM_DTYPE:-bfloat16}" \
     --tensor-parallel-size "${VLLM_TP_SIZE}" \
     --gpu-memory-utilization "${VLLM_GPU_MEMORY_UTILIZATION}" \
+    "${VLLM_MAX_MODEL_LEN_ARGS[@]}" \
     --enable-sleep-mode \
     --weight-transfer-config '{"backend":"nccl"}' \
     > "${VLLM_LOG}" 2>&1 &
