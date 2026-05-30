@@ -13,6 +13,7 @@ struct Fp32MasterAdamWOptions {
   double beta2 = 0.95;
   double eps = 1.0e-8;
   double weight_decay = 0.0;
+  bool use_master_weights = true;
 };
 
 class Fp32MasterAdamW {
@@ -27,6 +28,7 @@ class Fp32MasterAdamW {
   const std::vector<torch::Tensor>& model_parameters() const { return model_parameters_; }
   const std::vector<torch::Tensor>& master_parameters() const { return master_parameters_; }
   const std::vector<torch::Tensor>& main_grad_parameters() const { return main_grad_; }
+  bool uses_master_weights() const { return options_.use_master_weights; }
 
  private:
   std::vector<torch::Tensor> model_parameters_;

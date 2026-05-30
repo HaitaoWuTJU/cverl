@@ -44,7 +44,9 @@ Fp32MasterAdamW::Fp32MasterAdamW(std::vector<torch::Tensor> model_parameters,
       throw std::invalid_argument("Fp32MasterAdamW: undefined parameter");
     }
     auto master = p.detach().to(torch::kFloat32).contiguous();
-    master_parameters_.push_back(master);
+    if (options_.use_master_weights) {
+      master_parameters_.push_back(master);
+    }
     main_grad_.push_back(torch::zeros_like(master));
     exp_avg_.push_back(torch::zeros_like(master));
     exp_avg_sq_.push_back(torch::zeros_like(master));
@@ -96,7 +98,7 @@ void Fp32MasterAdamW::step() {
     } else {
       continue;
     }
-    auto& master = master_parameters_[i];
+    auto master = options_.use_master_weights ? master_parameters_[i] : model.detach().to(torch::kFloat32).contiguous();
     auto& m = exp_avg_[i];
     auto& v = exp_avg_sq_[i];
 
@@ -108,6 +110,9 @@ void Fp32MasterAdamW::step() {
     }
     auto denom = (v / bias_correction2).sqrt_().add_(options_.eps);
     master.addcdiv_(m, denom, -step_size);
+    if (options_.use_master_weights) {
+      master_parameters_[i].copy_(master);
+    }
     model.copy_(master.to(model.scalar_type()));
   }
 }

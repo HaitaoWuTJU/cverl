@@ -14,6 +14,7 @@ STEPS="${STEPS:-1}"
 LR="${LR:-1e-8}"
 CLIP_RATIO="${CLIP_RATIO:-0.2}"
 ADVANTAGE_SCALE="${ADVANTAGE_SCALE:-1.0}"
+MASTER_WEIGHTS="${MASTER_WEIGHTS:-true}"
 DTYPE="${DTYPE:-bfloat16}"
 ID_PREFIX="${ID_PREFIX:-/tmp/cverl_qwen_pp_tp_ppo}"
 NCCL_LIB_DIR="${NCCL_LIB_DIR:-}"
@@ -42,6 +43,7 @@ for ((rank = 0; rank < WORLD_SIZE; ++rank)); do
       --lr "${LR}" \
       --clip-ratio "${CLIP_RATIO}" \
       --advantage-scale "${ADVANTAGE_SCALE}" \
+      --master-weights "${MASTER_WEIGHTS}" \
       --dtype "${DTYPE}" \
       --id-prefix "${ID_PREFIX}" \
       >"/tmp/cverl_qwen_pp_tp_ppo_rank_${rank}.log" 2>&1 &

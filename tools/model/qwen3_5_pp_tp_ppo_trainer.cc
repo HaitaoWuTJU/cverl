@@ -39,6 +39,22 @@ double arg_f64(int argc, char** argv, const std::string& flag, double fallback) 
   return fallback;
 }
 
+bool arg_bool(int argc, char** argv, const std::string& flag, bool fallback) {
+  for (int i = 1; i + 1 < argc; ++i) {
+    if (argv[i] == flag) {
+      const std::string value = argv[i + 1];
+      if (value == "1" || value == "true" || value == "yes" || value == "on") {
+        return true;
+      }
+      if (value == "0" || value == "false" || value == "no" || value == "off") {
+        return false;
+      }
+      throw std::invalid_argument("invalid boolean value for " + flag);
+    }
+  }
+  return fallback;
+}
+
 std::string arg_str(int argc, char** argv, const std::string& flag, const std::string& fallback) {
   for (int i = 1; i + 1 < argc; ++i) {
     if (argv[i] == flag) {
@@ -55,6 +71,15 @@ std::vector<int64_t> full_group(int64_t size) {
     ranks.push_back(i);
   }
   return ranks;
+}
+
+std::vector<torch::Tensor> clone_params(const std::vector<torch::Tensor>& params) {
+  std::vector<torch::Tensor> out;
+  out.reserve(params.size());
+  for (const auto& p : params) {
+    out.push_back(p.detach().clone());
+  }
+  return out;
 }
 
 torch::ScalarType parse_dtype(const std::string& dtype) {
@@ -101,6 +126,7 @@ int main(int argc, char** argv) {
     const double lr = arg_f64(argc, argv, "--lr", 1.0e-8);
     const double clip_ratio = arg_f64(argc, argv, "--clip-ratio", 0.2);
     const double advantage_scale = arg_f64(argc, argv, "--advantage-scale", 1.0);
+    const bool use_master_weights = arg_bool(argc, argv, "--master-weights", true);
     const auto dtype = parse_dtype(arg_str(argc, argv, "--dtype", "bfloat16"));
     const std::string id_prefix = arg_str(argc, argv, "--id-prefix", "/tmp/cverl_qwen_pp_tp_ppo");
 
@@ -167,6 +193,7 @@ int main(int argc, char** argv) {
     optim_options.beta2 = 0.95;
     optim_options.eps = 1.0e-8;
     optim_options.weight_decay = 0.01;
+    optim_options.use_master_weights = use_master_weights;
     cverl::torch_backend::Fp32MasterAdamW optimizer(params, optim_options);
 
     const std::vector<int64_t> hidden_shape{1, seq_len, model.config().hidden_size};
@@ -175,7 +202,9 @@ int main(int argc, char** argv) {
 
     for (int64_t step = 0; step < steps; ++step) {
       optimizer.zero_grad();
-      auto master_before = cverl::torch_backend::clone_detached(optimizer.master_parameters());
+      auto param_before = use_master_weights
+                              ? cverl::torch_backend::clone_detached(optimizer.master_parameters())
+                              : clone_params(params);
       std::unordered_map<int64_t, torch::Tensor> stage_inputs;
       std::unordered_map<int64_t, torch::Tensor> stage_outputs;
       double loss_sum = 0.0;
@@ -247,8 +276,10 @@ int main(int argc, char** argv) {
 
       const double local_grad_norm = optimizer.grad_norm_sum();
       optimizer.step();
-      const double local_param_delta =
-          cverl::torch_backend::parameter_delta_sum(master_before, optimizer.master_parameters());
+      const double local_param_delta = use_master_weights
+                                           ? cverl::torch_backend::parameter_delta_sum(
+                                                 param_before, optimizer.master_parameters())
+                                           : cverl::torch_backend::parameter_delta_sum(param_before, params);
 
       auto grad_tensor = torch::tensor({local_grad_norm}, torch::TensorOptions().device(device).dtype(torch::kFloat32));
       auto delta_tensor = torch::tensor({local_param_delta}, torch::TensorOptions().device(device).dtype(torch::kFloat32));
@@ -290,6 +321,7 @@ int main(int argc, char** argv) {
                   << " layers=" << layers
                   << " prompt_len=" << prompt_len
                   << " response_len=" << response_len
+                  << " master_weights=" << (use_master_weights ? "true" : "false")
                   << " loss_sum=" << total_loss
                   << " ppo_kl_sum=" << total_kl
                   << " clipfrac_sum=" << total_clipfrac

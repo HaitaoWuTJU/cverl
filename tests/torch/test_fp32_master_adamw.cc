@@ -52,9 +52,23 @@ int main() {
     require(p.grad().defined(), "zero_grad keeps grad tensor allocated");
     require(p.grad().to(torch::kFloat32).abs().sum().item<double>() == 0.0, "zero_grad clears model gradient");
 
+    auto q = torch::ones({4}, torch::TensorOptions().dtype(torch::kBFloat16));
+    q.set_requires_grad(true);
+    opts.use_master_weights = false;
+    opts.lr = 1.0e-2;
+    cverl::torch_backend::Fp32MasterAdamW no_master_optimizer({q}, opts);
+    require(no_master_optimizer.master_parameters().empty(), "no-master mode must not allocate fp32 master weights");
+    q.mutable_grad() = torch::full_like(q, 1.0e-1);
+    no_master_optimizer.accumulate_model_grads();
+    auto q_before = q.detach().clone();
+    no_master_optimizer.step();
+    const double no_master_delta = (q.detach().to(torch::kFloat32) - q_before.to(torch::kFloat32)).abs().sum().item<double>();
+    require(no_master_delta > 0.0, "no-master BF16 mode must update model parameter when update exceeds BF16 quantum");
+
     std::cout << "fp32 master AdamW test passed"
               << " master_delta=" << master_delta
-              << " model_delta=" << model_delta << "\n";
+              << " model_delta=" << model_delta
+              << " no_master_delta=" << no_master_delta << "\n";
     return 0;
   } catch (const std::exception& e) {
     std::cerr << "test_fp32_master_adamw failed: " << e.what() << "\n";
