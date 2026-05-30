@@ -34,8 +34,10 @@ Fp32MasterAdamW::Fp32MasterAdamW(std::vector<torch::Tensor> model_parameters,
     throw std::invalid_argument("Fp32MasterAdamW: invalid optimizer options");
   }
   master_parameters_.reserve(model_parameters_.size());
+  main_grad_.reserve(model_parameters_.size());
   exp_avg_.reserve(model_parameters_.size());
   exp_avg_sq_.reserve(model_parameters_.size());
+  has_main_grad_.reserve(model_parameters_.size());
   torch::NoGradGuard no_grad;
   for (const auto& p : model_parameters_) {
     if (!p.defined()) {
@@ -43,17 +45,35 @@ Fp32MasterAdamW::Fp32MasterAdamW(std::vector<torch::Tensor> model_parameters,
     }
     auto master = p.detach().to(torch::kFloat32).contiguous();
     master_parameters_.push_back(master);
+    main_grad_.push_back(torch::zeros_like(master));
     exp_avg_.push_back(torch::zeros_like(master));
     exp_avg_sq_.push_back(torch::zeros_like(master));
+    has_main_grad_.push_back(false);
   }
 }
 
 void Fp32MasterAdamW::zero_grad() {
   torch::NoGradGuard no_grad;
-  for (auto& p : model_parameters_) {
+  for (size_t i = 0; i < model_parameters_.size(); ++i) {
+    auto& p = model_parameters_[i];
     if (p.grad().defined()) {
       p.mutable_grad().zero_();
     }
+    main_grad_[i].zero_();
+    has_main_grad_[i] = false;
+  }
+}
+
+void Fp32MasterAdamW::accumulate_model_grads(double scale) {
+  torch::NoGradGuard no_grad;
+  for (size_t i = 0; i < model_parameters_.size(); ++i) {
+    auto& model = model_parameters_[i];
+    if (!model.grad().defined()) {
+      continue;
+    }
+    main_grad_[i].add_(model.grad().detach().to(torch::kFloat32), scale);
+    model.mutable_grad().zero_();
+    has_main_grad_[i] = true;
   }
 }
 
@@ -68,10 +88,14 @@ void Fp32MasterAdamW::step() {
 
   for (size_t i = 0; i < model_parameters_.size(); ++i) {
     auto& model = model_parameters_[i];
-    if (!model.grad().defined()) {
+    torch::Tensor grad;
+    if (has_main_grad_[i]) {
+      grad = main_grad_[i];
+    } else if (model.grad().defined()) {
+      grad = model.grad().detach().to(torch::kFloat32);
+    } else {
       continue;
     }
-    auto grad = model.grad().detach().to(torch::kFloat32);
     auto& master = master_parameters_[i];
     auto& m = exp_avg_[i];
     auto& v = exp_avg_sq_[i];
@@ -86,6 +110,18 @@ void Fp32MasterAdamW::step() {
     master.addcdiv_(m, denom, -step_size);
     model.copy_(master.to(model.scalar_type()));
   }
+}
+
+double Fp32MasterAdamW::grad_norm_sum() const {
+  double out = 0.0;
+  for (size_t i = 0; i < model_parameters_.size(); ++i) {
+    if (has_main_grad_[i]) {
+      out += main_grad_[i].detach().norm().item<double>();
+    } else if (model_parameters_[i].grad().defined()) {
+      out += model_parameters_[i].grad().detach().to(torch::kFloat32).norm().item<double>();
+    }
+  }
+  return out;
 }
 
 }  // namespace cverl::torch_backend

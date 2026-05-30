@@ -70,16 +70,6 @@ torch::ScalarType parse_dtype(const std::string& dtype) {
   throw std::invalid_argument("unsupported dtype");
 }
 
-double grad_norm_sum(const std::vector<torch::Tensor>& params) {
-  double out = 0.0;
-  for (const auto& p : params) {
-    if (p.grad().defined()) {
-      out += p.grad().detach().to(torch::kFloat32).norm().item<double>();
-    }
-  }
-  return out;
-}
-
 torch::Tensor make_token_ids(int64_t seq_len, int64_t micro_batch, int64_t step, const cverl::Qwen35TextConfig& config, torch::Device device) {
   auto ids = torch::arange(1, seq_len + 1, torch::TensorOptions().dtype(torch::kLong).device(device)).view({1, seq_len});
   const int64_t offset = step + micro_batch;
@@ -255,7 +245,7 @@ int main(int argc, char** argv) {
         }
       }
 
-      const double local_grad_norm = grad_norm_sum(params);
+      const double local_grad_norm = optimizer.grad_norm_sum();
       optimizer.step();
       const double local_param_delta =
           cverl::torch_backend::parameter_delta_sum(master_before, optimizer.master_parameters());

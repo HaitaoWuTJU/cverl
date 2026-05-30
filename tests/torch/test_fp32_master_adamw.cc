@@ -33,6 +33,10 @@ int main() {
     auto model_before = p.detach().clone();
     auto master_before = cverl::torch_backend::clone_detached(optimizer.master_parameters());
     p.mutable_grad() = torch::full_like(p, 1.0e-3);
+    optimizer.accumulate_model_grads();
+    require(optimizer.main_grad_parameters()[0].scalar_type() == torch::kFloat32, "main_grad must be fp32");
+    require(p.grad().defined(), "accumulate_model_grads keeps grad tensor allocated");
+    require(p.grad().to(torch::kFloat32).abs().sum().item<double>() == 0.0, "accumulate_model_grads clears model gradient");
     optimizer.step();
 
     const double model_delta =

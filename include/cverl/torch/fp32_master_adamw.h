@@ -20,16 +20,21 @@ class Fp32MasterAdamW {
   Fp32MasterAdamW(std::vector<torch::Tensor> model_parameters, Fp32MasterAdamWOptions options);
 
   void zero_grad();
+  void accumulate_model_grads(double scale = 1.0);
   void step();
+  double grad_norm_sum() const;
 
   const std::vector<torch::Tensor>& model_parameters() const { return model_parameters_; }
   const std::vector<torch::Tensor>& master_parameters() const { return master_parameters_; }
+  const std::vector<torch::Tensor>& main_grad_parameters() const { return main_grad_; }
 
  private:
   std::vector<torch::Tensor> model_parameters_;
   std::vector<torch::Tensor> master_parameters_;
+  std::vector<torch::Tensor> main_grad_;
   std::vector<torch::Tensor> exp_avg_;
   std::vector<torch::Tensor> exp_avg_sq_;
+  std::vector<bool> has_main_grad_;
   Fp32MasterAdamWOptions options_;
   int64_t step_ = 0;
 };
