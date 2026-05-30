@@ -15,6 +15,11 @@ LR="${LR:-1e-8}"
 CLIP_RATIO="${CLIP_RATIO:-0.2}"
 ADVANTAGE_SCALE="${ADVANTAGE_SCALE:-1.0}"
 MASTER_WEIGHTS="${MASTER_WEIGHTS:-true}"
+SKIP_OPTIMIZER_STEP="${SKIP_OPTIMIZER_STEP:-false}"
+VARY_TOKENS_BY_STEP="${VARY_TOKENS_BY_STEP:-false}"
+JSONL_INPUT="${JSONL_INPUT:-}"
+JSONL_MAX_EXAMPLES="${JSONL_MAX_EXAMPLES:-16}"
+TOKENIZER_JSON="${TOKENIZER_JSON:-${MODEL_DIR}/tokenizer.json}"
 DTYPE="${DTYPE:-bfloat16}"
 ID_PREFIX="${ID_PREFIX:-/tmp/cverl_qwen_pp_tp_ppo}"
 NCCL_LIB_DIR="${NCCL_LIB_DIR:-}"
@@ -44,6 +49,11 @@ for ((rank = 0; rank < WORLD_SIZE; ++rank)); do
       --clip-ratio "${CLIP_RATIO}" \
       --advantage-scale "${ADVANTAGE_SCALE}" \
       --master-weights "${MASTER_WEIGHTS}" \
+      --skip-optimizer-step "${SKIP_OPTIMIZER_STEP}" \
+      --vary-tokens-by-step "${VARY_TOKENS_BY_STEP}" \
+      --jsonl-input "${JSONL_INPUT}" \
+      --jsonl-max-examples "${JSONL_MAX_EXAMPLES}" \
+      --tokenizer-json "${TOKENIZER_JSON}" \
       --dtype "${DTYPE}" \
       --id-prefix "${ID_PREFIX}" \
       >"/tmp/cverl_qwen_pp_tp_ppo_rank_${rank}.log" 2>&1 &

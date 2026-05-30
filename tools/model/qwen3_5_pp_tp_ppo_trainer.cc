@@ -9,12 +9,15 @@
 
 #include <torch/torch.h>
 
+#include "cverl/data/hf_dataset.h"
 #include "cverl/distributed/nccl_collectives.h"
 #include "cverl/distributed/parallel_ops.h"
 #include "cverl/distributed/pipeline.h"
 #include "cverl/distributed/topology.h"
 #include "cverl/model/hf_model_loader.h"
 #include "cverl/model/qwen3_5_text.h"
+#include "cverl/text/hf_bpe_tokenizer.h"
+#include "cverl/text/tokenizer.h"
 #include "cverl/torch/core_algos_torch.h"
 #include "cverl/torch/fp32_master_adamw.h"
 #include "cverl/torch/tiny_causal_policy.h"
@@ -95,9 +98,69 @@ torch::ScalarType parse_dtype(const std::string& dtype) {
   throw std::invalid_argument("unsupported dtype");
 }
 
-torch::Tensor make_token_ids(int64_t seq_len, int64_t micro_batch, int64_t step, const cverl::Qwen35TextConfig& config, torch::Device device) {
+std::vector<torch::Tensor> load_jsonl_token_batches(const std::string& jsonl_path,
+                                                    const std::string& tokenizer_json,
+                                                    int64_t seq_len,
+                                                    int64_t max_examples,
+                                                    torch::Device device) {
+  if (jsonl_path.empty()) {
+    return {};
+  }
+  cverl::data::JsonlDatasetOptions data_opts;
+  data_opts.path = jsonl_path;
+  data_opts.prompt_field = "prompt";
+  data_opts.answer_field = "answer";
+  data_opts.max_examples = max_examples;
+  auto examples = cverl::data::load_prompt_answer_jsonl(data_opts);
+  if (examples.empty()) {
+    throw std::runtime_error("jsonl input produced no examples: " + jsonl_path);
+  }
+
+  cverl::text::HfBpeTokenizerOptions tok_opts;
+  tok_opts.tokenizer_json_path = tokenizer_json;
+  cverl::text::HfBpeTokenizer tokenizer(tok_opts);
+  const int32_t pad_id = tokenizer.pad_id() >= 0 ? tokenizer.pad_id() : 0;
+
+  std::vector<torch::Tensor> batches;
+  batches.reserve(examples.size());
+  for (const auto& ex : examples) {
+    cverl::text::EncodeOptions enc_opts;
+    enc_opts.add_bos = false;
+    enc_opts.add_eos = false;
+    auto ids32 = tokenizer.encode("Question: " + ex.prompt + "\nAnswer:", enc_opts);
+    std::vector<int64_t> ids(static_cast<size_t>(seq_len), static_cast<int64_t>(pad_id));
+    if (ids32.empty()) {
+      ids32.push_back(pad_id);
+    }
+    if (static_cast<int64_t>(ids32.size()) >= seq_len) {
+      const int64_t start = static_cast<int64_t>(ids32.size()) - seq_len;
+      for (int64_t i = 0; i < seq_len; ++i) {
+        ids[static_cast<size_t>(i)] = ids32[static_cast<size_t>(start + i)];
+      }
+    } else {
+      const int64_t pad = seq_len - static_cast<int64_t>(ids32.size());
+      for (int64_t i = 0; i < static_cast<int64_t>(ids32.size()); ++i) {
+        ids[static_cast<size_t>(pad + i)] = ids32[static_cast<size_t>(i)];
+      }
+    }
+    batches.push_back(torch::tensor(ids, torch::TensorOptions().dtype(torch::kLong).device(device)).view({1, seq_len}));
+  }
+  return batches;
+}
+
+torch::Tensor make_token_ids(int64_t seq_len,
+                             int64_t micro_batch,
+                             int64_t step,
+                             bool vary_tokens_by_step,
+                             const std::vector<torch::Tensor>& jsonl_batches,
+                             const cverl::Qwen35TextConfig& config,
+                             torch::Device device) {
+  if (!jsonl_batches.empty()) {
+    const int64_t idx = (step * 1024 + micro_batch) % static_cast<int64_t>(jsonl_batches.size());
+    return jsonl_batches[static_cast<size_t>(idx)];
+  }
   auto ids = torch::arange(1, seq_len + 1, torch::TensorOptions().dtype(torch::kLong).device(device)).view({1, seq_len});
-  const int64_t offset = step + micro_batch;
+  const int64_t offset = micro_batch + (vary_tokens_by_step ? step : 0);
   return (ids + offset).remainder(config.vocab_size - 1).clamp_min(1);
 }
 
@@ -127,6 +190,12 @@ int main(int argc, char** argv) {
     const double clip_ratio = arg_f64(argc, argv, "--clip-ratio", 0.2);
     const double advantage_scale = arg_f64(argc, argv, "--advantage-scale", 1.0);
     const bool use_master_weights = arg_bool(argc, argv, "--master-weights", true);
+    const bool skip_optimizer_step = arg_bool(argc, argv, "--skip-optimizer-step", false);
+    const bool vary_tokens_by_step = arg_bool(argc, argv, "--vary-tokens-by-step", false);
+    const std::string jsonl_input = arg_str(argc, argv, "--jsonl-input", "");
+    const std::string tokenizer_json =
+        arg_str(argc, argv, "--tokenizer-json", (std::filesystem::path(model_dir) / "tokenizer.json").string());
+    const int64_t jsonl_max_examples = arg_i64(argc, argv, "--jsonl-max-examples", 16);
     const auto dtype = parse_dtype(arg_str(argc, argv, "--dtype", "bfloat16"));
     const std::string id_prefix = arg_str(argc, argv, "--id-prefix", "/tmp/cverl_qwen_pp_tp_ppo");
 
@@ -177,6 +246,8 @@ int main(int argc, char** argv) {
     cverl::HfModelLoader loader(model_dir);
     cverl::Qwen35TextModel model(std::move(loader));
     model.to(device);
+    const auto jsonl_batches =
+        load_jsonl_token_batches(jsonl_input, tokenizer_json, seq_len, jsonl_max_examples, device);
     std::vector<torch::Tensor> params;
     for (const auto& name : model.required_weight_names(layers)) {
       auto tensor = model.loader()
@@ -215,7 +286,8 @@ int main(int argc, char** argv) {
         if (action.op == cverl::distributed::PipelineScheduleOp::Forward) {
           torch::Tensor input;
           if (peers.is_first_stage) {
-            auto ids = make_token_ids(seq_len, action.micro_batch, step, model.config(), device);
+            auto ids = make_token_ids(
+                seq_len, action.micro_batch, step, vary_tokens_by_step, jsonl_batches, model.config(), device);
             input = model.token_embeddings(ids);
           } else {
             auto like = torch::empty(hidden_shape, torch::TensorOptions().device(device).dtype(dtype));
@@ -234,7 +306,8 @@ int main(int argc, char** argv) {
             throw std::runtime_error("missing stage activation for backward");
           }
           if (peers.is_last_stage) {
-            auto ids = make_token_ids(seq_len, action.micro_batch, step, model.config(), device);
+            auto ids = make_token_ids(
+                seq_len, action.micro_batch, step, vary_tokens_by_step, jsonl_batches, model.config(), device);
             auto logits = model.lm_head_logits(out_it->second).to(torch::kFloat32);
             auto response_logits = logits.slice(1, prompt_len - 1, prompt_len + response_len - 1);
             auto response_ids = ids.slice(1, prompt_len, prompt_len + response_len);
@@ -275,11 +348,15 @@ int main(int argc, char** argv) {
       }
 
       const double local_grad_norm = optimizer.grad_norm_sum();
-      optimizer.step();
-      const double local_param_delta = use_master_weights
-                                           ? cverl::torch_backend::parameter_delta_sum(
-                                                 param_before, optimizer.master_parameters())
-                                           : cverl::torch_backend::parameter_delta_sum(param_before, params);
+      if (!skip_optimizer_step) {
+        optimizer.step();
+      }
+      const double local_param_delta =
+          skip_optimizer_step
+              ? 0.0
+              : (use_master_weights ? cverl::torch_backend::parameter_delta_sum(
+                                          param_before, optimizer.master_parameters())
+                                    : cverl::torch_backend::parameter_delta_sum(param_before, params));
 
       auto grad_tensor = torch::tensor({local_grad_norm}, torch::TensorOptions().device(device).dtype(torch::kFloat32));
       auto delta_tensor = torch::tensor({local_param_delta}, torch::TensorOptions().device(device).dtype(torch::kFloat32));
@@ -322,6 +399,9 @@ int main(int argc, char** argv) {
                   << " prompt_len=" << prompt_len
                   << " response_len=" << response_len
                   << " master_weights=" << (use_master_weights ? "true" : "false")
+                  << " skip_optimizer_step=" << (skip_optimizer_step ? "true" : "false")
+                  << " vary_tokens_by_step=" << (vary_tokens_by_step ? "true" : "false")
+                  << " jsonl_examples=" << jsonl_batches.size()
                   << " loss_sum=" << total_loss
                   << " ppo_kl_sum=" << total_kl
                   << " clipfrac_sum=" << total_clipfrac
@@ -331,7 +411,7 @@ int main(int argc, char** argv) {
                   << " all_ranks_updated=" << (all_updated ? "true" : "false")
                   << " any_rank_updated=" << (any_updated ? "true" : "false")
                   << "\n";
-        trainer_ok = trainer_ok && all_have_grad && any_updated;
+        trainer_ok = trainer_ok && all_have_grad && (skip_optimizer_step || any_updated);
       }
     }
 

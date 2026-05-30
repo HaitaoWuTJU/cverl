@@ -1,5 +1,6 @@
 #include "cverl/distributed/nccl_collectives.h"
 
+#include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime_api.h>
 
 #include <cstring>
@@ -70,6 +71,15 @@ void require_all_rank_group(const std::vector<int64_t>& group, int64_t world_siz
       throw std::invalid_argument("current NCCL implementation expects group [0..world_size)");
     }
   }
+}
+
+void wait_current_stream_before_nccl(cudaStream_t nccl_stream, int device_index) {
+  cudaEvent_t event = nullptr;
+  check_cuda(cudaEventCreateWithFlags(&event, cudaEventDisableTiming), "cudaEventCreateWithFlags");
+  auto current_stream = at::cuda::getCurrentCUDAStream(device_index).stream();
+  check_cuda(cudaEventRecord(event, current_stream), "cudaEventRecord before NCCL");
+  check_cuda(cudaStreamWaitEvent(nccl_stream, event, 0), "cudaStreamWaitEvent before NCCL");
+  check_cuda(cudaEventDestroy(event), "cudaEventDestroy before NCCL");
 }
 
 ncclUniqueId decode_unique_id(const NcclUniqueIdBytes& bytes) {
@@ -165,6 +175,9 @@ torch::Tensor NcclCollectives::broadcast(const torch::Tensor& input,
   }
   auto out = torch::empty_like(input);
   void* send_recv = rank_ == root ? input.data_ptr() : out.data_ptr();
+  if (rank_ == root) {
+    wait_current_stream_before_nccl(stream_, device_index_);
+  }
   check_nccl(ncclBroadcast(send_recv, out.data_ptr(), input.numel(), nccl_dtype(input.scalar_type()),
                            static_cast<int>(root), comm_, stream_),
              "ncclBroadcast");
@@ -179,6 +192,7 @@ torch::Tensor NcclCollectives::all_reduce(const torch::Tensor& input, ReduceOp o
   require_all_rank_group(group, world_size_);
   require_cuda_contiguous(input, "all_reduce input");
   auto out = torch::empty_like(input);
+  wait_current_stream_before_nccl(stream_, device_index_);
   check_nccl(ncclAllReduce(input.data_ptr(), out.data_ptr(), input.numel(), nccl_dtype(input.scalar_type()),
                            nccl_reduce_op(op), comm_, stream_),
              "ncclAllReduce");
@@ -198,6 +212,7 @@ torch::Tensor NcclCollectives::all_gather(const torch::Tensor& input, const std:
   std::vector<int64_t> shape = input.sizes().vec();
   shape[0] *= static_cast<int64_t>(group.size());
   auto out = torch::empty(shape, input.options());
+  wait_current_stream_before_nccl(stream_, device_index_);
   check_nccl(ncclAllGather(input.data_ptr(), out.data_ptr(), input.numel(), nccl_dtype(input.scalar_type()), comm_, stream_),
              "ncclAllGather");
   check_cuda(cudaStreamSynchronize(stream_), "cudaStreamSynchronize");
@@ -216,6 +231,7 @@ torch::Tensor NcclCollectives::reduce_scatter(const torch::Tensor& input,
   std::vector<int64_t> shape = input.sizes().vec();
   shape[0] /= static_cast<int64_t>(group.size());
   auto out = torch::empty(shape, input.options());
+  wait_current_stream_before_nccl(stream_, device_index_);
   check_nccl(ncclReduceScatter(input.data_ptr(), out.data_ptr(), out.numel(), nccl_dtype(input.scalar_type()),
                                nccl_reduce_op(op), comm_, stream_),
              "ncclReduceScatter");
@@ -228,6 +244,7 @@ torch::Tensor NcclCollectives::reduce_scatter(const torch::Tensor& input,
 
 void NcclCollectives::send(const torch::Tensor& input, int64_t peer) {
   require_cuda_contiguous(input, "send input");
+  wait_current_stream_before_nccl(stream_, device_index_);
   check_nccl(ncclSend(input.data_ptr(), input.numel(), nccl_dtype(input.scalar_type()), static_cast<int>(peer), comm_, stream_),
              "ncclSend");
   check_cuda(cudaStreamSynchronize(stream_), "cudaStreamSynchronize");
