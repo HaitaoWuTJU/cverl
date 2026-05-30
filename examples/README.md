@@ -11,6 +11,9 @@ Current examples:
 - `run_h20_nccl_weight_sync.sh`: H20 NCCL collectives and parameter sync check.
 - `run_vllm_online_grpo.sh`: online GSM8K GRPO driver where cverl updates the
   live Qwen actor tensors and synchronizes them to vLLM through Native RL NCCL.
+- `run_vllm_tp2_online_grpo_h20.sh`: 4-card H20 node launcher using vLLM TP=2
+  on GPU0-1 and cverl trainer/sender on GPU2, with GPU3 left free for the next
+  trainer DP/TP step.
 
 HTTP is still treated as a debug/control surface. The online vLLM script uses
 HTTP for OpenAI-compatible generation while the weight payload uses Native RL
