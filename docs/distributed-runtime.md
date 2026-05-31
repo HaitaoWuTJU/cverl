@@ -245,11 +245,12 @@ Current code exposes the distributed shape directly:
   channel. CUDA `dq/dk/dv` backward uses that saved LSE instead of recomputing
   row max/sum. Backward now precomputes per-query `dot(grad_out, out)` once and
   shares it across `dq/dk/dv`, instead of recomputing that scalar inside every
-  KV-row CTA. The CUDA `dk/dv` CTA also computes each query-key score and
-  `dot(grad_out, value_key)` once, then shares those scalars across D/V lanes
-  for the local KV row. The CUDA path accepts fp32, fp16, and bf16 Q/K/V/grad
-  tensors while keeping LSE and scalar reductions in fp32, so Qwen bf16 CP
-  training does not have to fall back to eager attention.
+  KV-row CTA. The CUDA `dq` CTA computes each query-key score and
+  `dot(grad_out, value_key)` once and shares them across D lanes; the `dk/dv`
+  CTA does the same across D/V lanes for the local KV row. The CUDA path
+  accepts fp32, fp16, and bf16 Q/K/V/grad tensors while keeping LSE and scalar
+  reductions in fp32, so Qwen bf16 CP training does not have to fall back to
+  eager attention.
   Full industrial CP training still needs multi-row tile/shared-memory
   accumulation, while the NCCL backend now caches subgroup communicators with
   `ncclCommSplit` so CP groups can use the reduce-scatter path directly when

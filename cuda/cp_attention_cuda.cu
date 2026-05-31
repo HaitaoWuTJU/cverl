@@ -364,6 +364,63 @@ __global__ void cp_ring_attention_backward_q_kernel(const scalar_t* __restrict__
     return;
   }
 
+  if (D <= blockDim.x && V <= blockDim.x) {
+    __shared__ float reduction[kCpAttentionThreads];
+    __shared__ float shared_score;
+    __shared__ float shared_dot_go_v;
+    __shared__ float grad_q_shared[kCpAttentionThreads];
+
+    if (threadIdx.x < D) {
+      grad_q_shared[threadIdx.x] = 0.0f;
+    }
+    __syncthreads();
+
+    for (int block = 0; block < num_blocks; ++block) {
+      const int key_begin = static_cast<int>(key_begin_positions[block]);
+      for (int local = 0; local < shard_size; ++local) {
+        const int k_pos = key_begin + local;
+        const bool valid_key = k_pos <= q_pos && k_pos < original_sequence_length;
+        const int kt = block * shard_size + local;
+
+        float score_part = 0.0f;
+        if (valid_key && threadIdx.x < D) {
+          score_part =
+              static_cast<float>(q[q_base + threadIdx.x]) *
+              static_cast<float>(k[kv_bh_base_k + kt * D + threadIdx.x]);
+        }
+        const float score = block_reduce_sum(score_part, reduction);
+        if (threadIdx.x == 0) {
+          shared_score = score;
+        }
+        __syncthreads();
+
+        float dot_part = 0.0f;
+        if (valid_key && threadIdx.x < V) {
+          dot_part =
+              static_cast<float>(grad_out[go_base + threadIdx.x]) *
+              static_cast<float>(v[kv_bh_base_v + kt * V + threadIdx.x]);
+        }
+        const float dot_go_v = block_reduce_sum(dot_part, reduction);
+        if (threadIdx.x == 0) {
+          shared_dot_go_v = dot_go_v;
+        }
+        __syncthreads();
+
+        if (valid_key && threadIdx.x < D) {
+          const float prob = expf(shared_score * scale - row_lse);
+          const float ds = prob * (shared_dot_go_v - dot_go_o);
+          grad_q_shared[threadIdx.x] += ds * static_cast<float>(k[kv_bh_base_k + kt * D + threadIdx.x]);
+        }
+        __syncthreads();
+      }
+    }
+
+    if (threadIdx.x < D) {
+      dq[q_base + threadIdx.x] = static_cast<scalar_t>(grad_q_shared[threadIdx.x] * scale);
+    }
+    return;
+  }
+
   for (int d = threadIdx.x; d < D; d += blockDim.x) {
     float acc = 0.0f;
     for (int block = 0; block < num_blocks; ++block) {
