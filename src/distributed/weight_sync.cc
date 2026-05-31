@@ -27,6 +27,27 @@ int64_t tensor_bytes(const torch::Tensor& tensor) {
   return tensor.numel() * static_cast<int64_t>(tensor.element_size());
 }
 
+void require_rank_in_group(int64_t rank,
+                           int64_t root,
+                           const std::vector<int64_t>& group,
+                           const char* name) {
+  if (group.empty()) {
+    throw std::invalid_argument(std::string(name) + " requires a non-empty group");
+  }
+  bool have_rank = false;
+  bool have_root = false;
+  for (int64_t member : group) {
+    have_rank = have_rank || member == rank;
+    have_root = have_root || member == root;
+  }
+  if (!have_rank) {
+    throw std::invalid_argument(std::string(name) + " collectives rank is not in group");
+  }
+  if (!have_root) {
+    throw std::invalid_argument(std::string(name) + " root is not in group");
+  }
+}
+
 struct ParameterBucketEntry {
   const ParameterView* parameter = nullptr;
   int64_t numel = 0;
@@ -116,7 +137,14 @@ void broadcast_parameters_from_root(const std::vector<ParameterView>& parameters
   if (bucket_bytes <= 0) {
     throw std::invalid_argument("broadcast_parameters_from_root bucket_bytes must be positive");
   }
+  require_rank_in_group(collectives.rank(), root, group, "broadcast_parameters_from_root");
   torch::NoGradGuard no_grad;
+  if (group.size() == 1) {
+    for (const auto& p : parameters) {
+      require_parameter(p);
+    }
+    return;
+  }
   std::vector<ParameterBucketEntry> bucket;
   bucket.reserve(parameters.size());
   int64_t current_bytes = 0;

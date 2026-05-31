@@ -14,7 +14,7 @@ class CountingCollectives final : public cverl::distributed::Collectives {
   int64_t barrier_calls = 0;
 
   int64_t rank() const override { return 0; }
-  int64_t world_size() const override { return 1; }
+  int64_t world_size() const override { return 2; }
   void barrier() override { ++barrier_calls; }
 
   torch::Tensor broadcast(const torch::Tensor& input,
@@ -62,8 +62,14 @@ class CountingCollectives final : public cverl::distributed::Collectives {
 
  private:
   static void require_single_root(int64_t root, const std::vector<int64_t>& group) {
-    if (root != 0 || group.size() != 1 || group[0] != 0) {
-      throw std::invalid_argument("CountingCollectives only supports root/group 0");
+    bool have_rank = false;
+    bool have_root = false;
+    for (int64_t member : group) {
+      have_rank = have_rank || member == 0;
+      have_root = have_root || member == root;
+    }
+    if (!have_rank || !have_root) {
+      throw std::invalid_argument("CountingCollectives requires rank/root in group");
     }
   }
 };
@@ -97,18 +103,22 @@ int main() {
 
     CountingCollectives counting;
     cverl::distributed::broadcast_parameters_from_root(params, counting, 0, {0}, 1024 * 1024);
+    require(counting.broadcast_calls == 0, "single-rank broadcast should skip payload broadcast");
+    require(counting.barrier_calls == 0, "single-rank broadcast should skip final barrier");
+
+    cverl::distributed::broadcast_parameters_from_root(params, counting, 0, {0, 1}, 1024 * 1024);
     require(counting.broadcast_calls == 1, "same dtype/device params should share one broadcast bucket");
     require(counting.barrier_calls == 1, "broadcast should keep one final barrier");
 
     counting.broadcast_calls = 0;
     counting.barrier_calls = 0;
-    cverl::distributed::broadcast_parameters_from_root(params, counting, 0, {0}, 16);
+    cverl::distributed::broadcast_parameters_from_root(params, counting, 0, {0, 1}, 16);
     require(counting.broadcast_calls > 1, "small broadcast bucket should split calls");
     require(counting.barrier_calls == 1, "split broadcast should keep one final barrier");
 
     counting.broadcast_calls = 0;
     counting.barrier_calls = 0;
-    cverl::distributed::broadcast_parameters_from_root(params, counting, 0, {0}, 16, false);
+    cverl::distributed::broadcast_parameters_from_root(params, counting, 0, {0, 1}, 16, false);
     require(counting.broadcast_calls > 1, "barrier-free split broadcast still sends buckets");
     require(counting.barrier_calls == 0, "barrier-free broadcast should not call barrier");
 
