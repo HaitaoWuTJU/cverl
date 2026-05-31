@@ -1014,6 +1014,7 @@ int main(int argc, char** argv) {
     const double kl_coef = arg_f64(argc, argv, "--kl-coef", 0.0);
     const auto kl_penalty_mode = parse_kl_penalty_mode(arg_str(argc, argv, "--kl-penalty", "k1"));
     const double max_grad_norm = arg_f64(argc, argv, "--max-grad-norm", 1.0);
+    const int64_t dp_grad_bucket_mb = arg_i64(argc, argv, "--dp-grad-bucket-mb", 25);
     const double advantage_scale = arg_f64(argc, argv, "--advantage-scale", 1.0);
     const bool use_master_weights = arg_bool(argc, argv, "--master-weights", false);
     const bool skip_optimizer_step = arg_bool(argc, argv, "--skip-optimizer-step", false);
@@ -1046,6 +1047,10 @@ int main(int argc, char** argv) {
     if (kl_coef < 0.0) {
       throw std::invalid_argument("--kl-coef must be non-negative");
     }
+    if (dp_grad_bucket_mb <= 0) {
+      throw std::invalid_argument("--dp-grad-bucket-mb must be positive");
+    }
+    const int64_t dp_grad_bucket_bytes = dp_grad_bucket_mb * 1024 * 1024;
 
     const int64_t seq_len = prompt_len + response_len;
     const auto device = torch::Device(torch::kCUDA, static_cast<int>(device_idx));
@@ -1297,7 +1302,8 @@ int main(int argc, char** argv) {
       }
 
       sync_tp_replicated_gradients(param_names, params, tp_group);
-      cverl::distributed::data_parallel_sync_gradients(params, dp_comm, dp_group.ranks, true);
+      cverl::distributed::data_parallel_sync_gradients(
+          params, dp_comm, dp_group.ranks, true, dp_grad_bucket_bytes);
       const double local_grad_norm_sq = optimizer.grad_l2_norm_sq();
       auto grad_sq_tensor =
           torch::tensor({local_grad_norm_sq}, torch::TensorOptions().device(device).dtype(torch::kFloat32));
@@ -1422,6 +1428,7 @@ int main(int argc, char** argv) {
                   << " prompt_len=" << prompt_len
                   << " response_len=" << response_len
                   << " master_weights=" << (use_master_weights ? "true" : "false")
+                  << " dp_grad_bucket_mb=" << dp_grad_bucket_mb
                   << " resumed_from_step=" << start_step
                   << " skip_optimizer_step=" << (skip_optimizer_step ? "true" : "false")
                   << " vary_tokens_by_step=" << (vary_tokens_by_step ? "true" : "false")

@@ -8,6 +8,68 @@
 
 namespace {
 
+class CountingCollectives final : public cverl::distributed::Collectives {
+ public:
+  int64_t all_reduce_calls = 0;
+
+  int64_t rank() const override { return 0; }
+  int64_t world_size() const override { return 1; }
+  void barrier() override {}
+
+  torch::Tensor broadcast(const torch::Tensor& input,
+                          int64_t root,
+                          const std::vector<int64_t>& group) override {
+    require_group(group);
+    if (root != 0) {
+      throw std::invalid_argument("CountingCollectives root must be 0");
+    }
+    return input.clone();
+  }
+
+  torch::Tensor all_reduce(const torch::Tensor& input,
+                           cverl::distributed::ReduceOp /*op*/,
+                           const std::vector<int64_t>& group) override {
+    require_group(group);
+    ++all_reduce_calls;
+    return input.clone();
+  }
+
+  torch::Tensor all_gather(const torch::Tensor& input,
+                           const std::vector<int64_t>& group,
+                           int64_t /*dim*/) override {
+    require_group(group);
+    return input.clone();
+  }
+
+  torch::Tensor reduce_scatter(const torch::Tensor& input,
+                               cverl::distributed::ReduceOp /*op*/,
+                               const std::vector<int64_t>& group,
+                               int64_t /*dim*/) override {
+    require_group(group);
+    return input.clone();
+  }
+
+  void send(const torch::Tensor& /*input*/, int64_t peer) override {
+    if (peer != 0) {
+      throw std::invalid_argument("CountingCollectives peer must be 0");
+    }
+  }
+
+  torch::Tensor recv_like(const torch::Tensor& like, int64_t peer) override {
+    if (peer != 0) {
+      throw std::invalid_argument("CountingCollectives peer must be 0");
+    }
+    return torch::empty_like(like);
+  }
+
+ private:
+  static void require_group(const std::vector<int64_t>& group) {
+    if (group.size() != 1 || group[0] != 0) {
+      throw std::invalid_argument("CountingCollectives only supports group {0}");
+    }
+  }
+};
+
 void require_allclose(const torch::Tensor& actual,
                       const torch::Tensor& expected,
                       const char* msg,
@@ -131,6 +193,32 @@ void test_dp_sync_single_process() {
   }
 }
 
+void test_dp_sync_bucketed() {
+  CountingCollectives collectives;
+  auto p0 = torch::randn({2, 3}, torch::requires_grad());
+  auto p1 = torch::randn({4}, torch::requires_grad());
+  auto p2 = torch::randn({5}, torch::requires_grad());
+  auto loss = (p0 * p0).sum() + (p1 * 3).sum() + (p2 * -2).sum();
+  loss.backward();
+  auto g0 = p0.grad().clone();
+  auto g1 = p1.grad().clone();
+  auto g2 = p2.grad().clone();
+
+  cverl::distributed::data_parallel_sync_gradients({p0, p1, p2}, collectives, {0}, true, 1024 * 1024);
+  if (collectives.all_reduce_calls != 1) {
+    throw std::runtime_error("bucketed dp sync should use one all_reduce for same dtype/device");
+  }
+  require_allclose(p0.grad(), g0, "bucketed dp sync p0");
+  require_allclose(p1.grad(), g1, "bucketed dp sync p1");
+  require_allclose(p2.grad(), g2, "bucketed dp sync p2");
+
+  collectives.all_reduce_calls = 0;
+  cverl::distributed::data_parallel_sync_gradients({p0, p1, p2}, collectives, {0}, true, 16);
+  if (collectives.all_reduce_calls <= 1) {
+    throw std::runtime_error("small dp sync bucket should split all_reduce calls");
+  }
+}
+
 void test_single_process_collectives_validation() {
   cverl::distributed::SingleProcessCollectives collectives;
   auto x = torch::ones({2, 2});
@@ -150,6 +238,7 @@ int main() {
     test_single_rank_tp_paths();
     test_parallel_group_validation();
     test_dp_sync_single_process();
+    test_dp_sync_bucketed();
     test_single_process_collectives_validation();
   } catch (const std::exception& e) {
     std::cerr << "test_parallel_ops failed: " << e.what() << "\n";

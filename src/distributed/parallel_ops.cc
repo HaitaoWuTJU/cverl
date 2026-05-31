@@ -1,6 +1,8 @@
 #include "cverl/distributed/parallel_ops.h"
 
+#include <cstddef>
 #include <stdexcept>
+#include <vector>
 
 namespace cverl::distributed {
 namespace {
@@ -17,6 +19,39 @@ void validate_group(const ParallelGroup& group) {
 torch::Tensor dense_linear(const torch::Tensor& input, const torch::Tensor& weight) {
   auto x = input.scalar_type() == weight.scalar_type() ? input : input.to(weight.scalar_type());
   return torch::matmul(x, weight.transpose(0, 1));
+}
+
+int64_t tensor_bytes(const torch::Tensor& tensor) {
+  return tensor.numel() * static_cast<int64_t>(tensor.element_size());
+}
+
+struct GradBucketEntry {
+  torch::Tensor grad;
+  int64_t numel = 0;
+};
+
+void flush_grad_bucket(std::vector<GradBucketEntry>* bucket,
+                       Collectives& collectives,
+                       const std::vector<int64_t>& data_group,
+                       bool average) {
+  if (bucket->empty()) {
+    return;
+  }
+
+  std::vector<torch::Tensor> flat_grads;
+  flat_grads.reserve(bucket->size());
+  for (const auto& entry : *bucket) {
+    flat_grads.push_back(entry.grad.contiguous().view({entry.numel}));
+  }
+  auto flat = torch::cat(flat_grads, 0).contiguous();
+  auto synced = collectives.all_reduce(flat, average ? ReduceOp::Mean : ReduceOp::Sum, data_group).contiguous();
+  int64_t offset = 0;
+  for (const auto& entry : *bucket) {
+    auto shard = synced.narrow(0, offset, entry.numel).view(entry.grad.sizes());
+    entry.grad.copy_(shard);
+    offset += entry.numel;
+  }
+  bucket->clear();
 }
 
 }  // namespace
@@ -87,15 +122,42 @@ torch::Tensor tensor_parallel_mlp_swiglu(const torch::Tensor& input,
 void data_parallel_sync_gradients(const std::vector<torch::Tensor>& parameters,
                                   Collectives& collectives,
                                   const std::vector<int64_t>& data_group,
-                                  bool average) {
+                                  bool average,
+                                  int64_t bucket_bytes) {
+  if (bucket_bytes <= 0) {
+    throw std::invalid_argument("data_parallel_sync_gradients bucket_bytes must be positive");
+  }
+  std::vector<GradBucketEntry> bucket;
+  bucket.reserve(parameters.size());
+  int64_t current_bytes = 0;
+  torch::ScalarType current_dtype = torch::kFloat32;
+  torch::Device current_device(torch::kCPU);
+  bool have_bucket = false;
+
   for (const auto& param : parameters) {
     if (!param.defined() || !param.requires_grad() || !param.grad().defined()) {
       continue;
     }
     auto grad = param.grad();
-    auto synced = collectives.all_reduce(grad.contiguous(), average ? ReduceOp::Mean : ReduceOp::Sum, data_group);
-    grad.copy_(synced);
+    const int64_t grad_bytes = tensor_bytes(grad);
+    const bool incompatible =
+        have_bucket && (grad.scalar_type() != current_dtype || grad.device() != current_device);
+    const bool would_overflow = have_bucket && current_bytes + grad_bytes > bucket_bytes;
+    if (incompatible || would_overflow) {
+      flush_grad_bucket(&bucket, collectives, data_group, average);
+      current_bytes = 0;
+      have_bucket = false;
+    }
+
+    if (!have_bucket) {
+      current_dtype = grad.scalar_type();
+      current_device = grad.device();
+      have_bucket = true;
+    }
+    bucket.push_back(GradBucketEntry{grad, grad.numel()});
+    current_bytes += grad_bytes;
   }
+  flush_grad_bucket(&bucket, collectives, data_group, average);
 }
 
 }  // namespace cverl::distributed

@@ -16,6 +16,7 @@ STEPS="${STEPS:-1}"
 LR="${LR:-1e-8}"
 CLIP_RATIO="${CLIP_RATIO:-0.2}"
 MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
+DP_GRAD_BUCKET_MB="${DP_GRAD_BUCKET_MB:-25}"
 ADVANTAGE_SCALE="${ADVANTAGE_SCALE:-1.0}"
 MASTER_WEIGHTS="${MASTER_WEIGHTS:-false}"
 SKIP_OPTIMIZER_STEP="${SKIP_OPTIMIZER_STEP:-false}"
@@ -72,6 +73,7 @@ for ((rank = 0; rank < WORLD_SIZE; ++rank)); do
       --lr "${LR}" \
       --clip-ratio "${CLIP_RATIO}" \
       --max-grad-norm "${MAX_GRAD_NORM}" \
+      --dp-grad-bucket-mb "${DP_GRAD_BUCKET_MB}" \
       --advantage-scale "${ADVANTAGE_SCALE}" \
       --master-weights "${MASTER_WEIGHTS}" \
       --skip-optimizer-step "${SKIP_OPTIMIZER_STEP}" \

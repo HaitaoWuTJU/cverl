@@ -36,6 +36,7 @@ torch::Tensor tensor_parallel_mlp_swiglu(const torch::Tensor& input,
 void data_parallel_sync_gradients(const std::vector<torch::Tensor>& parameters,
                                   Collectives& collectives,
                                   const std::vector<int64_t>& data_group,
-                                  bool average);
+                                  bool average,
+                                  int64_t bucket_bytes = 25 * 1024 * 1024);
 
 }  // namespace cverl::distributed
