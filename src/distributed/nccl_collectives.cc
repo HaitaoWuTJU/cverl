@@ -7,8 +7,10 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <sstream>
 #include <stdexcept>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 #include <unistd.h>
 
@@ -72,6 +74,63 @@ void require_all_rank_group(const std::vector<int64_t>& group, int64_t world_siz
       throw std::invalid_argument("current NCCL implementation expects group [0..world_size)");
     }
   }
+}
+
+void validate_group(const std::vector<int64_t>& group, int64_t world_size) {
+  if (group.empty()) {
+    throw std::invalid_argument("NCCL group must not be empty");
+  }
+  std::unordered_set<int64_t> seen;
+  seen.reserve(group.size());
+  for (int64_t rank : group) {
+    if (rank < 0 || rank >= world_size) {
+      throw std::invalid_argument("NCCL group rank out of range");
+    }
+    if (!seen.insert(rank).second) {
+      throw std::invalid_argument("NCCL group contains duplicate rank");
+    }
+  }
+}
+
+bool is_full_world_group(const std::vector<int64_t>& group, int64_t world_size) {
+  if (static_cast<int64_t>(group.size()) != world_size) {
+    return false;
+  }
+  for (int64_t i = 0; i < world_size; ++i) {
+    if (group[static_cast<size_t>(i)] != i) {
+      return false;
+    }
+  }
+  return true;
+}
+
+int64_t rank_index_in_group(const std::vector<int64_t>& group, int64_t rank) {
+  for (size_t i = 0; i < group.size(); ++i) {
+    if (group[i] == rank) {
+      return static_cast<int64_t>(i);
+    }
+  }
+  return -1;
+}
+
+std::string group_key(const std::vector<int64_t>& group) {
+  std::ostringstream out;
+  for (size_t i = 0; i < group.size(); ++i) {
+    if (i != 0) {
+      out << ',';
+    }
+    out << group[i];
+  }
+  return out.str();
+}
+
+int subgroup_color(const std::vector<int64_t>& group) {
+  uint64_t h = 1469598103934665603ULL;
+  for (int64_t rank : group) {
+    h ^= static_cast<uint64_t>(rank + 0x9e3779b97f4a7c15ULL);
+    h *= 1099511628211ULL;
+  }
+  return static_cast<int>(h & 0x7fffffff);
 }
 
 void wait_current_stream_before_nccl(cudaStream_t nccl_stream, int device_index) {
@@ -164,6 +223,12 @@ NcclCollectives::~NcclCollectives() {
     }
   }
   pending_ops_.clear();
+  for (auto& item : subgroup_comms_) {
+    if (item.second != nullptr) {
+      (void)ncclCommDestroy(item.second);
+    }
+  }
+  subgroup_comms_.clear();
   if (comm_ != nullptr) {
     (void)ncclCommDestroy(comm_);
   }
@@ -182,6 +247,32 @@ void NcclCollectives::synchronize() {
     }
   }
   pending_ops_.clear();
+}
+
+ncclComm_t NcclCollectives::communicator_for_group(const std::vector<int64_t>& group) {
+  validate_group(group, world_size_);
+  if (is_full_world_group(group, world_size_)) {
+    return comm_;
+  }
+  const int64_t local_index = rank_index_in_group(group, rank_);
+  if (local_index < 0) {
+    throw std::invalid_argument("local NCCL rank is not a member of group");
+  }
+#if defined(NCCL_VERSION_CODE) && NCCL_VERSION_CODE >= 2700
+  const std::string key = group_key(group);
+  auto it = subgroup_comms_.find(key);
+  if (it != subgroup_comms_.end()) {
+    return it->second;
+  }
+  wait_current_stream_before_nccl(stream_, device_index_);
+  ncclComm_t subcomm = nullptr;
+  check_nccl(ncclCommSplit(comm_, subgroup_color(group), static_cast<int>(local_index), &subcomm, nullptr),
+             "ncclCommSplit subgroup");
+  subgroup_comms_.emplace(key, subcomm);
+  return subcomm;
+#else
+  throw std::invalid_argument("NCCL subgroup collectives require ncclCommSplit support");
+#endif
 }
 
 void NcclCollectives::finish_nccl_op(std::vector<torch::Tensor> keep_alive) {
@@ -234,9 +325,10 @@ void NcclCollectives::barrier() {
 torch::Tensor NcclCollectives::broadcast(const torch::Tensor& input,
                                          int64_t root,
                                          const std::vector<int64_t>& group) {
-  require_all_rank_group(group, world_size_);
   require_cuda_contiguous(input, "broadcast input");
-  if (root < 0 || root >= world_size_) {
+  auto comm = communicator_for_group(group);
+  const int64_t root_index = rank_index_in_group(group, root);
+  if (root_index < 0) {
     throw std::invalid_argument("broadcast root out of range");
   }
   auto out = torch::empty_like(input);
@@ -245,19 +337,19 @@ torch::Tensor NcclCollectives::broadcast(const torch::Tensor& input,
     wait_current_stream_before_nccl(stream_, device_index_);
   }
   check_nccl(ncclBroadcast(send_recv, out.data_ptr(), input.numel(), nccl_dtype(input.scalar_type()),
-                           static_cast<int>(root), comm_, stream_),
+                           static_cast<int>(root_index), comm, stream_),
              "ncclBroadcast");
   finish_nccl_op({input, out});
   return out;
 }
 
 torch::Tensor NcclCollectives::all_reduce(const torch::Tensor& input, ReduceOp op, const std::vector<int64_t>& group) {
-  require_all_rank_group(group, world_size_);
   require_cuda_contiguous(input, "all_reduce input");
+  auto comm = communicator_for_group(group);
   auto out = torch::empty_like(input);
   wait_current_stream_before_nccl(stream_, device_index_);
   check_nccl(ncclAllReduce(input.data_ptr(), out.data_ptr(), input.numel(), nccl_dtype(input.scalar_type()),
-                           nccl_reduce_op(op), comm_, stream_),
+                           nccl_reduce_op(op), comm, stream_),
              "ncclAllReduce");
   finish_nccl_op({input, out});
   if (op == ReduceOp::Mean) {
@@ -267,8 +359,8 @@ torch::Tensor NcclCollectives::all_reduce(const torch::Tensor& input, ReduceOp o
 }
 
 torch::Tensor NcclCollectives::all_gather(const torch::Tensor& input, const std::vector<int64_t>& group, int64_t dim) {
-  require_all_rank_group(group, world_size_);
   require_cuda_contiguous(input, "all_gather input");
+  auto comm = communicator_for_group(group);
   if (dim != 0) {
     throw std::invalid_argument("NCCL all_gather currently supports dim=0 only");
   }
@@ -276,7 +368,7 @@ torch::Tensor NcclCollectives::all_gather(const torch::Tensor& input, const std:
   shape[0] *= static_cast<int64_t>(group.size());
   auto out = torch::empty(shape, input.options());
   wait_current_stream_before_nccl(stream_, device_index_);
-  check_nccl(ncclAllGather(input.data_ptr(), out.data_ptr(), input.numel(), nccl_dtype(input.scalar_type()), comm_, stream_),
+  check_nccl(ncclAllGather(input.data_ptr(), out.data_ptr(), input.numel(), nccl_dtype(input.scalar_type()), comm, stream_),
              "ncclAllGather");
   finish_nccl_op({input, out});
   return out;
@@ -286,8 +378,8 @@ torch::Tensor NcclCollectives::reduce_scatter(const torch::Tensor& input,
                                               ReduceOp op,
                                               const std::vector<int64_t>& group,
                                               int64_t dim) {
-  require_all_rank_group(group, world_size_);
   require_cuda_contiguous(input, "reduce_scatter input");
+  auto comm = communicator_for_group(group);
   if (dim != 0 || input.size(0) % static_cast<int64_t>(group.size()) != 0) {
     throw std::invalid_argument("NCCL reduce_scatter currently requires dim=0 evenly divisible by group size");
   }
@@ -296,7 +388,7 @@ torch::Tensor NcclCollectives::reduce_scatter(const torch::Tensor& input,
   auto out = torch::empty(shape, input.options());
   wait_current_stream_before_nccl(stream_, device_index_);
   check_nccl(ncclReduceScatter(input.data_ptr(), out.data_ptr(), out.numel(), nccl_dtype(input.scalar_type()),
-                               nccl_reduce_op(op), comm_, stream_),
+                               nccl_reduce_op(op), comm, stream_),
              "ncclReduceScatter");
   finish_nccl_op({input, out});
   if (op == ReduceOp::Mean) {

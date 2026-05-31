@@ -237,8 +237,9 @@ Current code exposes the distributed shape directly:
   ring-ordered CP causal attention that compute causal softmax over ring KV
   blocks without materializing a `[Q,K]` matrix. The first CUDA backward is a
   correctness-oriented recompute kernel; full industrial CP training still
-  needs tile/shared-memory optimization and subgroup NCCL communicator support
-  so every CP group can use the reduce-scatter path directly.
+  needs tile/shared-memory optimization, while the NCCL backend now caches
+  subgroup communicators with `ncclCommSplit` so CP groups can use the
+  reduce-scatter path directly when the installed NCCL version supports it.
 - `qwen3_5_pp_tp_ppo_trainer`: accepts DP/PP/CP/TP topology dimensions and
   records all four axes in metrics and checkpoint manifests. For `CP>1,TP=1`,
   PP stages now pass local sequence shards, Qwen range forward keeps
@@ -260,6 +261,10 @@ Run the CP/NCCL smoke on a multi-GPU node with:
 ```sh
 WORLD_SIZE=4 CUDA_VISIBLE_DEVICES=0,1,2,3 examples/run_cp_attention_nccl_smoke.sh
 ```
+
+For `WORLD_SIZE>=4`, the NCCL smoke also validates subgroup reduce-scatter,
+which is the communication primitive used by CP ring-exchange backward to
+return K/V gradients to owner ranks without reconstructing full K/V tensors.
 
 CPU regression coverage includes:
 

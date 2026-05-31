@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <nccl.h>
@@ -60,9 +61,11 @@ class NcclCollectives final : public Collectives {
   cudaStream_t stream_ = nullptr;
   bool synchronize_after_collective_ = true;
   std::vector<PendingOp> pending_ops_;
+  std::unordered_map<std::string, ncclComm_t> subgroup_comms_;
 
   void finish_nccl_op(std::vector<torch::Tensor> keep_alive);
   void collect_finished_pending_ops();
+  ncclComm_t communicator_for_group(const std::vector<int64_t>& group);
 };
 
 }  // namespace cverl::distributed

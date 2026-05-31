@@ -198,6 +198,28 @@ int main(int argc, char** argv) {
     require_throws([&]() { (void)comm.reduce_scatter(scatter_in.contiguous(), cverl::distributed::ReduceOp::Sum, group, 1); },
                    "NCCL reduce_scatter should reject dim != 0");
 
+    if (world >= 4 && world % 2 == 0) {
+      std::vector<int64_t> subgroup;
+      const int64_t half = world / 2;
+      const int64_t begin = rank < half ? 0 : half;
+      for (int64_t r = begin; r < begin + half; ++r) {
+        subgroup.push_back(r);
+      }
+      auto subgroup_input = torch::full({half, 2},
+                                        static_cast<float>(rank + 1),
+                                        torch::TensorOptions().device(torch::kCUDA, static_cast<int>(device)).dtype(torch::kFloat32));
+      auto subgroup_scattered =
+          comm.reduce_scatter(subgroup_input, cverl::distributed::ReduceOp::Sum, subgroup, 0);
+      float subgroup_sum = 0.0f;
+      for (int64_t r : subgroup) {
+        subgroup_sum += static_cast<float>(r + 1);
+      }
+      auto expected_subgroup = torch::full({1, 2},
+                                           subgroup_sum,
+                                           torch::TensorOptions().device(torch::kCUDA, static_cast<int>(device)).dtype(torch::kFloat32));
+      require_allclose(subgroup_scattered, expected_subgroup, "NCCL subgroup reduce_scatter mismatch");
+    }
+
     torch::manual_seed(123);
     auto cpu_x = torch::randn({2, 3, 8});
     auto cpu_gate = torch::randn({16, 8});
