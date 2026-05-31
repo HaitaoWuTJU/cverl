@@ -5,6 +5,7 @@
 #include "cverl/model/qwen3_5_text.h"
 
 #include <torch/torch.h>
+#include <torch/nn/functional/conv.h>
 
 #include <cmath>
 #include <filesystem>
@@ -27,8 +28,14 @@ void require(bool cond, const std::string& msg) {
 
 class SendRecvCollectives final : public cverl::distributed::Collectives {
  public:
-  SendRecvCollectives(int64_t rank, int64_t world_size, std::vector<torch::Tensor> responses)
-      : responses_(std::move(responses)), rank_(rank), world_size_(world_size) {}
+  SendRecvCollectives(int64_t rank,
+                      int64_t world_size,
+                      std::vector<torch::Tensor> responses,
+                      std::vector<torch::Tensor> recv_responses = {})
+      : responses_(std::move(responses)),
+        recv_responses_(std::move(recv_responses)),
+        rank_(rank),
+        world_size_(world_size) {}
 
   int64_t rank() const override { return rank_; }
   int64_t world_size() const override { return world_size_; }
@@ -47,8 +54,15 @@ class SendRecvCollectives final : public cverl::distributed::Collectives {
     const int64_t shard = input.size(0) / world_size_;
     return input.narrow(0, rank_ * shard, shard).contiguous();
   }
-  void send(const torch::Tensor&, int64_t) override {}
-  torch::Tensor recv_like(const torch::Tensor& like, int64_t) override { return torch::empty_like(like); }
+  void send(const torch::Tensor&, int64_t) override { ++send_calls_; }
+  torch::Tensor recv_like(const torch::Tensor& like, int64_t) override {
+    if (recv_next_ >= recv_responses_.size()) {
+      throw std::runtime_error("unexpected recv_like in Qwen CP forward test");
+    }
+    auto out = recv_responses_.at(recv_next_++);
+    require(out.sizes() == like.sizes(), "recv_like response shape mismatch");
+    return out;
+  }
   torch::Tensor send_recv(const torch::Tensor&, int64_t, const torch::Tensor& like, int64_t) override {
     if (next_ >= responses_.size()) {
       throw std::runtime_error("unexpected send_recv in Qwen CP forward test");
@@ -59,12 +73,17 @@ class SendRecvCollectives final : public cverl::distributed::Collectives {
   }
 
   int64_t send_recv_calls() const { return static_cast<int64_t>(next_); }
+  int64_t send_calls() const { return send_calls_; }
+  int64_t recv_calls() const { return static_cast<int64_t>(recv_next_); }
 
  private:
   std::vector<torch::Tensor> responses_;
+  std::vector<torch::Tensor> recv_responses_;
   int64_t rank_ = 0;
   int64_t world_size_ = 1;
   size_t next_ = 0;
+  size_t recv_next_ = 0;
+  int64_t send_calls_ = 0;
 };
 
 torch::Tensor dense(const torch::Tensor& x, const torch::Tensor& w) {
@@ -74,6 +93,10 @@ torch::Tensor dense(const torch::Tensor& x, const torch::Tensor& w) {
 torch::Tensor rms_norm(const torch::Tensor& x, const torch::Tensor& w, double eps) {
   auto xf = x.to(torch::kFloat32);
   return (xf * torch::rsqrt((xf * xf).mean(-1, true) + eps) * (1.0 + w.to(torch::kFloat32))).to(x.scalar_type());
+}
+
+torch::Tensor l2norm(const torch::Tensor& x) {
+  return x * torch::rsqrt((x * x).sum(-1, true) + 1e-6);
 }
 
 torch::Tensor rotate_half(const torch::Tensor& x) {
@@ -226,6 +249,56 @@ std::vector<torch::Tensor> remote_linear_attention_messages(const torch::Tensor&
   };
 }
 
+torch::Tensor linear_attention_prefix_state(const torch::Tensor& hidden,
+                                            int64_t prefix_len,
+                                            const std::unordered_map<std::string, torch::Tensor>& weights,
+                                            const cverl::Qwen35TextConfig& cfg) {
+  const std::string p = "model.language_model.layers.0.";
+  auto x = rms_norm(hidden, weights.at(p + "input_layernorm.weight"), cfg.rms_norm_eps);
+  const int64_t b = x.size(0);
+  const int64_t seq = x.size(1);
+  const int64_t kh = cfg.linear_num_key_heads;
+  const int64_t vh = cfg.linear_num_value_heads;
+  const int64_t kd = cfg.linear_key_head_dim;
+  const int64_t vd = cfg.linear_value_head_dim;
+  const int64_t key_dim = kh * kd;
+  const int64_t value_dim = vh * vd;
+  const int64_t conv_dim = key_dim * 2 + value_dim;
+
+  auto mixed = dense(x, weights.at(p + "linear_attn.in_proj_qkv.weight")).transpose(1, 2);
+  auto conv_opts = torch::nn::functional::Conv1dFuncOptions().padding(cfg.linear_conv_kernel_dim - 1).groups(conv_dim);
+  mixed = torch::nn::functional::conv1d(mixed, weights.at(p + "linear_attn.conv1d.weight"), conv_opts);
+  mixed = torch::silu(mixed.index({torch::indexing::Slice(), torch::indexing::Slice(), torch::indexing::Slice(0, seq)}))
+              .transpose(1, 2);
+  auto qkv = mixed.split({key_dim, key_dim, value_dim}, -1);
+  auto key = qkv[1].reshape({b, seq, kh, kd});
+  auto value = qkv[2].reshape({b, seq, vh, vd});
+  auto beta = torch::sigmoid(dense(x, weights.at(p + "linear_attn.in_proj_b.weight")));
+  auto a = dense(x, weights.at(p + "linear_attn.in_proj_a.weight"));
+  auto g = -torch::exp(weights.at(p + "linear_attn.A_log")) *
+           torch::softplus(a + weights.at(p + "linear_attn.dt_bias"));
+  if (vh / kh > 1) {
+    key = key.repeat_interleave(vh / kh, 2);
+  }
+  key = l2norm(key).transpose(1, 2).contiguous().to(torch::kFloat32);
+  value = value.transpose(1, 2).contiguous().to(torch::kFloat32);
+  beta = beta.transpose(1, 2).contiguous().to(torch::kFloat32);
+  g = g.transpose(1, 2).contiguous().to(torch::kFloat32);
+
+  auto state = torch::zeros({b, vh, kd, vd}, torch::kFloat32);
+  for (int64_t t = 0; t < prefix_len; ++t) {
+    auto kt = key.index({torch::indexing::Slice(), torch::indexing::Slice(), t});
+    auto vt = value.index({torch::indexing::Slice(), torch::indexing::Slice(), t});
+    auto gt = torch::exp(g.index({torch::indexing::Slice(), torch::indexing::Slice(), t})).unsqueeze(-1).unsqueeze(-1);
+    auto bt = beta.index({torch::indexing::Slice(), torch::indexing::Slice(), t}).unsqueeze(-1);
+    state = state * gt;
+    auto kv_mem = (state * kt.unsqueeze(-1)).sum(-2);
+    auto delta = (vt - kv_mem) * bt;
+    state = state + kt.unsqueeze(-1) * delta.unsqueeze(-2);
+  }
+  return state.contiguous();
+}
+
 void run_full_attention_case() {
   auto dir = make_model_dir("full_attention");
   cverl::HfModelLoader loader(dir.string());
@@ -298,7 +371,9 @@ void run_linear_attention_case() {
   auto shard0_grad = shard0.detach().clone().set_requires_grad(true);
   auto out0 = model.forward_hidden_range_context_parallel(shard0_grad, 0, 1, rank0_group, 4, false);
 
-  SendRecvCollectives rank1_collectives(1, 2, remote_linear_attention_messages(shard0, weights, model.config()));
+  auto rank1_initial_state = linear_attention_prefix_state(hidden, 2, weights, model.config());
+  SendRecvCollectives rank1_collectives(
+      1, 2, remote_linear_attention_messages(shard0, weights, model.config()), {rank1_initial_state});
   cverl::distributed::ParallelGroup rank1_group{9, 2, {8, 9}, &rank1_collectives};
   auto shard1_grad = shard1.detach().clone().set_requires_grad(true);
   auto out1 = model.forward_hidden_range_context_parallel(shard1_grad, 0, 1, rank1_group, 4, false);
@@ -307,6 +382,10 @@ void run_linear_attention_case() {
           "Qwen CP linear-attention rank0 forward shard must match dense slice");
   require(torch::allclose(out1, dense.narrow(1, 2, 2), 1.0e-5, 1.0e-5),
           "Qwen CP linear-attention rank1 forward shard must match dense slice");
+  require(rank0_collectives.send_calls() == 1 && rank0_collectives.recv_calls() == 0,
+          "Qwen CP linear-attention rank0 should send final recurrent state");
+  require(rank1_collectives.send_calls() == 0 && rank1_collectives.recv_calls() == 1,
+          "Qwen CP linear-attention rank1 should receive initial recurrent state");
   auto grad0 = torch::randn_like(out0);
   auto grad1 = torch::randn_like(out1);
   auto dense_hidden0 = hidden.detach().clone().set_requires_grad(true);

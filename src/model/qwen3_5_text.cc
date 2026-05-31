@@ -418,6 +418,26 @@ std::tuple<torch::Tensor, torch::Tensor> linear_attention_recurrent_with_state(c
   return linear_attention_chunked_recurrent_with_state(query, key, value, beta, g, initial_state, kd, vd);
 }
 
+torch::Tensor linear_attention_context_initial_state(const torch::Tensor& state_like,
+                                                     const distributed::ParallelGroup& context_group,
+                                                     int64_t context_rank) {
+  if (context_rank == 0) {
+    return torch::Tensor();
+  }
+  const int64_t prev_peer = context_group.ranks.at(static_cast<size_t>(context_rank - 1));
+  return context_group.collectives->recv_like(state_like.contiguous(), prev_peer).contiguous();
+}
+
+void linear_attention_send_final_state(const torch::Tensor& final_state,
+                                       const distributed::ParallelGroup& context_group,
+                                       int64_t context_rank) {
+  if (context_rank + 1 >= context_group.world_size) {
+    return;
+  }
+  const int64_t next_peer = context_group.ranks.at(static_cast<size_t>(context_rank + 1));
+  context_group.collectives->send(final_state.contiguous(), next_peer);
+}
+
 std::string layer_prefix(int64_t layer_idx) {
   return "model.language_model.layers." + std::to_string(layer_idx) + ".";
 }
@@ -870,33 +890,24 @@ torch::Tensor Qwen35TextModel::linear_attention_context_parallel(const torch::Te
   beta = beta.transpose(1, 2).contiguous().to(torch::kFloat32);
   g = g.transpose(1, 2).contiguous().to(torch::kFloat32);
 
-  const auto range = distributed::context_parallel_sequence_range(
-      original_sequence_length, context_rank, context_group.world_size);
-  torch::Tensor initial_state;
-  if (range.begin > 0) {
-    initial_state = std::get<1>(linear_attention_recurrent_with_state(query.narrow(2, 0, range.begin).contiguous(),
-                                                                      key.narrow(2, 0, range.begin).contiguous(),
-                                                                      value.narrow(2, 0, range.begin).contiguous(),
-                                                                      beta.narrow(2, 0, range.begin).contiguous(),
-                                                                      g.narrow(2, 0, range.begin).contiguous(),
-                                                                      torch::Tensor(),
-                                                                      kd,
-                                                                      vd));
-  }
   auto query_local = distributed::context_parallel_slice_padded(query, context_rank, context_group.world_size, 2, 0.0);
   auto key_local = distributed::context_parallel_slice_padded(key, context_rank, context_group.world_size, 2, 0.0);
   auto value_local = distributed::context_parallel_slice_padded(value, context_rank, context_group.world_size, 2, 0.0);
   auto beta_local_scan =
       distributed::context_parallel_slice_padded(beta, context_rank, context_group.world_size, 2, 0.0);
   auto g_local = distributed::context_parallel_slice_padded(g, context_rank, context_group.world_size, 2, 0.0);
-  auto core_local = std::get<0>(linear_attention_recurrent_with_state(query_local.contiguous(),
-                                                                      key_local.contiguous(),
-                                                                      value_local.contiguous(),
-                                                                      beta_local_scan.contiguous(),
-                                                                      g_local.contiguous(),
-                                                                      initial_state,
-                                                                      kd,
-                                                                      vd))
+  auto state_like = torch::empty({bsz, vh, kd, vd}, torch::TensorOptions().dtype(torch::kFloat32).device(x.device()));
+  auto initial_state = linear_attention_context_initial_state(state_like, context_group, context_rank);
+  auto scan = linear_attention_recurrent_with_state(query_local.contiguous(),
+                                                    key_local.contiguous(),
+                                                    value_local.contiguous(),
+                                                    beta_local_scan.contiguous(),
+                                                    g_local.contiguous(),
+                                                    initial_state,
+                                                    kd,
+                                                    vd);
+  linear_attention_send_final_state(std::get<1>(scan), context_group, context_rank);
+  auto core_local = std::get<0>(scan)
                         .transpose(1, 2)
                         .contiguous()
                         .reshape({bsz * seq_local * vh, vd});
