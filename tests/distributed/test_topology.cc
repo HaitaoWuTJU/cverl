@@ -49,15 +49,29 @@ void require_throws(Fn&& fn, const char* msg) {
 class PrecomputedAllGatherCollectives final : public cverl::distributed::Collectives {
  public:
   explicit PrecomputedAllGatherCollectives(std::vector<torch::Tensor> parts) {
+    world_size_ = static_cast<int64_t>(parts.size());
     responses_.push_back(std::move(parts));
   }
 
   explicit PrecomputedAllGatherCollectives(std::vector<std::vector<torch::Tensor>> responses)
-      : responses_(std::move(responses)) {}
+      : responses_(std::move(responses)) {
+    if (!responses_.empty()) {
+      world_size_ = static_cast<int64_t>(responses_.front().size());
+    }
+  }
+
+  PrecomputedAllGatherCollectives(std::vector<std::vector<torch::Tensor>> responses,
+                                  std::vector<torch::Tensor> send_recv_responses,
+                                  int64_t world_size = 2)
+      : responses_(std::move(responses)), send_recv_responses_(std::move(send_recv_responses)), world_size_(world_size) {
+    if (!responses_.empty()) {
+      world_size_ = static_cast<int64_t>(responses_.front().size());
+    }
+  }
 
   int64_t rank() const override { return 0; }
   int64_t world_size() const override {
-    return responses_.empty() ? 0 : static_cast<int64_t>(responses_.front().size());
+    return world_size_;
   }
   void barrier() override {}
 
@@ -86,18 +100,34 @@ class PrecomputedAllGatherCollectives final : public cverl::distributed::Collect
                                const std::vector<int64_t>& /*group*/,
                                int64_t dim) override {
     if (dim != 0 || responses_.empty()) {
-      return input;
+      if (dim != 0 || world_size_ <= 1) {
+        return input;
+      }
+      return input.narrow(0, 0, input.size(0) / world_size_).contiguous();
     }
-    const int64_t world = static_cast<int64_t>(responses_.front().size());
-    return input.narrow(0, 0, input.size(0) / world).contiguous();
+    return input.narrow(0, 0, input.size(0) / world_size_).contiguous();
   }
 
   void send(const torch::Tensor& /*input*/, int64_t /*peer*/) override {}
   torch::Tensor recv_like(const torch::Tensor& like, int64_t /*peer*/) override { return torch::empty_like(like); }
+  torch::Tensor send_recv(const torch::Tensor& /*input*/,
+                          int64_t /*send_peer*/,
+                          const torch::Tensor& like,
+                          int64_t /*recv_peer*/) override {
+    if (send_recv_responses_.empty()) {
+      return torch::empty_like(like);
+    }
+    const size_t index = std::min(send_recv_call_count_, send_recv_responses_.size() - 1);
+    ++send_recv_call_count_;
+    return send_recv_responses_.at(index);
+  }
 
  private:
   std::vector<std::vector<torch::Tensor>> responses_;
+  std::vector<torch::Tensor> send_recv_responses_;
+  int64_t world_size_ = 0;
   size_t call_count_ = 0;
+  size_t send_recv_call_count_ = 0;
 };
 
 cverl::distributed::ClusterSpec make_spec() {
@@ -428,6 +458,15 @@ void test_context_parallel_causal_attention() {
               torch::allclose(stream_v1.grad(), stream_dense_v.grad().narrow(2, 3, 3), 1.0e-5, 1.0e-5),
           "CP streaming value block 1 gradient matches dense");
 
+  auto ring_x0 = k.narrow(2, 0, 3).contiguous().set_requires_grad(true);
+  PrecomputedAllGatherCollectives ring_exchange_collectives({}, {k.narrow(2, 3, 3).transpose(0, 2).contiguous()});
+  auto ring_exchanged =
+      cverl::distributed::context_parallel_ring_exchange_autograd(ring_x0, ring_exchange_collectives, {0, 1}, 0, 2);
+  require(torch::allclose(ring_exchanged, k, 1.0e-5, 1.0e-5), "CP ring exchange forward order");
+  ring_exchanged.sum().backward();
+  require(ring_x0.grad().defined() && torch::allclose(ring_x0.grad(), torch::ones_like(ring_x0), 1.0e-5, 1.0e-5),
+          "CP ring exchange backward returns owner gradient");
+
   auto dense_q = q.detach().clone().set_requires_grad(true);
   auto dense_k = k.detach().clone().set_requires_grad(true);
   auto dense_v = v.detach().clone().set_requires_grad(true);
@@ -456,6 +495,26 @@ void test_context_parallel_causal_attention() {
       q0, k0, v0, ring_collectives, {0, 1}, 0, 6, scale);
   require(torch::allclose(ring_gathered, dense.narrow(2, 0, 3), 1.0e-5, 1.0e-5),
           "CP ring-order gathered KV causal attention");
+  auto q0_exchange = q.narrow(2, 0, 3).contiguous().set_requires_grad(true);
+  auto k0_exchange = k.narrow(2, 0, 3).contiguous().set_requires_grad(true);
+  auto v0_exchange = v.narrow(2, 0, 3).contiguous().set_requires_grad(true);
+  PrecomputedAllGatherCollectives attention_exchange_collectives(
+      {},
+      {k1.transpose(0, 2).contiguous(), v1.transpose(0, 2).contiguous()});
+  auto ring_exchanged_attention = cverl::distributed::context_parallel_causal_attention_ring_exchange_kv(
+      q0_exchange, k0_exchange, v0_exchange, attention_exchange_collectives, {0, 1}, 0, 6, scale);
+  require(torch::allclose(ring_exchanged_attention, dense.narrow(2, 0, 3), 1.0e-5, 1.0e-5),
+          "CP ring-exchange KV causal attention");
+  ring_exchanged_attention.sum().backward();
+  require(q0_exchange.grad().defined() &&
+              torch::allclose(q0_exchange.grad(), dense_q.grad().narrow(2, 0, 3), 1.0e-5, 1.0e-5),
+          "CP ring-exchange query gradient matches dense");
+  require(k0_exchange.grad().defined() &&
+              torch::allclose(k0_exchange.grad(), dense_k.grad().narrow(2, 0, 3), 1.0e-5, 1.0e-5),
+          "CP ring-exchange key gradient matches dense");
+  require(v0_exchange.grad().defined() &&
+              torch::allclose(v0_exchange.grad(), dense_v.grad().narrow(2, 0, 3), 1.0e-5, 1.0e-5),
+          "CP ring-exchange value gradient matches dense");
   gathered.sum().backward();
   require(q0.grad().defined() && torch::allclose(q0.grad(), dense_q.grad().narrow(2, 0, 3), 1.0e-5, 1.0e-5),
           "CP gathered KV query gradient matches dense local-output gradient");

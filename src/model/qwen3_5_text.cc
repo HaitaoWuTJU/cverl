@@ -613,7 +613,7 @@ torch::Tensor Qwen35TextModel::full_attention_context_parallel(const torch::Tens
 
   k = repeat_kv(k, h / kvh).contiguous();
   v = repeat_kv(v, h / kvh).contiguous();
-  auto context_out = distributed::context_parallel_causal_attention_ring_gather_kv(
+  auto context_out = distributed::context_parallel_causal_attention_ring_exchange_kv(
       q.contiguous(),
       k,
       v,

@@ -92,6 +92,71 @@ class ContextParallelGatherFunction final
   }
 };
 
+class ContextParallelRingExchangeFunction final
+    : public torch::autograd::Function<ContextParallelRingExchangeFunction> {
+ public:
+  static torch::Tensor forward(torch::autograd::AutogradContext* ctx,
+                               torch::Tensor local,
+                               torch::Tensor group_tensor,
+                               int64_t collectives_addr,
+                               int64_t context_rank,
+                               int64_t sequence_dim) {
+    auto* collectives = reinterpret_cast<Collectives*>(static_cast<uintptr_t>(collectives_addr));
+    if (collectives == nullptr) {
+      throw std::invalid_argument("context_parallel_ring_exchange_autograd requires collectives");
+    }
+    const auto group = group_vector_from_tensor(group_tensor);
+    validate_context_rank(context_rank, static_cast<int64_t>(group.size()));
+    const int64_t dim = normalize_sequence_dim(local, sequence_dim);
+    auto current = dim == 0 ? local.contiguous() : local.transpose(0, dim).contiguous();
+    const auto schedule = context_parallel_ring_schedule(group, group.at(static_cast<size_t>(context_rank)));
+    std::vector<torch::Tensor> blocks;
+    blocks.reserve(schedule.size());
+    for (size_t i = 0; i < schedule.size(); ++i) {
+      blocks.push_back(current);
+      if (i + 1 < schedule.size()) {
+        current = collectives->send_recv(current.contiguous(), schedule[i].send_rank, current, schedule[i].recv_rank)
+                      .contiguous();
+      }
+    }
+    ctx->saved_data["collectives_addr"] = collectives_addr;
+    ctx->saved_data["context_rank"] = context_rank;
+    ctx->saved_data["sequence_dim"] = dim;
+    ctx->saved_data["local_shard"] = current.size(0);
+    ctx->save_for_backward({group_tensor});
+    auto gathered = torch::cat(blocks, 0).contiguous();
+    return dim == 0 ? gathered : gathered.transpose(0, dim).contiguous();
+  }
+
+  static torch::autograd::tensor_list backward(torch::autograd::AutogradContext* ctx,
+                                               torch::autograd::tensor_list grad_outputs) {
+    auto saved = ctx->get_saved_variables();
+    auto* collectives =
+        reinterpret_cast<Collectives*>(static_cast<uintptr_t>(ctx->saved_data["collectives_addr"].toInt()));
+    const int64_t context_rank = ctx->saved_data["context_rank"].toInt();
+    const int64_t dim = ctx->saved_data["sequence_dim"].toInt();
+    const int64_t shard = ctx->saved_data["local_shard"].toInt();
+    const auto group = group_vector_from_tensor(saved.at(0));
+    auto grad = grad_outputs.at(0).contiguous();
+    auto moved = dim == 0 ? grad : grad.transpose(0, dim).contiguous();
+    const auto schedule = context_parallel_ring_schedule(group, group.at(static_cast<size_t>(context_rank)));
+    if (moved.size(0) != shard * static_cast<int64_t>(schedule.size())) {
+      throw std::invalid_argument("ring exchange gradient shape does not match saved schedule");
+    }
+    std::vector<torch::Tensor> rank_order(static_cast<size_t>(group.size()));
+    for (size_t i = 0; i < schedule.size(); ++i) {
+      const int64_t rank_index = context_parallel_group_index(group, schedule[i].kv_rank);
+      rank_order[static_cast<size_t>(rank_index)] = moved.narrow(0, static_cast<int64_t>(i) * shard, shard);
+    }
+    auto rank_order_grad = torch::cat(rank_order, 0).contiguous();
+    auto local = collectives->reduce_scatter(rank_order_grad, ReduceOp::Sum, group, 0).contiguous();
+    if (dim != 0) {
+      local = local.transpose(0, dim).contiguous();
+    }
+    return {local, torch::Tensor(), torch::Tensor(), torch::Tensor(), torch::Tensor()};
+  }
+};
+
 }  // namespace
 
 int64_t context_parallel_padded_length(int64_t sequence_length, int64_t context_parallel) {
@@ -182,6 +247,21 @@ torch::Tensor context_parallel_gather_autograd(const torch::Tensor& local,
   auto group_tensor = group_tensor_from_vector(context_group);
   const auto collectives_addr = static_cast<int64_t>(reinterpret_cast<uintptr_t>(&collectives));
   return ContextParallelGatherFunction::apply(local, group_tensor, collectives_addr, dim);
+}
+
+torch::Tensor context_parallel_ring_exchange_autograd(const torch::Tensor& local,
+                                                      Collectives& collectives,
+                                                      const std::vector<int64_t>& context_group,
+                                                      int64_t context_rank,
+                                                      int64_t sequence_dim) {
+  validate_context_rank(context_rank, static_cast<int64_t>(context_group.size()));
+  if (context_group.size() <= 1) {
+    return local;
+  }
+  const int64_t dim = normalize_sequence_dim(local, sequence_dim);
+  auto group_tensor = group_tensor_from_vector(context_group);
+  const auto collectives_addr = static_cast<int64_t>(reinterpret_cast<uintptr_t>(&collectives));
+  return ContextParallelRingExchangeFunction::apply(local, group_tensor, collectives_addr, context_rank, dim);
 }
 
 torch::Tensor context_parallel_gather_padded(const torch::Tensor& local,
@@ -429,6 +509,49 @@ torch::Tensor context_parallel_causal_attention_ring_gather_kv(const torch::Tens
     const int64_t block = std::min<int64_t>(shard, key_global.size(2) - begin);
     key_blocks.push_back(key_global.narrow(2, begin, block).contiguous());
     value_blocks.push_back(value_global.narrow(2, begin, block).contiguous());
+    key_begin_positions.push_back(begin);
+  }
+  return context_parallel_causal_attention_streaming_blocks(
+      query_local, key_blocks, value_blocks, key_begin_positions, context_rank * shard, original_sequence_length, scale);
+}
+
+torch::Tensor context_parallel_causal_attention_ring_exchange_kv(const torch::Tensor& query_local,
+                                                                 const torch::Tensor& key_local,
+                                                                 const torch::Tensor& value_local,
+                                                                 Collectives& collectives,
+                                                                 const std::vector<int64_t>& context_group,
+                                                                 int64_t context_rank,
+                                                                 int64_t original_sequence_length,
+                                                                 double scale) {
+  require_attention_tensor(query_local, "query_local");
+  require_attention_tensor(key_local, "key_local");
+  require_attention_tensor(value_local, "value_local");
+  validate_context_rank(context_rank, static_cast<int64_t>(context_group.size()));
+  const int64_t shard = query_local.size(2);
+  if (key_local.size(2) != shard || value_local.size(2) != shard) {
+    throw std::invalid_argument("query/key/value local CP shards must have matching sequence length");
+  }
+  auto key_ring =
+      context_parallel_ring_exchange_autograd(key_local.contiguous(), collectives, context_group, context_rank, 2)
+          .contiguous();
+  auto value_ring =
+      context_parallel_ring_exchange_autograd(value_local.contiguous(), collectives, context_group, context_rank, 2)
+          .contiguous();
+  const auto schedule = context_parallel_ring_schedule(context_group, context_group.at(static_cast<size_t>(context_rank)));
+  std::vector<torch::Tensor> key_blocks;
+  std::vector<torch::Tensor> value_blocks;
+  std::vector<int64_t> key_begin_positions;
+  key_blocks.reserve(schedule.size());
+  value_blocks.reserve(schedule.size());
+  key_begin_positions.reserve(schedule.size());
+  for (size_t i = 0; i < schedule.size(); ++i) {
+    const int64_t rank_index = context_parallel_group_index(context_group, schedule[i].kv_rank);
+    const int64_t begin = rank_index * shard;
+    if (begin >= original_sequence_length) {
+      continue;
+    }
+    key_blocks.push_back(key_ring.narrow(2, static_cast<int64_t>(i) * shard, shard).contiguous());
+    value_blocks.push_back(value_ring.narrow(2, static_cast<int64_t>(i) * shard, shard).contiguous());
     key_begin_positions.push_back(begin);
   }
   return context_parallel_causal_attention_streaming_blocks(

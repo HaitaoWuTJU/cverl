@@ -224,20 +224,17 @@ Current code exposes the distributed shape directly:
   uses FlashAttention-style streaming over KV blocks, maintaining row max,
   row sum, and value accumulator instead of materializing the full `[Q,K]`
   score/probability matrix. Qwen CP full attention consumes blocks in the
-  same order as the CP ring schedule; the current implementation still obtains
-  those blocks from autograd all-gather. The NCCL backend now exposes grouped
-  `send_recv`, so the next CP attention step can replace the block source with
-  deadlock-free ring exchange while preserving the streaming math.
-  The NCCL smoke test runs this path on GPU ranks. The current differentiable
-  gather uses all-gather in forward and reduce-scatter in backward, so local
-  K/V owners receive gradients. Full industrial CP training still needs a
-  ring-attention/FlashAttention-style kernel that avoids materializing global
-  KV and returns K/V gradients through ring exchange.
+  same order as the CP ring schedule. The current ring-exchange path obtains
+  those blocks through grouped `send_recv` and has an autograd wrapper that
+  reorders ring-layout gradients back to rank order before reducing them to
+  K/V owner ranks. Full industrial CP training still needs a fused CUDA
+  ring-attention kernel and a ring reduce-scatter backward to replace the
+  remaining high-level tensor ops and reduce-scatter fallback.
 - `qwen3_5_pp_tp_ppo_trainer`: accepts DP/PP/CP/TP topology dimensions and
   records all four axes in metrics and checkpoint manifests. For `CP>1,TP=1`,
   PP stages now pass local sequence shards, Qwen range forward keeps
-  RMSNorm/MLP/projections local, full attention runs local-Q plus ring-order
-  differentiable CP K/V blocks, and the final PPO logprob slice gathers hidden
+  RMSNorm/MLP/projections local, full attention runs local-Q plus differentiable
+  CP ring-exchanged K/V blocks, and the final PPO logprob slice gathers hidden
   with autograd so gradients reduce-scatter back to owner shards. `TP>1` with
   `CP>1` is intentionally rejected until TP-sharded CP attention and MLP are
   fused into one Megatron-style execution path.

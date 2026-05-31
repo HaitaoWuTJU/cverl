@@ -47,6 +47,12 @@ torch::Tensor context_parallel_gather_autograd(const torch::Tensor& local,
                                                const std::vector<int64_t>& context_group,
                                                int64_t sequence_dim);
 
+torch::Tensor context_parallel_ring_exchange_autograd(const torch::Tensor& local,
+                                                      Collectives& collectives,
+                                                      const std::vector<int64_t>& context_group,
+                                                      int64_t context_rank,
+                                                      int64_t sequence_dim);
+
 torch::Tensor context_parallel_gather_padded(const torch::Tensor& local,
                                              Collectives& collectives,
                                              const std::vector<int64_t>& context_group,
@@ -90,5 +96,14 @@ torch::Tensor context_parallel_causal_attention_ring_gather_kv(const torch::Tens
                                                                int64_t context_rank,
                                                                int64_t original_sequence_length,
                                                                double scale);
+
+torch::Tensor context_parallel_causal_attention_ring_exchange_kv(const torch::Tensor& query_local,
+                                                                 const torch::Tensor& key_local,
+                                                                 const torch::Tensor& value_local,
+                                                                 Collectives& collectives,
+                                                                 const std::vector<int64_t>& context_group,
+                                                                 int64_t context_rank,
+                                                                 int64_t original_sequence_length,
+                                                                 double scale);
 
 }  // namespace cverl::distributed
