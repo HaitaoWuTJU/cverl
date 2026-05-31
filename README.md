@@ -326,7 +326,8 @@ Implemented pieces:
 - Qwen3.5 RMSNorm weight convention
 - linear attention via LibTorch depthwise `conv1d` and recurrent gated delta rule
 - CUDA linear attention for `kd=128, vd=128`; forward is tiled over the value
-  dimension and backward can recompute or use recurrent-state checkpoints
+  dimension and backward can recompute, use recurrent-state checkpoints, or
+  replay each checkpoint chunk once with a temporary state cache
 - full attention with grouped KV heads, causal masking, RoPE, q/k norm, and output gate
 - SwiGLU MLP
 - final norm
@@ -347,6 +348,7 @@ CVERL_LINEAR_ATTN_VALUE_TILE=32     # forward tile over vd; lower values reduce 
 CVERL_LINEAR_ATTN_STATE_MODE=chunk  # none|recompute|full|chunk|checkpoint
 CVERL_LINEAR_ATTN_CHECKPOINT_INTERVAL=16
 CVERL_LINEAR_ATTN_CHECKPOINT_MAX_BYTES_MB=256  # optional per-layer checkpoint budget
+CVERL_LINEAR_ATTN_CHUNK_REPLAY_BACKWARD=1      # opt-in faster checkpointed backward
 CVERL_LINEAR_ATTN_SAVE_STATES=0     # default: chunk checkpoints to reduce activation memory
 CVERL_LINEAR_ATTN_SAVE_STATES=1     # debug/comparison: save every recurrent state
 ```

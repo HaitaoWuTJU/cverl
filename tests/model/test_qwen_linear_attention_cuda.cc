@@ -1,5 +1,6 @@
 #include "cverl/model/qwen_linear_attention_cuda.h"
 
+#include <cstdlib>
 #include <cmath>
 #include <iostream>
 #include <stdexcept>
@@ -65,6 +66,10 @@ int main() {
       grad_out, q, k, v, beta, g);
   auto checkpointed_grads = cverl::qwen_linear_attention_cuda_backward_checkpointed(
       grad_out, q, k, v, beta, g, std::get<1>(checkpointed_forward), 2);
+  setenv("CVERL_LINEAR_ATTN_CHUNK_REPLAY_BACKWARD", "1", 1);
+  auto chunk_replay_grads = cverl::qwen_linear_attention_cuda_backward_checkpointed(
+      grad_out, q, k, v, beta, g, std::get<1>(checkpointed_forward), 2);
+  unsetenv("CVERL_LINEAR_ATTN_CHUNK_REPLAY_BACKWARD");
 
   require_close(recompute_grads[0].cpu(), saved_grads[0].cpu(), 5e-4, 5e-4, "dq");
   require_close(recompute_grads[1].cpu(), saved_grads[1].cpu(), 5e-4, 5e-4, "dk");
@@ -76,6 +81,11 @@ int main() {
   require_close(checkpointed_grads[2].cpu(), saved_grads[2].cpu(), 5e-4, 5e-4, "checkpointed dv");
   require_close(checkpointed_grads[3].cpu(), saved_grads[3].cpu(), 5e-4, 5e-4, "checkpointed dbeta");
   require_close(checkpointed_grads[4].cpu(), saved_grads[4].cpu(), 5e-4, 5e-4, "checkpointed dg");
+  require_close(chunk_replay_grads[0].cpu(), saved_grads[0].cpu(), 5e-4, 5e-4, "chunk replay dq");
+  require_close(chunk_replay_grads[1].cpu(), saved_grads[1].cpu(), 5e-4, 5e-4, "chunk replay dk");
+  require_close(chunk_replay_grads[2].cpu(), saved_grads[2].cpu(), 5e-4, 5e-4, "chunk replay dv");
+  require_close(chunk_replay_grads[3].cpu(), saved_grads[3].cpu(), 5e-4, 5e-4, "chunk replay dbeta");
+  require_close(chunk_replay_grads[4].cpu(), saved_grads[4].cpu(), 5e-4, 5e-4, "chunk replay dg");
 
   std::cout << "test_qwen_linear_attention_cuda passed\n";
   return 0;
