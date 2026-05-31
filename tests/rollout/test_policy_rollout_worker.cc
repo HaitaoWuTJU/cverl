@@ -17,6 +17,35 @@ void require(bool cond, const std::string& msg) {
   }
 }
 
+class DeterministicEosPolicy final : public cverl::torch_backend::CausalLmPolicy {
+ public:
+  torch::Tensor forward(const torch::Tensor& prompt_ids,
+                        const torch::Tensor& response_ids) override {
+    (void)prompt_ids;
+    const int64_t batch = response_ids.size(0);
+    const int64_t response_len = response_ids.size(1);
+    auto logits = torch::full({batch, response_len, vocab_size()}, -1000.0f,
+                              response_ids.options().dtype(torch::kFloat32));
+    for (int64_t row = 0; row < batch; ++row) {
+      const int64_t token = (row == 0) ? eos_id_ : normal_id_;
+      logits.index_put_({row, torch::indexing::Slice(), token}, 1000.0f);
+    }
+    return logits;
+  }
+
+  int64_t vocab_size() const override { return 8; }
+  int32_t pad_id() const override { return pad_id_; }
+
+  std::shared_ptr<cverl::torch_backend::CausalLmPolicy> clone_as_reference() const override {
+    return std::make_shared<DeterministicEosPolicy>(*this);
+  }
+
+ private:
+  static constexpr int32_t pad_id_ = 0;
+  static constexpr int64_t eos_id_ = 2;
+  static constexpr int64_t normal_id_ = 3;
+};
+
 }  // namespace
 
 int main() {
@@ -42,6 +71,25 @@ int main() {
       require(torch::all(out.lengths == 4).item<bool>(), "tiny lengths without eos");
       require(out.token_ids.device().is_cpu(), "tiny tokens stay on CPU");
       require(out.logprobs.device().is_cpu(), "tiny logprobs stay on CPU");
+    }
+    {
+      auto policy = std::make_shared<DeterministicEosPolicy>();
+      cverl::rollout::PolicyRolloutWorker worker(policy);
+
+      cverl::rollout::TokenBatch prompts;
+      prompts.token_ids = torch::tensor({{1, 2}, {3, 4}}, torch::kLong);
+      cverl::rollout::GenerationConfig config;
+      config.max_new_tokens = 3;
+      config.temperature = 0.0;
+      config.eos_token_id = 2;
+      auto out = worker.generate(prompts, config);
+
+      require(torch::equal(out.token_ids.cpu(), torch::tensor({{2, 0, 0}, {3, 3, 3}}, torch::kLong)),
+              "eos leaves inactive token slots padded");
+      require(torch::equal(out.lengths.cpu(), torch::tensor({1, 3}, torch::kLong)),
+              "eos lengths count emitted eos and active non-eos tokens");
+      require(torch::all(out.logprobs[0].slice(/*dim=*/0, /*start=*/1) == 0).item<bool>(),
+              "eos leaves inactive logprob slots zero");
     }
 
     std::string model_dir;

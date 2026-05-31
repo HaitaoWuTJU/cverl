@@ -103,10 +103,10 @@ GenerationOutput PolicyRolloutWorker::generate(const TokenBatch& prompts,
                          .squeeze(1);
 
     active = torch::logical_not(finished);
-    auto emitted = torch::where(active, next, torch::full_like(next, pad_id));
-    auto emitted_log_probs = torch::where(active, log_probs, torch::zeros_like(log_probs));
-    token_ids.select(/*dim=*/1, step).copy_(emitted);
-    logprob_ids.select(/*dim=*/1, step).copy_(emitted_log_probs);
+    auto token_column = token_ids.select(/*dim=*/1, step);
+    auto logprob_column = logprob_ids.select(/*dim=*/1, step);
+    token_column.masked_scatter_(active, next.masked_select(active));
+    logprob_column.masked_scatter_(active, log_probs.masked_select(active));
     lengths = lengths + active.to(torch::kLong);
 
     if (config.eos_token_id >= 0) {
