@@ -154,6 +154,10 @@ The runtime config separates memory decisions from model code:
   parameter copy. Resume reconstructs local parameters with DP all-gather.
   `--flat-checkpoint-save-model-params true` keeps the older debug-friendly
   full-parameter rank checkpoint format.
+- PP/TP trainer checkpoint manifests record the training policy that changes
+  numerical behavior or restore compatibility: model dtype, DP/TP gradient
+  communication dtype, bucket sizes, micro-batch/sequence shape, PPO loss
+  settings, and optimizer sharding/master-weight mode.
 - CPU offload is available as a policy switch, not a default. It saves memory
   but usually costs throughput.
 

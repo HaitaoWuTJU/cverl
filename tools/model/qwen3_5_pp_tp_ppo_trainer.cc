@@ -769,6 +769,7 @@ void write_checkpoint_manifest(const std::string& checkpoint_dir,
                                int64_t dp_size,
                                int64_t pp_size,
                                int64_t tp_size,
+                               const nlohmann::json& training_config,
                                const cverl::torch_backend::Fp32MasterAdamW& optimizer) {
   if (checkpoint_dir.empty()) {
     return;
@@ -783,6 +784,7 @@ void write_checkpoint_manifest(const std::string& checkpoint_dir,
   manifest["data_parallel"] = dp_size;
   manifest["pipeline_parallel"] = pp_size;
   manifest["tensor_parallel"] = tp_size;
+  manifest["training_config"] = training_config;
   manifest["optimizer"] = {
       {"type", "Fp32MasterAdamW"},
       {"lr", optimizer.options().lr},
@@ -823,6 +825,7 @@ void write_flat_checkpoint_manifest(const std::string& checkpoint_dir,
                                     int64_t dp_size,
                                     int64_t pp_size,
                                     int64_t tp_size,
+                                    const nlohmann::json& training_config,
                                     const cverl::torch_backend::FlatAdamW& optimizer,
                                     bool save_model_params) {
   if (checkpoint_dir.empty()) {
@@ -841,6 +844,7 @@ void write_flat_checkpoint_manifest(const std::string& checkpoint_dir,
   manifest["data_parallel"] = dp_size;
   manifest["pipeline_parallel"] = pp_size;
   manifest["tensor_parallel"] = tp_size;
+  manifest["training_config"] = training_config;
   manifest["optimizer"] = {
       {"type", "FlatAdamW"},
       {"lr", optimizer.options().lr},
@@ -873,6 +877,46 @@ void write_flat_checkpoint_manifest(const std::string& checkpoint_dir,
   write_json_atomic(step_dir / "manifest.json", manifest);
   write_text_atomic(std::filesystem::path(checkpoint_dir) / "latest_checkpoint.txt",
                     checkpoint_step_name(step) + "\n");
+}
+
+nlohmann::json make_training_config_json(const std::string& dtype,
+                                         const std::string& dp_grad_comm_dtype,
+                                         const std::string& tp_grad_comm_dtype,
+                                         int64_t dp_grad_bucket_mb,
+                                         int64_t tp_grad_bucket_mb,
+                                         int64_t micro_batches,
+                                         int64_t layers,
+                                         int64_t prompt_len,
+                                         int64_t response_len,
+                                         double max_grad_norm,
+                                         double clip_ratio,
+                                         double kl_coef,
+                                         const std::string& kl_penalty,
+                                         double advantage_scale,
+                                         bool use_master_weights,
+                                         bool dp_shard_optimizer,
+                                         bool dp_flat_shard_optimizer,
+                                         bool flat_checkpoint_save_model_params) {
+  nlohmann::json config;
+  config["dtype"] = dtype;
+  config["dp_grad_comm_dtype"] = dp_grad_comm_dtype;
+  config["tp_grad_comm_dtype"] = tp_grad_comm_dtype;
+  config["dp_grad_bucket_mb"] = dp_grad_bucket_mb;
+  config["tp_grad_bucket_mb"] = tp_grad_bucket_mb;
+  config["micro_batches"] = micro_batches;
+  config["layers"] = layers;
+  config["prompt_len"] = prompt_len;
+  config["response_len"] = response_len;
+  config["max_grad_norm"] = max_grad_norm;
+  config["clip_ratio"] = clip_ratio;
+  config["kl_coef"] = kl_coef;
+  config["kl_penalty"] = kl_penalty;
+  config["advantage_scale"] = advantage_scale;
+  config["master_weights"] = use_master_weights;
+  config["dp_shard_optimizer"] = dp_shard_optimizer;
+  config["dp_flat_shard_optimizer"] = dp_flat_shard_optimizer;
+  config["flat_checkpoint_save_model_params"] = flat_checkpoint_save_model_params;
+  return config;
 }
 
 int64_t load_rank_checkpoint(const std::string& checkpoint_path,
@@ -1510,7 +1554,8 @@ int main(int argc, char** argv) {
     const double lr = arg_f64(argc, argv, "--lr", 1.0e-8);
     const double clip_ratio = arg_f64(argc, argv, "--clip-ratio", 0.2);
     const double kl_coef = arg_f64(argc, argv, "--kl-coef", 0.0);
-    const auto kl_penalty_mode = parse_kl_penalty_mode(arg_str(argc, argv, "--kl-penalty", "k1"));
+    const std::string kl_penalty_arg = arg_str(argc, argv, "--kl-penalty", "k1");
+    const auto kl_penalty_mode = parse_kl_penalty_mode(kl_penalty_arg);
     const double max_grad_norm = arg_f64(argc, argv, "--max-grad-norm", 1.0);
     const int64_t dp_grad_bucket_mb = arg_i64(argc, argv, "--dp-grad-bucket-mb", 25);
     const int64_t tp_grad_bucket_mb = arg_i64(argc, argv, "--tp-grad-bucket-mb", dp_grad_bucket_mb);
@@ -1570,6 +1615,24 @@ int main(int argc, char** argv) {
     const torch::ScalarType flat_param_bucket_dtype = use_master_weights ? torch::kFloat32 : dtype;
     const int64_t dp_grad_bucket_numel = bucket_numel_for_bytes(dp_grad_bucket_bytes, dp_grad_bucket_dtype);
     const int64_t dp_param_bucket_numel = bucket_numel_for_bytes(dp_grad_bucket_bytes, flat_param_bucket_dtype);
+    const auto training_config = make_training_config_json(dtype_arg,
+                                                           dp_grad_comm_dtype_arg,
+                                                           tp_grad_comm_dtype_arg,
+                                                           dp_grad_bucket_mb,
+                                                           tp_grad_bucket_mb,
+                                                           micro_batches,
+                                                           layers,
+                                                           prompt_len,
+                                                           response_len,
+                                                           max_grad_norm,
+                                                           clip_ratio,
+                                                           kl_coef,
+                                                           kl_penalty_arg,
+                                                           advantage_scale,
+                                                           use_master_weights,
+                                                           dp_shard_optimizer,
+                                                           dp_flat_shard_optimizer,
+                                                           flat_checkpoint_save_model_params);
 
     const int64_t seq_len = prompt_len + response_len;
     const auto device = torch::Device(torch::kCUDA, static_cast<int>(device_idx));
@@ -2052,10 +2115,12 @@ int main(int argc, char** argv) {
                                            dp_size,
                                            pp_size,
                                            tp_size,
+                                           training_config,
                                            *flat_optimizer,
                                            flat_checkpoint_save_model_params);
           } else {
-            write_checkpoint_manifest(checkpoint_dir, step, world_size, dp_size, pp_size, tp_size, optimizer);
+            write_checkpoint_manifest(
+                checkpoint_dir, step, world_size, dp_size, pp_size, tp_size, training_config, optimizer);
           }
         }
         full_comm.barrier();
