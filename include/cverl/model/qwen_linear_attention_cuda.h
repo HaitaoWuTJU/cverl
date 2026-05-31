@@ -11,7 +11,8 @@ std::tuple<torch::Tensor, torch::Tensor> qwen_linear_attention_cuda_forward(
     const torch::Tensor& key,
     const torch::Tensor& value,
     const torch::Tensor& beta,
-    const torch::Tensor& g);
+    const torch::Tensor& g,
+    bool save_states);
 
 std::vector<torch::Tensor> qwen_linear_attention_cuda_backward(
     const torch::Tensor& grad_out,
@@ -21,5 +22,13 @@ std::vector<torch::Tensor> qwen_linear_attention_cuda_backward(
     const torch::Tensor& beta,
     const torch::Tensor& g,
     const torch::Tensor& states);
+
+std::vector<torch::Tensor> qwen_linear_attention_cuda_backward_recompute(
+    const torch::Tensor& grad_out,
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    const torch::Tensor& beta,
+    const torch::Tensor& g);
 
 }  // namespace cverl

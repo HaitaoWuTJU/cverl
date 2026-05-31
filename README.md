@@ -323,6 +323,8 @@ Implemented pieces:
 - decoder layer residual structure
 - Qwen3.5 RMSNorm weight convention
 - linear attention via LibTorch depthwise `conv1d` and recurrent gated delta rule
+- CUDA linear attention for `kd=128, vd=128`; default backward recomputes
+  recurrent states instead of saving `[batch, heads, seq, kd, vd]`
 - full attention with grouped KV heads, causal masking, RoPE, q/k norm, and output gate
 - SwiGLU MLP
 - final norm
@@ -334,6 +336,14 @@ Current limitations:
 - prefill/no-cache forward; incremental KV/recurrent cache is not implemented yet
 - correctness is checked against Hugging Face CPU forward for hidden states and logits
 - CPU path is intended for validation, not performance
+
+CUDA linear attention controls:
+
+```sh
+CVERL_LINEAR_ATTN_BACKEND=cuda      # cuda|auto|chunked|eager
+CVERL_LINEAR_ATTN_SAVE_STATES=0     # default: recompute backward to reduce activation memory
+CVERL_LINEAR_ATTN_SAVE_STATES=1     # debug/comparison: save every recurrent state
+```
 
 The lightweight HF-weight RL regression path uses Qwen embeddings as the policy
 input and action head over a small vocabulary subset:

@@ -14,12 +14,14 @@ std::tuple<torch::Tensor, torch::Tensor> qwen_linear_attention_cuda_forward(
     const torch::Tensor& key,
     const torch::Tensor& value,
     const torch::Tensor& beta,
-    const torch::Tensor& g) {
+    const torch::Tensor& g,
+    bool save_states) {
   (void)query;
   (void)key;
   (void)value;
   (void)beta;
   (void)g;
+  (void)save_states;
   throw std::runtime_error("Qwen linear attention CUDA kernel was not built");
 }
 
@@ -38,6 +40,22 @@ std::vector<torch::Tensor> qwen_linear_attention_cuda_backward(
   (void)beta;
   (void)g;
   (void)states;
+  throw std::runtime_error("Qwen linear attention CUDA kernel was not built");
+}
+
+std::vector<torch::Tensor> qwen_linear_attention_cuda_backward_recompute(
+    const torch::Tensor& grad_out,
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    const torch::Tensor& beta,
+    const torch::Tensor& g) {
+  (void)grad_out;
+  (void)query;
+  (void)key;
+  (void)value;
+  (void)beta;
+  (void)g;
   throw std::runtime_error("Qwen linear attention CUDA kernel was not built");
 }
 #endif

@@ -326,6 +326,10 @@ if (CVERL_BUILD_TESTS)
     add_executable(test_gpu_ipc_rollout_batch tests/rollout/test_gpu_ipc_rollout_batch.cc)
     target_link_libraries(test_gpu_ipc_rollout_batch PRIVATE cverl)
     target_compile_options(test_gpu_ipc_rollout_batch PRIVATE ${TORCH_CXX_FLAGS})
+
+    add_executable(test_qwen_linear_attention_cuda tests/model/test_qwen_linear_attention_cuda.cc)
+    target_link_libraries(test_qwen_linear_attention_cuda PRIVATE cverl)
+    target_compile_options(test_qwen_linear_attention_cuda PRIVATE ${TORCH_CXX_FLAGS})
   endif()
 
   add_executable(test_gsm8k_grpo_trainer tests/rollout/test_gsm8k_grpo_trainer.cc)

@@ -185,6 +185,11 @@ bool use_cuda_linear_attention_kernel(const torch::Tensor& query, int64_t kd, in
          kd == 128 && vd == 128;
 }
 
+bool save_cuda_linear_attention_states() {
+  const char* env = std::getenv("CVERL_LINEAR_ATTN_SAVE_STATES");
+  return env != nullptr && std::string(env) == "1";
+}
+
 class QwenLinearAttentionCudaFunction
     : public torch::autograd::Function<QwenLinearAttentionCudaFunction> {
  public:
@@ -194,10 +199,12 @@ class QwenLinearAttentionCudaFunction
                                torch::Tensor value,
                                torch::Tensor beta,
                                torch::Tensor g) {
+    const bool save_states = save_cuda_linear_attention_states();
     auto result = qwen_linear_attention_cuda_forward(
-        query.contiguous(), key.contiguous(), value.contiguous(), beta.contiguous(), g.contiguous());
+        query.contiguous(), key.contiguous(), value.contiguous(), beta.contiguous(), g.contiguous(), save_states);
     auto out = std::get<0>(result);
     auto states = std::get<1>(result);
+    ctx->saved_data["save_states"] = save_states;
     ctx->save_for_backward({query, key, value, beta, g, states});
     return out;
   }
@@ -205,14 +212,26 @@ class QwenLinearAttentionCudaFunction
   static torch::autograd::tensor_list backward(torch::autograd::AutogradContext* ctx,
                                                torch::autograd::tensor_list grad_outputs) {
     auto saved = ctx->get_saved_variables();
-    auto grads = qwen_linear_attention_cuda_backward(
-        grad_outputs[0].contiguous(),
-        saved[0].contiguous(),
-        saved[1].contiguous(),
-        saved[2].contiguous(),
-        saved[3].contiguous(),
-        saved[4].contiguous(),
-        saved[5].contiguous());
+    const bool save_states = ctx->saved_data["save_states"].toBool();
+    std::vector<torch::Tensor> grads;
+    if (save_states) {
+      grads = qwen_linear_attention_cuda_backward(
+          grad_outputs[0].contiguous(),
+          saved[0].contiguous(),
+          saved[1].contiguous(),
+          saved[2].contiguous(),
+          saved[3].contiguous(),
+          saved[4].contiguous(),
+          saved[5].contiguous());
+    } else {
+      grads = qwen_linear_attention_cuda_backward_recompute(
+          grad_outputs[0].contiguous(),
+          saved[0].contiguous(),
+          saved[1].contiguous(),
+          saved[2].contiguous(),
+          saved[3].contiguous(),
+          saved[4].contiguous());
+    }
     return {grads[0], grads[1], grads[2], grads[3], grads[4]};
   }
 };
