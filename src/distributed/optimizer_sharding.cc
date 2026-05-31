@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <numeric>
+#include <optional>
 #include <stdexcept>
 
 namespace cverl::distributed {
@@ -401,16 +402,30 @@ FlatParameterShard reduce_scatter_flat_gradient_shard(const std::vector<torch::T
                                                       Collectives& collectives,
                                                       const std::vector<int64_t>& data_group,
                                                       bool average,
-                                                      bool require_grad) {
+                                                      bool require_grad,
+                                                      std::optional<torch::ScalarType> communication_dtype) {
   const int64_t data_rank =
       rank_index_in_group(collectives.rank(), data_group, "reduce_scatter_flat_gradient_shard");
   const int64_t data_parallel = static_cast<int64_t>(data_group.size());
   if (data_parallel == 1) {
-    return flatten_gradient_shard(parameters, 1, data_rank, require_grad);
+    if (!communication_dtype.has_value()) {
+      return flatten_gradient_shard(parameters, 1, data_rank, require_grad);
+    }
+    auto gradients = gradient_tensor_list(parameters, require_grad, "reduce_scatter_flat_gradient_shard");
+    return flatten_tensor_list_shard(
+        gradients, 1, data_rank, *communication_dtype, "reduce_scatter_flat_gradient_shard");
   }
   auto gradients = gradient_tensor_list(parameters, require_grad, "reduce_scatter_flat_gradient_shard");
+  if (communication_dtype.has_value()) {
+    for (auto& grad : gradients) {
+      grad = grad.to(*communication_dtype).contiguous();
+    }
+  }
   auto numels = tensor_numels(gradients, "reduce_scatter_flat_gradient_shard");
-  auto full_flat = flatten_tensor_list_shard(gradients, 1, 0, "reduce_scatter_flat_gradient_shard");
+  auto full_flat = communication_dtype.has_value()
+                       ? flatten_tensor_list_shard(
+                             gradients, 1, 0, *communication_dtype, "reduce_scatter_flat_gradient_shard")
+                       : flatten_tensor_list_shard(gradients, 1, 0, "reduce_scatter_flat_gradient_shard");
   auto flat = full_flat.shard;
   const int64_t remainder = full_flat.original_numel % data_parallel;
   const int64_t padded_numel =
@@ -435,7 +450,8 @@ FlatParameterShard reduce_scatter_flat_gradient_shard_bucketed(
     const std::vector<int64_t>& data_group,
     bool average,
     int64_t bucket_numel,
-    bool require_grad) {
+    bool require_grad,
+    std::optional<torch::ScalarType> communication_dtype) {
   if (bucket_numel <= 0) {
     throw std::invalid_argument("reduce_scatter_flat_gradient_shard_bucketed bucket_numel must be positive");
   }
@@ -443,9 +459,19 @@ FlatParameterShard reduce_scatter_flat_gradient_shard_bucketed(
       rank_index_in_group(collectives.rank(), data_group, "reduce_scatter_flat_gradient_shard_bucketed");
   const int64_t data_parallel = static_cast<int64_t>(data_group.size());
   if (data_parallel == 1) {
-    return flatten_gradient_shard(parameters, 1, data_rank, require_grad);
+    if (!communication_dtype.has_value()) {
+      return flatten_gradient_shard(parameters, 1, data_rank, require_grad);
+    }
+    auto gradients = gradient_tensor_list(parameters, require_grad, "reduce_scatter_flat_gradient_shard_bucketed");
+    return flatten_tensor_list_shard(
+        gradients, 1, data_rank, *communication_dtype, "reduce_scatter_flat_gradient_shard_bucketed");
   }
   auto gradients = gradient_tensor_list(parameters, require_grad, "reduce_scatter_flat_gradient_shard_bucketed");
+  if (communication_dtype.has_value()) {
+    for (auto& grad : gradients) {
+      grad = grad.to(*communication_dtype).contiguous();
+    }
+  }
   std::vector<int64_t> tensor_numels;
   tensor_numels.reserve(gradients.size());
   int64_t original_numel = 0;
@@ -459,7 +485,7 @@ FlatParameterShard reduce_scatter_flat_gradient_shard_bucketed(
       have_tensor = true;
     }
   }
-  auto options = torch::TensorOptions().device(device).dtype(torch::kFloat32);
+  auto options = torch::TensorOptions().device(device).dtype(communication_dtype.value_or(torch::kFloat32));
   const int64_t remainder = original_numel % data_parallel;
   const int64_t padded_numel = original_numel + (remainder == 0 ? 0 : data_parallel - remainder);
   const int64_t shard_size = padded_numel / data_parallel;
@@ -559,7 +585,8 @@ FlatAdamWStepResult flat_sharded_adamw_step(const std::vector<torch::Tensor>& pa
                                             bool require_grad,
                                             bool apply_parameters,
                                             int64_t reduce_scatter_bucket_numel,
-                                            int64_t all_gather_bucket_numel) {
+                                            int64_t all_gather_bucket_numel,
+                                            std::optional<torch::ScalarType> gradient_communication_dtype) {
   if (max_grad_norm < 0.0) {
     throw std::invalid_argument("flat_sharded_adamw_step max_grad_norm must be non-negative");
   }
@@ -569,9 +596,15 @@ FlatAdamWStepResult flat_sharded_adamw_step(const std::vector<torch::Tensor>& pa
                                                                       data_group,
                                                                       average_gradients,
                                                                       reduce_scatter_bucket_numel,
-                                                                      require_grad)
+                                                                      require_grad,
+                                                                      gradient_communication_dtype)
                         : reduce_scatter_flat_gradient_shard(
-                              parameters, data_collectives, data_group, average_gradients, require_grad);
+                              parameters,
+                              data_collectives,
+                              data_group,
+                              average_gradients,
+                              require_grad,
+                              gradient_communication_dtype);
   if (grad_shard.original_numel != parameter_shard.original_numel ||
       grad_shard.padded_numel != parameter_shard.padded_numel ||
       grad_shard.shard_begin != parameter_shard.shard_begin ||

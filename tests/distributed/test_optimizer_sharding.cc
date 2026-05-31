@@ -72,6 +72,7 @@ class SliceCollectives final : public cverl::distributed::Collectives {
     }
     last_reduce_op = op;
     ++reduce_scatter_calls;
+    last_reduce_scatter_dtype = input.scalar_type();
     const int64_t shard = input.size(0) / 2;
     return input.narrow(0, rank_ * shard, shard).clone();
   }
@@ -84,6 +85,7 @@ class SliceCollectives final : public cverl::distributed::Collectives {
   int64_t reduce_scatter_calls = 0;
   int64_t all_gather_calls = 0;
   int64_t all_reduce_calls = 0;
+  torch::ScalarType last_reduce_scatter_dtype = torch::kFloat32;
   cverl::distributed::ReduceOp last_reduce_op = cverl::distributed::ReduceOp::Sum;
 
  private:
@@ -379,6 +381,37 @@ void test_reduce_scatter_flat_gradient_shard() {
   }, "rank outside data group rejected");
 }
 
+void test_reduce_scatter_flat_gradient_comm_dtype() {
+  auto p0 = torch::ones({4}, torch::TensorOptions().dtype(torch::kBFloat16).requires_grad(true));
+  auto p1 = torch::full({4}, 2.0, torch::TensorOptions().dtype(torch::kBFloat16).requires_grad(true));
+  p0.mutable_grad() = torch::full({4}, 0.25, torch::TensorOptions().dtype(torch::kBFloat16));
+  p1.mutable_grad() = torch::full({4}, -0.5, torch::TensorOptions().dtype(torch::kBFloat16));
+  std::vector<torch::Tensor> params{p0, p1};
+
+  SliceCollectives rank0(0);
+  auto shard0 = cverl::distributed::reduce_scatter_flat_gradient_shard(
+      params, rank0, {0, 1}, true, true, torch::kBFloat16);
+  require(rank0.last_reduce_scatter_dtype == torch::kBFloat16,
+          "flat reduce-scatter should use requested BF16 communication dtype");
+  require(shard0.shard.scalar_type() == torch::kBFloat16,
+          "flat reduce-scatter shard should keep requested BF16 dtype");
+
+  SliceCollectives bucket_rank0(0);
+  auto bucket0 = cverl::distributed::reduce_scatter_flat_gradient_shard_bucketed(
+      params, bucket_rank0, {0, 1}, true, 4, true, torch::kBFloat16);
+  require(bucket_rank0.last_reduce_scatter_dtype == torch::kBFloat16,
+          "bucketed flat reduce-scatter should use requested BF16 communication dtype");
+  require(bucket0.shard.scalar_type() == torch::kBFloat16,
+          "bucketed flat reduce-scatter shard should keep requested BF16 dtype");
+
+  SliceCollectives single_rank(0);
+  auto single = cverl::distributed::reduce_scatter_flat_gradient_shard(
+      params, single_rank, {0}, true, true, torch::kBFloat16);
+  require(single_rank.reduce_scatter_calls == 0, "single-DP forced dtype should skip reduce-scatter");
+  require(single.shard.scalar_type() == torch::kBFloat16,
+          "single-DP flat reduce-scatter should still honor requested BF16 dtype");
+}
+
 void test_flat_sharded_adamw_matches_dense() {
   cverl::torch_backend::Fp32MasterAdamWOptions opts;
   opts.lr = 2.0e-4;
@@ -563,6 +596,7 @@ int main() {
     test_apply_full_flat_validation();
     test_flat_gradient_shards();
     test_reduce_scatter_flat_gradient_shard();
+    test_reduce_scatter_flat_gradient_comm_dtype();
     test_flat_sharded_adamw_matches_dense();
     test_flat_sharded_adamw_clipped_local_norm();
     test_flat_sharded_adamw_single_dp_skips_data_collectives();

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 #include <torch/torch.h>
@@ -58,7 +59,8 @@ FlatParameterShard reduce_scatter_flat_gradient_shard(const std::vector<torch::T
                                                       Collectives& collectives,
                                                       const std::vector<int64_t>& data_group,
                                                       bool average,
-                                                      bool require_grad = true);
+                                                      bool require_grad = true,
+                                                      std::optional<torch::ScalarType> communication_dtype = std::nullopt);
 
 FlatParameterShard reduce_scatter_flat_gradient_shard_bucketed(
     const std::vector<torch::Tensor>& parameters,
@@ -66,7 +68,8 @@ FlatParameterShard reduce_scatter_flat_gradient_shard_bucketed(
     const std::vector<int64_t>& data_group,
     bool average,
     int64_t bucket_numel,
-    bool require_grad = true);
+    bool require_grad = true,
+    std::optional<torch::ScalarType> communication_dtype = std::nullopt);
 
 torch::Tensor all_gather_flat_parameter_shards(const FlatParameterShard& local_shard,
                                                Collectives& collectives,
@@ -95,7 +98,8 @@ FlatAdamWStepResult flat_sharded_adamw_step(const std::vector<torch::Tensor>& pa
                                             bool require_grad = false,
                                             bool apply_parameters = true,
                                             int64_t reduce_scatter_bucket_numel = 0,
-                                            int64_t all_gather_bucket_numel = 0);
+                                            int64_t all_gather_bucket_numel = 0,
+                                            std::optional<torch::ScalarType> gradient_communication_dtype = std::nullopt);
 
 void apply_flat_parameter_shard(const FlatParameterShard& shard,
                                 const std::vector<torch::Tensor>& parameters);

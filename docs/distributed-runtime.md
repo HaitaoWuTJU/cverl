@@ -99,6 +99,11 @@ The first sharding layer is implemented in
   across a DP group. It accepts an optional communication dtype, so BF16/FP16
   training can choose FP32 gradient communication for numerical stability or
   BF16/FP16 communication to save bandwidth.
+- `qwen3_5_pp_tp_ppo_trainer` exposes this policy as
+  `--dp-grad-comm-dtype model|float32|bfloat16|float16` and
+  `--tp-grad-comm-dtype model|float32|bfloat16|float16`. `model` keeps the
+  existing per-gradient dtype behavior; explicit dtypes force bucket
+  all-reduce/reduce-scatter payload dtype.
 
 Qwen3.5 has TP entry points for:
 

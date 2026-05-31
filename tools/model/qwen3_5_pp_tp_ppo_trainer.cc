@@ -5,6 +5,7 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -390,7 +391,8 @@ std::vector<torch::Tensor> collect_tp_replicated_parameters(const std::vector<st
 
 void sync_tp_replicated_gradients(const std::vector<torch::Tensor>& replicated_params,
                                   cverl::distributed::ParallelGroup& tp_group,
-                                  int64_t bucket_bytes) {
+                                  int64_t bucket_bytes,
+                                  std::optional<torch::ScalarType> communication_dtype) {
   if (tp_group.world_size == 1) {
     return;
   }
@@ -398,7 +400,7 @@ void sync_tp_replicated_gradients(const std::vector<torch::Tensor>& replicated_p
     throw std::runtime_error("TP replicated gradient sync requires collectives");
   }
   cverl::distributed::data_parallel_sync_gradients(
-      replicated_params, *tp_group.collectives, tp_group.ranks, true, bucket_bytes);
+      replicated_params, *tp_group.collectives, tp_group.ranks, true, bucket_bytes, communication_dtype);
 }
 
 struct PpPpoBatch {
@@ -476,6 +478,13 @@ torch::ScalarType parse_dtype(const std::string& dtype) {
     return torch::kFloat16;
   }
   throw std::invalid_argument("unsupported dtype");
+}
+
+std::optional<torch::ScalarType> parse_optional_dtype(const std::string& dtype) {
+  if (dtype.empty() || dtype == "model" || dtype == "param" || dtype == "none" || dtype == "auto") {
+    return std::nullopt;
+  }
+  return parse_dtype(dtype);
 }
 
 cverl_kl_penalty_t parse_kl_penalty_mode(const std::string& mode) {
@@ -1476,6 +1485,8 @@ int main(int argc, char** argv) {
     const double max_grad_norm = arg_f64(argc, argv, "--max-grad-norm", 1.0);
     const int64_t dp_grad_bucket_mb = arg_i64(argc, argv, "--dp-grad-bucket-mb", 25);
     const int64_t tp_grad_bucket_mb = arg_i64(argc, argv, "--tp-grad-bucket-mb", dp_grad_bucket_mb);
+    const std::string dp_grad_comm_dtype_arg = arg_str(argc, argv, "--dp-grad-comm-dtype", "model");
+    const std::string tp_grad_comm_dtype_arg = arg_str(argc, argv, "--tp-grad-comm-dtype", dp_grad_comm_dtype_arg);
     const double advantage_scale = arg_f64(argc, argv, "--advantage-scale", 1.0);
     const bool use_master_weights = arg_bool(argc, argv, "--master-weights", false);
     const bool dp_shard_optimizer = arg_bool(argc, argv, "--dp-shard-optimizer", false);
@@ -1504,6 +1515,8 @@ int main(int argc, char** argv) {
     const std::string resume_checkpoint = arg_str(argc, argv, "--resume-checkpoint", "");
     const std::string metrics_csv = arg_str(argc, argv, "--metrics-csv", "");
     const auto dtype = parse_dtype(arg_str(argc, argv, "--dtype", "bfloat16"));
+    const auto dp_grad_comm_dtype = parse_optional_dtype(dp_grad_comm_dtype_arg);
+    const auto tp_grad_comm_dtype = parse_optional_dtype(tp_grad_comm_dtype_arg);
     const std::string id_prefix = arg_str(argc, argv, "--id-prefix", "/tmp/cverl_qwen_pp_tp_ppo");
 
     if (dp_size <= 0 || pp_size <= 0 || tp_size <= 0 || micro_batches <= 0 || steps <= 0) {
@@ -1858,7 +1871,7 @@ int main(int argc, char** argv) {
         }
       }
 
-      sync_tp_replicated_gradients(tp_replicated_params, tp_group, tp_grad_bucket_bytes);
+      sync_tp_replicated_gradients(tp_replicated_params, tp_group, tp_grad_bucket_bytes, tp_grad_comm_dtype);
       bool flat_step_done = false;
       double local_grad_norm_sq = 0.0;
       double global_grad_norm = 0.0;
@@ -1877,7 +1890,8 @@ int main(int argc, char** argv) {
                                                                      false,
                                                                      true,
                                                                      dp_bucket_numel,
-                                                                     dp_bucket_numel);
+                                                                     dp_bucket_numel,
+                                                                     dp_grad_comm_dtype);
         flat_gradient_shard = flat_step.gradient_shard.shard;
         local_grad_norm_sq = flat_step.local_grad_norm_sq;
         global_grad_norm = flat_step.global_grad_norm;
@@ -1886,7 +1900,7 @@ int main(int argc, char** argv) {
         flat_step_done = true;
       } else if (dp_flat_shard_optimizer) {
         auto flat_grad = cverl::distributed::reduce_scatter_flat_gradient_shard(
-            params, dp_comm, dp_group.ranks, true, false);
+            params, dp_comm, dp_group.ranks, true, false, dp_grad_comm_dtype);
         if (flat_grad.original_numel != flat_param_shard.original_numel ||
             flat_grad.padded_numel != flat_param_shard.padded_numel ||
             flat_grad.shard.numel() != flat_param_shard.shard.numel()) {
@@ -1895,7 +1909,7 @@ int main(int argc, char** argv) {
         flat_gradient_shard = flat_grad.shard;
       } else {
         cverl::distributed::data_parallel_sync_gradients(
-            params, dp_comm, dp_group.ranks, true, dp_grad_bucket_bytes);
+            params, dp_comm, dp_group.ranks, true, dp_grad_bucket_bytes, dp_grad_comm_dtype);
       }
       if (!flat_step_done) {
         auto grad_sq_tensor =
@@ -2099,6 +2113,8 @@ int main(int argc, char** argv) {
                   << " total_params=" << params.size()
                   << " dp_grad_bucket_mb=" << dp_grad_bucket_mb
                   << " tp_grad_bucket_mb=" << tp_grad_bucket_mb
+                  << " dp_grad_comm_dtype=" << dp_grad_comm_dtype_arg
+                  << " tp_grad_comm_dtype=" << tp_grad_comm_dtype_arg
                   << " resumed_from_step=" << start_step
                   << " skip_optimizer_step=" << (skip_optimizer_step ? "true" : "false")
                   << " measure_param_delta=" << (measure_param_delta ? "true" : "false")
