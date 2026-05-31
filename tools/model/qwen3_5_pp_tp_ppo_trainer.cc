@@ -268,24 +268,6 @@ void sync_tp_replicated_gradients(const std::vector<std::string>& names,
   }
 }
 
-void sync_data_parallel_gradients(const std::vector<torch::Tensor>& params,
-                                  cverl::distributed::ParallelGroup& dp_group) {
-  if (dp_group.world_size == 1) {
-    return;
-  }
-  if (dp_group.collectives == nullptr) {
-    throw std::runtime_error("DP gradient sync requires collectives");
-  }
-  for (auto& p : params) {
-    if (!p.defined() || !p.grad().defined()) {
-      continue;
-    }
-    auto synced = dp_group.collectives->all_reduce(
-        p.grad().contiguous(), cverl::distributed::ReduceOp::Mean, dp_group.ranks);
-    p.mutable_grad().copy_(synced);
-  }
-}
-
 struct PpPpoBatch {
   std::vector<torch::Tensor> token_ids;
   std::vector<torch::Tensor> advantages;
@@ -1262,7 +1244,7 @@ int main(int argc, char** argv) {
       }
 
       sync_tp_replicated_gradients(param_names, params, tp_group);
-      sync_data_parallel_gradients(params, dp_group);
+      cverl::distributed::data_parallel_sync_gradients(params, dp_comm, dp_group.ranks, true);
       const double local_grad_norm_sq = optimizer.grad_l2_norm_sq();
       auto grad_sq_tensor =
           torch::tensor({local_grad_norm_sq}, torch::TensorOptions().device(device).dtype(torch::kFloat32));
