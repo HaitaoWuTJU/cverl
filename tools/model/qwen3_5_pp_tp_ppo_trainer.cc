@@ -400,6 +400,33 @@ struct PpPpoBatch {
   double adv_abs_sum = 0.0;
 };
 
+void assign_rollout_batch_metrics(PpPpoBatch& out,
+                                  const torch::Tensor& rewards,
+                                  const torch::Tensor& advantages,
+                                  double success_threshold) {
+  if (!advantages.defined()) {
+    return;
+  }
+  torch::NoGradGuard no_grad;
+  auto adv_abs = advantages.to(torch::kFloat32).abs().sum();
+  std::vector<torch::Tensor> metrics;
+  metrics.reserve(3);
+  if (rewards.defined() && rewards.numel() > 0) {
+    auto reward_values = rewards.to(advantages.device()).to(torch::kFloat32);
+    metrics.push_back(reward_values.mean());
+    metrics.push_back((reward_values >= success_threshold).to(torch::kFloat32).mean());
+  } else {
+    metrics.push_back(torch::full({}, static_cast<float>(out.mean_reward), adv_abs.options()));
+    metrics.push_back(torch::full({}, static_cast<float>(out.success_rate), adv_abs.options()));
+  }
+  metrics.push_back(adv_abs);
+  auto host_metrics = torch::stack(metrics).contiguous().cpu();
+  auto values = host_metrics.accessor<float, 1>();
+  out.mean_reward = static_cast<double>(values[0]);
+  out.success_rate = static_cast<double>(values[1]);
+  out.adv_abs_sum = static_cast<double>(values[2]);
+}
+
 torch::Tensor rollout_row(const torch::Tensor& tensor, int64_t row, int64_t width) {
   if (!tensor.defined()) {
     return {};
@@ -1139,10 +1166,7 @@ PpPpoBatch load_rollout_ppo_batch(const std::string& path,
 
   PpPpoBatch out;
   out.rows = prompt_ids.size(0);
-  out.mean_reward = rollout_batch.scalar_rewards.mean().item<double>();
-  out.success_rate =
-      (rollout_batch.scalar_rewards >= reward_opts.correct_score - 1e-6).to(torch::kFloat32).mean().item<double>();
-  out.adv_abs_sum = advantages.abs().sum().item<double>();
+  assign_rollout_batch_metrics(out, rollout_batch.scalar_rewards, advantages, reward_opts.correct_score - 1e-6);
   out.token_ids = torch::cat({prompt_ids, response_ids}, 1).contiguous();
   out.advantages = advantages.contiguous();
   out.response_masks = response_mask.contiguous();
@@ -1258,7 +1282,7 @@ PpPpoBatch load_rollout_ipc_batch(const std::string& path,
   out.rows = batch;
   out.mean_reward = doc.value("mean_reward", 0.0);
   out.success_rate = doc.value("success_rate", 0.0);
-  out.adv_abs_sum = advantages.abs().sum().item<double>();
+  assign_rollout_batch_metrics(out, torch::Tensor(), advantages, 1.0 - 1e-6);
   out.token_ids = torch::cat({prompt_ids, response_ids}, 1).contiguous();
   out.advantages = advantages.contiguous();
   out.response_masks = response_mask.contiguous();
@@ -1283,12 +1307,7 @@ PpPpoBatch convert_gpu_rollout_batch(const cverl::rollout::GpuRolloutBatch& gpu_
   }
   PpPpoBatch out;
   out.rows = batch;
-  out.adv_abs_sum = gpu_batch.advantages.to(torch::kFloat32).abs().sum().item<double>();
-  if (gpu_batch.rewards.defined() && gpu_batch.rewards.numel() > 0) {
-    auto rewards = gpu_batch.rewards.to(torch::kFloat32);
-    out.mean_reward = rewards.mean().item<double>();
-    out.success_rate = (rewards >= 1.0 - 1e-6).to(torch::kFloat32).mean().item<double>();
-  }
+  assign_rollout_batch_metrics(out, gpu_batch.rewards, gpu_batch.advantages, 1.0 - 1e-6);
   auto response_mask = gpu_batch.response_mask.to(torch::kFloat32);
   auto advantages = gpu_batch.advantages.to(torch::kFloat32);
   torch::Tensor old_log_probs = gpu_batch.old_log_probs.defined() ? gpu_batch.old_log_probs.to(torch::kFloat32) : torch::Tensor();
