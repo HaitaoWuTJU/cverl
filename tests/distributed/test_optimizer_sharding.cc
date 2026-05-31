@@ -307,6 +307,10 @@ void test_reduce_scatter_flat_gradient_shard() {
   require(rank1.last_reduce_op == cverl::distributed::ReduceOp::Sum, "non-average uses sum reduce-scatter");
   require(shard0.original_numel == 11 && shard0.padded_numel == 12, "rank0 flat reduce-scatter metadata");
   require(shard1.original_numel == 11 && shard1.padded_numel == 12, "rank1 flat reduce-scatter metadata");
+  require(shard0.ranges.size() == 1 && shard0.ranges[0].parameter_index == 0,
+          "rank0 flat reduce-scatter ranges should be metadata-only accurate");
+  require(shard1.ranges.size() == 1 && shard1.ranges[0].parameter_index == 1,
+          "rank1 flat reduce-scatter ranges should be metadata-only accurate");
   require_allclose(shard0.shard, expected.narrow(0, 0, 6), "rank0 flat reduce-scatter shard");
   require_allclose(shard1.shard, expected.narrow(0, 6, 6), "rank1 flat reduce-scatter shard");
 

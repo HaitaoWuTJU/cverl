@@ -159,6 +159,18 @@ std::vector<torch::Tensor> gradient_tensor_list(const std::vector<torch::Tensor>
   return gradients;
 }
 
+std::vector<int64_t> tensor_numels(const std::vector<torch::Tensor>& tensors, const char* name) {
+  std::vector<int64_t> out;
+  out.reserve(tensors.size());
+  for (const auto& tensor : tensors) {
+    if (!tensor.defined()) {
+      throw std::invalid_argument(std::string(name) + " requires defined tensors");
+    }
+    out.push_back(tensor.numel());
+  }
+  return out;
+}
+
 torch::Tensor flat_tensor_range(const std::vector<torch::Tensor>& tensors,
                                 int64_t original_numel,
                                 int64_t begin,
@@ -336,16 +348,20 @@ FlatParameterShard reduce_scatter_flat_gradient_shard(const std::vector<torch::T
     return flatten_gradient_shard(parameters, 1, data_rank, require_grad);
   }
   auto gradients = gradient_tensor_list(parameters, require_grad, "reduce_scatter_flat_gradient_shard");
+  auto numels = tensor_numels(gradients, "reduce_scatter_flat_gradient_shard");
   auto full_flat = flatten_tensor_list_shard(gradients, 1, 0, "reduce_scatter_flat_gradient_shard");
-  auto metadata = flatten_tensor_list_shard(gradients, data_parallel, data_rank, "reduce_scatter_flat_gradient_shard");
   auto flat = full_flat.shard;
-  if (metadata.padded_numel > flat.numel()) {
-    flat = torch::cat({flat, torch::zeros({metadata.padded_numel - flat.numel()}, flat.options())}, 0).contiguous();
+  const int64_t remainder = full_flat.original_numel % data_parallel;
+  const int64_t padded_numel =
+      full_flat.original_numel + (remainder == 0 ? 0 : data_parallel - remainder);
+  if (padded_numel > flat.numel()) {
+    flat = torch::cat({flat, torch::zeros({padded_numel - flat.numel()}, flat.options())}, 0).contiguous();
   }
-  metadata.shard = collectives
-                       .reduce_scatter(
-                           flat.contiguous(), average ? ReduceOp::Mean : ReduceOp::Sum, data_group, 0)
-                       .contiguous();
+  auto reduced_shard =
+      collectives.reduce_scatter(flat.contiguous(), average ? ReduceOp::Mean : ReduceOp::Sum, data_group, 0)
+          .contiguous();
+  auto metadata = make_flat_shard_metadata(
+      numels, data_parallel, data_rank, reduced_shard, "reduce_scatter_flat_gradient_shard");
   if (metadata.shard.numel() != metadata.shard_end - metadata.shard_begin) {
     throw std::runtime_error("reduce_scatter_flat_gradient_shard returned an unexpected shard size");
   }
