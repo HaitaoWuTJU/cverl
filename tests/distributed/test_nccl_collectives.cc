@@ -177,25 +177,33 @@ int main(int argc, char** argv) {
     if (world >= 2) {
       auto shard0 = torch::zeros({2, 2}, torch::TensorOptions().device(torch::kCUDA, static_cast<int>(device)).dtype(torch::kFloat32));
       auto shard1 = torch::zeros({3}, torch::TensorOptions().device(torch::kCUDA, static_cast<int>(device)).dtype(torch::kFloat32));
+      auto shard2 = torch::zeros({2}, torch::TensorOptions().device(torch::kCUDA, static_cast<int>(device)).dtype(torch::kBFloat16));
       if (rank == 0) {
         shard0.copy_(torch::arange(1, 5, torch::TensorOptions().device(shard0.device()).dtype(torch::kFloat32)).reshape({2, 2}));
         shard1.copy_(torch::tensor({11.0f, 12.0f, 13.0f}, torch::TensorOptions().device(shard1.device())));
+        shard2.copy_(torch::tensor({21.0f, 22.0f}, torch::TensorOptions().device(shard2.device()).dtype(torch::kBFloat16)));
         cverl::distributed::send_parameter_shards(
             {cverl::distributed::ParameterView{"tp_linear.weight.shard0", shard0},
-             cverl::distributed::ParameterView{"tp_linear.bias.shard0", shard1}},
+             cverl::distributed::ParameterView{"tp_linear.bias.shard0", shard1},
+             cverl::distributed::ParameterView{"tp_linear.norm.shard0", shard2}},
             comm,
-            1);
+            1,
+            1024);
       } else if (rank == 1) {
         cverl::distributed::recv_parameter_shards(
             {cverl::distributed::ParameterView{"tp_linear.weight.shard0", shard0},
-             cverl::distributed::ParameterView{"tp_linear.bias.shard0", shard1}},
+             cverl::distributed::ParameterView{"tp_linear.bias.shard0", shard1},
+             cverl::distributed::ParameterView{"tp_linear.norm.shard0", shard2}},
             comm,
-            0);
+            0,
+            1024);
         auto expected_shard0 =
             torch::arange(1, 5, torch::TensorOptions().device(shard0.device()).dtype(torch::kFloat32)).reshape({2, 2});
         auto expected_shard1 = torch::tensor({11.0f, 12.0f, 13.0f}, torch::TensorOptions().device(shard1.device()));
+        auto expected_shard2 = torch::tensor({21.0f, 22.0f}, torch::TensorOptions().device(shard2.device()).dtype(torch::kBFloat16));
         require_allclose(shard0, expected_shard0, "NCCL shard-wise parameter sync weight mismatch");
         require_allclose(shard1, expected_shard1, "NCCL shard-wise parameter sync bias mismatch");
+        require_allclose(shard2.to(torch::kFloat32), expected_shard2.to(torch::kFloat32), "NCCL shard-wise parameter sync norm mismatch");
       }
     }
 
