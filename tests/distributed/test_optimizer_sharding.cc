@@ -9,6 +9,65 @@
 
 namespace {
 
+class SliceCollectives final : public cverl::distributed::Collectives {
+ public:
+  explicit SliceCollectives(int64_t rank) : rank_(rank) {}
+
+  int64_t rank() const override { return rank_; }
+  int64_t world_size() const override { return 2; }
+  void barrier() override {}
+
+  torch::Tensor broadcast(const torch::Tensor& input,
+                          int64_t /*root*/,
+                          const std::vector<int64_t>& /*group*/) override {
+    return input.clone();
+  }
+
+  torch::Tensor all_reduce(const torch::Tensor& input,
+                           cverl::distributed::ReduceOp /*op*/,
+                           const std::vector<int64_t>& /*group*/) override {
+    return input.clone();
+  }
+
+  torch::Tensor all_gather(const torch::Tensor& input,
+                           const std::vector<int64_t>& group,
+                           int64_t dim) override {
+    if (dim != 0) {
+      throw std::invalid_argument("SliceCollectives all_gather dim must be 0");
+    }
+    std::vector<torch::Tensor> copies;
+    copies.reserve(group.size());
+    for (size_t i = 0; i < group.size(); ++i) {
+      copies.push_back(input.clone());
+    }
+    return torch::cat(copies, 0);
+  }
+
+  torch::Tensor reduce_scatter(const torch::Tensor& input,
+                               cverl::distributed::ReduceOp op,
+                               const std::vector<int64_t>& group,
+                               int64_t dim) override {
+    if (dim != 0 || group.size() != 2 || input.size(0) % 2 != 0) {
+      throw std::invalid_argument("SliceCollectives reduce_scatter expects two even shards");
+    }
+    last_reduce_op = op;
+    ++reduce_scatter_calls;
+    const int64_t shard = input.size(0) / 2;
+    return input.narrow(0, rank_ * shard, shard).clone();
+  }
+
+  void send(const torch::Tensor& /*input*/, int64_t /*peer*/) override {}
+  torch::Tensor recv_like(const torch::Tensor& like, int64_t /*peer*/) override {
+    return torch::empty_like(like);
+  }
+
+  int64_t reduce_scatter_calls = 0;
+  cverl::distributed::ReduceOp last_reduce_op = cverl::distributed::ReduceOp::Sum;
+
+ private:
+  int64_t rank_ = 0;
+};
+
 void require(bool cond, const char* msg) {
   if (!cond) {
     throw std::runtime_error(msg);
@@ -155,6 +214,37 @@ void test_flat_gradient_shards() {
   require_allclose(optional.shard, torch::zeros({3}, torch::kFloat32), "optional missing gradient zeros");
 }
 
+void test_reduce_scatter_flat_gradient_shard() {
+  auto p0 = torch::zeros({2, 3}, torch::TensorOptions().dtype(torch::kBFloat16));
+  auto p1 = torch::zeros({5}, torch::TensorOptions().dtype(torch::kBFloat16));
+  p0.set_requires_grad(true);
+  p1.set_requires_grad(true);
+  p0.mutable_grad() = torch::arange(1, 7, torch::TensorOptions().dtype(torch::kFloat32)).reshape({2, 3});
+  p1.mutable_grad() = torch::arange(11, 16, torch::TensorOptions().dtype(torch::kFloat32));
+  std::vector<torch::Tensor> params{p0, p1};
+
+  SliceCollectives rank0(0);
+  SliceCollectives rank1(1);
+  auto shard0 = cverl::distributed::reduce_scatter_flat_gradient_shard(params, rank0, {0, 1}, true);
+  auto shard1 = cverl::distributed::reduce_scatter_flat_gradient_shard(params, rank1, {0, 1}, false);
+  auto expected = torch::cat({p0.grad().to(torch::kFloat32).view({-1}),
+                              p1.grad().to(torch::kFloat32).view({-1}),
+                              torch::zeros({1}, torch::kFloat32)}, 0).contiguous();
+  require(rank0.reduce_scatter_calls == 1 && rank1.reduce_scatter_calls == 1,
+          "flat reduce-scatter should issue one collective per rank");
+  require(rank0.last_reduce_op == cverl::distributed::ReduceOp::Mean, "average uses mean reduce-scatter");
+  require(rank1.last_reduce_op == cverl::distributed::ReduceOp::Sum, "non-average uses sum reduce-scatter");
+  require(shard0.original_numel == 11 && shard0.padded_numel == 12, "rank0 flat reduce-scatter metadata");
+  require(shard1.original_numel == 11 && shard1.padded_numel == 12, "rank1 flat reduce-scatter metadata");
+  require_allclose(shard0.shard, expected.narrow(0, 0, 6), "rank0 flat reduce-scatter shard");
+  require_allclose(shard1.shard, expected.narrow(0, 6, 6), "rank1 flat reduce-scatter shard");
+
+  SliceCollectives bad_rank(1);
+  require_throws([&]() {
+    (void)cverl::distributed::reduce_scatter_flat_gradient_shard(params, bad_rank, {0}, true);
+  }, "rank outside data group rejected");
+}
+
 void test_flat_sharded_adamw_matches_dense() {
   cverl::torch_backend::Fp32MasterAdamWOptions opts;
   opts.lr = 2.0e-4;
@@ -228,6 +318,7 @@ int main() {
     test_flat_parameter_shard_update_slice();
     test_apply_full_flat_validation();
     test_flat_gradient_shards();
+    test_reduce_scatter_flat_gradient_shard();
     test_flat_sharded_adamw_matches_dense();
     std::cout << "optimizer sharding tests passed\n";
     return 0;

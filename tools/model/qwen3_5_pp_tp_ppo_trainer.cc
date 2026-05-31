@@ -1153,6 +1153,8 @@ int main(int argc, char** argv) {
     const double advantage_scale = arg_f64(argc, argv, "--advantage-scale", 1.0);
     const bool use_master_weights = arg_bool(argc, argv, "--master-weights", false);
     const bool dp_shard_optimizer = arg_bool(argc, argv, "--dp-shard-optimizer", false);
+    const bool dp_flat_shard_optimizer =
+        dp_shard_optimizer && arg_bool(argc, argv, "--dp-flat-shard-optimizer", true);
     const bool skip_optimizer_step = arg_bool(argc, argv, "--skip-optimizer-step", false);
     const bool vary_tokens_by_step = arg_bool(argc, argv, "--vary-tokens-by-step", false);
     const std::string jsonl_input = arg_str(argc, argv, "--jsonl-input", "");
@@ -1289,10 +1291,11 @@ int main(int argc, char** argv) {
       dp_optimizer_owner_by_param = cverl::distributed::greedy_parameter_owner_by_size(param_bytes, dp_size);
     }
     const auto optimizer_param_indices =
-        dp_shard_optimizer
+        (dp_shard_optimizer && !dp_flat_shard_optimizer)
             ? cverl::distributed::owned_parameter_indices(dp_optimizer_owner_by_param, info.data_rank)
             : full_index_list(params.size());
-    auto optimizer_params = select_params(params, optimizer_param_indices);
+    auto optimizer_params =
+        dp_flat_shard_optimizer ? std::vector<torch::Tensor>{} : select_params(params, optimizer_param_indices);
     cverl::torch_backend::Fp32MasterAdamWOptions optim_options;
     optim_options.lr = lr;
     optim_options.beta1 = 0.9;
@@ -1301,6 +1304,16 @@ int main(int argc, char** argv) {
     optim_options.weight_decay = 0.01;
     optim_options.use_master_weights = use_master_weights;
     cverl::torch_backend::Fp32MasterAdamW optimizer(optimizer_params, optim_options);
+    cverl::distributed::FlatParameterShard flat_param_shard;
+    std::unique_ptr<cverl::torch_backend::FlatAdamW> flat_optimizer;
+    if (dp_flat_shard_optimizer) {
+      if (!resume_checkpoint.empty() || checkpoint_every > 0) {
+        throw std::runtime_error(
+            "flat DP sharded optimizer checkpoint/resume is not wired yet; use --dp-flat-shard-optimizer false");
+      }
+      flat_param_shard = cverl::distributed::flatten_parameter_shard(params, dp_size, info.data_rank);
+      flat_optimizer = std::make_unique<cverl::torch_backend::FlatAdamW>(flat_param_shard.shard, optim_options);
+    }
     int64_t start_step = 0;
     if (!resume_checkpoint.empty()) {
       start_step = load_rank_checkpoint(resume_checkpoint,
@@ -1323,12 +1336,15 @@ int main(int argc, char** argv) {
 
     for (int64_t step = start_step; step < steps; ++step) {
       zero_model_gradients(params);
-      optimizer.zero_grad();
+      if (!dp_flat_shard_optimizer) {
+        optimizer.zero_grad();
+      }
       auto param_before = clone_params(params);
       auto optimizer_param_before =
           (!dp_shard_optimizer && use_master_weights)
               ? cverl::torch_backend::clone_detached(optimizer.master_parameters())
               : std::vector<torch::Tensor>{};
+      torch::Tensor flat_gradient_shard;
       std::unordered_map<int64_t, torch::Tensor> stage_inputs;
       std::unordered_map<int64_t, torch::Tensor> stage_outputs;
       double loss_sum = 0.0;
@@ -1460,31 +1476,58 @@ int main(int argc, char** argv) {
       }
 
       sync_tp_replicated_gradients(param_names, params, tp_group, tp_grad_bucket_bytes);
-      cverl::distributed::data_parallel_sync_gradients(
-          params, dp_comm, dp_group.ranks, true, dp_grad_bucket_bytes);
+      if (dp_flat_shard_optimizer) {
+        auto flat_grad = cverl::distributed::reduce_scatter_flat_gradient_shard(
+            params, dp_comm, dp_group.ranks, true, false);
+        if (flat_grad.original_numel != flat_param_shard.original_numel ||
+            flat_grad.padded_numel != flat_param_shard.padded_numel ||
+            flat_grad.shard.numel() != flat_param_shard.shard.numel()) {
+          throw std::runtime_error("flat DP optimizer parameter/gradient shard metadata mismatch");
+        }
+        flat_gradient_shard = flat_grad.shard;
+      } else {
+        cverl::distributed::data_parallel_sync_gradients(
+            params, dp_comm, dp_group.ranks, true, dp_grad_bucket_bytes);
+      }
       const double local_grad_norm_sq =
-          dp_shard_optimizer ? grad_l2_norm_sq(params) : optimizer.grad_l2_norm_sq();
+          dp_flat_shard_optimizer
+              ? flat_gradient_shard.pow(2).sum().item<double>()
+              : (dp_shard_optimizer ? grad_l2_norm_sq(params) : optimizer.grad_l2_norm_sq());
       auto grad_sq_tensor =
           torch::tensor({local_grad_norm_sq}, torch::TensorOptions().device(device).dtype(torch::kFloat32));
       auto global_grad_sq_tensor =
-          model_comm.all_reduce(
-              grad_sq_tensor.contiguous(), cverl::distributed::ReduceOp::Sum, full_group(model_parallel_size));
+          dp_flat_shard_optimizer
+              ? full_comm.all_reduce(grad_sq_tensor.contiguous(), cverl::distributed::ReduceOp::Sum, full_ranks)
+              : model_comm.all_reduce(
+                    grad_sq_tensor.contiguous(), cverl::distributed::ReduceOp::Sum, full_group(model_parallel_size));
       const double global_grad_norm =
           std::sqrt(static_cast<double>(global_grad_sq_tensor.cpu()[0].item<float>()));
       double grad_clip_scale = 1.0;
       if (max_grad_norm > 0.0 && std::isfinite(global_grad_norm) && global_grad_norm > max_grad_norm) {
         grad_clip_scale = max_grad_norm / (global_grad_norm + 1.0e-6);
-        if (dp_shard_optimizer) {
+        if (dp_flat_shard_optimizer) {
+          flat_gradient_shard.mul_(grad_clip_scale);
+        } else if (dp_shard_optimizer) {
           scale_model_gradients(params, grad_clip_scale);
         } else {
           optimizer.scale_gradients(grad_clip_scale);
         }
       }
       const double local_grad_norm =
-          dp_shard_optimizer ? grad_norm_sum(params) : optimizer.grad_norm_sum();
+          dp_flat_shard_optimizer
+              ? flat_gradient_shard.norm().item<double>()
+              : (dp_shard_optimizer ? grad_norm_sum(params) : optimizer.grad_norm_sum());
       if (!skip_optimizer_step) {
-        optimizer.step();
-        if (dp_shard_optimizer) {
+        if (dp_flat_shard_optimizer) {
+          flat_optimizer->step(flat_gradient_shard);
+          auto gathered_flat =
+              dp_comm.all_gather(flat_optimizer->parameter_shard().contiguous(), dp_group.ranks, 0).contiguous();
+          cverl::distributed::apply_full_flat_parameters(
+              gathered_flat, flat_param_shard.original_numel, params);
+        } else {
+          optimizer.step();
+        }
+        if (dp_shard_optimizer && !dp_flat_shard_optimizer) {
           broadcast_dp_sharded_optimizer_parameters(param_names,
                                                     params,
                                                     dp_optimizer_owner_by_param,

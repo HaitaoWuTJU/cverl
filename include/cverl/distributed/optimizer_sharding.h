@@ -5,6 +5,8 @@
 
 #include <torch/torch.h>
 
+#include "cverl/distributed/collectives.h"
+
 namespace cverl::distributed {
 
 struct FlatParameterShardRange {
@@ -37,6 +39,12 @@ FlatParameterShard flatten_gradient_shard(const std::vector<torch::Tensor>& para
                                           int64_t data_parallel,
                                           int64_t data_rank,
                                           bool require_grad = true);
+
+FlatParameterShard reduce_scatter_flat_gradient_shard(const std::vector<torch::Tensor>& parameters,
+                                                      Collectives& collectives,
+                                                      const std::vector<int64_t>& data_group,
+                                                      bool average,
+                                                      bool require_grad = true);
 
 void apply_flat_parameter_shard(const FlatParameterShard& shard,
                                 const std::vector<torch::Tensor>& parameters);

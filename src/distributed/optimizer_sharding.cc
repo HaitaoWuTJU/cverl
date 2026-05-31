@@ -75,6 +75,43 @@ FlatParameterShard flatten_tensor_list_shard(const std::vector<torch::Tensor>& t
   return out;
 }
 
+int64_t rank_index_in_group(int64_t rank, const std::vector<int64_t>& group, const char* name) {
+  if (group.empty()) {
+    throw std::invalid_argument(std::string(name) + " requires a non-empty data group");
+  }
+  for (size_t i = 0; i < group.size(); ++i) {
+    if (group[i] == rank) {
+      return static_cast<int64_t>(i);
+    }
+  }
+  throw std::invalid_argument(std::string(name) + " collectives rank is not in data group");
+}
+
+std::vector<torch::Tensor> gradient_tensor_list(const std::vector<torch::Tensor>& parameters,
+                                                bool require_grad,
+                                                const char* name) {
+  std::vector<torch::Tensor> gradients;
+  gradients.reserve(parameters.size());
+  for (const auto& parameter : parameters) {
+    if (!parameter.defined()) {
+      throw std::invalid_argument(std::string(name) + " requires defined parameters");
+    }
+    if (!parameter.grad().defined()) {
+      if (require_grad) {
+        throw std::invalid_argument(std::string(name) + " missing parameter gradient");
+      }
+      gradients.push_back(torch::zeros_like(parameter, torch::TensorOptions().dtype(torch::kFloat32)));
+      continue;
+    }
+    auto grad = parameter.grad().detach();
+    if (grad.numel() != parameter.numel()) {
+      throw std::invalid_argument(std::string(name) + " gradient size mismatch");
+    }
+    gradients.push_back(grad.to(parameter.device(), torch::kFloat32).contiguous().view(parameter.sizes()));
+  }
+  return gradients;
+}
+
 }  // namespace
 
 std::vector<int64_t> greedy_parameter_owner_by_size(const std::vector<int64_t>& parameter_bytes,
@@ -133,26 +170,33 @@ FlatParameterShard flatten_gradient_shard(const std::vector<torch::Tensor>& para
                                           int64_t data_parallel,
                                           int64_t data_rank,
                                           bool require_grad) {
-  std::vector<torch::Tensor> gradients;
-  gradients.reserve(parameters.size());
-  for (const auto& parameter : parameters) {
-    if (!parameter.defined()) {
-      throw std::invalid_argument("flatten_gradient_shard requires defined parameters");
-    }
-    if (!parameter.grad().defined()) {
-      if (require_grad) {
-        throw std::invalid_argument("flatten_gradient_shard missing parameter gradient");
-      }
-      gradients.push_back(torch::zeros_like(parameter, torch::TensorOptions().dtype(torch::kFloat32)));
-      continue;
-    }
-    auto grad = parameter.grad().detach();
-    if (grad.numel() != parameter.numel()) {
-      throw std::invalid_argument("flatten_gradient_shard gradient size mismatch");
-    }
-    gradients.push_back(grad.to(parameter.device(), torch::kFloat32).contiguous().view(parameter.sizes()));
-  }
+  auto gradients = gradient_tensor_list(parameters, require_grad, "flatten_gradient_shard");
   return flatten_tensor_list_shard(gradients, data_parallel, data_rank, "flatten_gradient_shard");
+}
+
+FlatParameterShard reduce_scatter_flat_gradient_shard(const std::vector<torch::Tensor>& parameters,
+                                                      Collectives& collectives,
+                                                      const std::vector<int64_t>& data_group,
+                                                      bool average,
+                                                      bool require_grad) {
+  const int64_t data_rank =
+      rank_index_in_group(collectives.rank(), data_group, "reduce_scatter_flat_gradient_shard");
+  const int64_t data_parallel = static_cast<int64_t>(data_group.size());
+  auto gradients = gradient_tensor_list(parameters, require_grad, "reduce_scatter_flat_gradient_shard");
+  auto full_flat = flatten_tensor_list_shard(gradients, 1, 0, "reduce_scatter_flat_gradient_shard");
+  auto metadata = flatten_tensor_list_shard(gradients, data_parallel, data_rank, "reduce_scatter_flat_gradient_shard");
+  auto flat = full_flat.shard;
+  if (metadata.padded_numel > flat.numel()) {
+    flat = torch::cat({flat, torch::zeros({metadata.padded_numel - flat.numel()}, flat.options())}, 0).contiguous();
+  }
+  metadata.shard = collectives
+                       .reduce_scatter(
+                           flat.contiguous(), average ? ReduceOp::Mean : ReduceOp::Sum, data_group, 0)
+                       .contiguous();
+  if (metadata.shard.numel() != metadata.shard_end - metadata.shard_begin) {
+    throw std::runtime_error("reduce_scatter_flat_gradient_shard returned an unexpected shard size");
+  }
+  return metadata;
 }
 
 void apply_flat_parameter_shard(const FlatParameterShard& shard,
