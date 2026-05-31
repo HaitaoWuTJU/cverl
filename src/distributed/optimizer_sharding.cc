@@ -18,8 +18,6 @@ FlatParameterShard flatten_tensor_list_shard(const std::vector<torch::Tensor>& t
                                              int64_t data_rank,
                                              const char* name) {
   validate_dp_rank(data_parallel, data_rank);
-  std::vector<torch::Tensor> flat_tensors;
-  flat_tensors.reserve(tensors.size());
   int64_t original_numel = 0;
   torch::Device device(torch::kCPU);
   bool have_tensor = false;
@@ -33,39 +31,34 @@ FlatParameterShard flatten_tensor_list_shard(const std::vector<torch::Tensor>& t
     } else if (tensor.device() != device) {
       throw std::invalid_argument(std::string(name) + " requires tensors on one device");
     }
-    flat_tensors.push_back(tensor.detach().to(torch::kFloat32).contiguous().view({tensor.numel()}));
     original_numel += tensor.numel();
   }
 
   const int64_t remainder = original_numel % data_parallel;
   const int64_t pad = remainder == 0 ? 0 : data_parallel - remainder;
   const int64_t padded_numel = original_numel + pad;
-  torch::Tensor flat;
-  if (flat_tensors.empty()) {
-    flat = torch::zeros({padded_numel}, torch::TensorOptions().device(device).dtype(torch::kFloat32));
-  } else if (flat_tensors.size() == 1) {
-    flat = flat_tensors[0].contiguous();
-  } else {
-    flat = torch::cat(flat_tensors, 0).contiguous();
-  }
-  if (pad > 0 && !flat_tensors.empty()) {
-    flat = torch::cat({flat, torch::zeros({pad}, flat.options())}, 0).contiguous();
-  }
-
   const int64_t shard_size = padded_numel / data_parallel;
   FlatParameterShard out;
   out.original_numel = original_numel;
   out.padded_numel = padded_numel;
   out.shard_begin = data_rank * shard_size;
   out.shard_end = out.shard_begin + shard_size;
-  out.shard = flat.narrow(0, out.shard_begin, shard_size).contiguous();
 
+  std::vector<torch::Tensor> shard_parts;
+  shard_parts.reserve(tensors.size() + 1);
+  const auto shard_options = torch::TensorOptions().device(device).dtype(torch::kFloat32);
   int64_t tensor_begin = 0;
   for (size_t i = 0; i < tensors.size(); ++i) {
     const int64_t tensor_end = tensor_begin + tensors[i].numel();
     const int64_t overlap_begin = std::max(tensor_begin, out.shard_begin);
     const int64_t overlap_end = std::min(tensor_end, out.shard_end);
     if (overlap_begin < overlap_end) {
+      auto part = tensors[i].detach()
+                      .view({tensors[i].numel()})
+                      .narrow(0, overlap_begin - tensor_begin, overlap_end - overlap_begin)
+                      .to(shard_options.device(), shard_options.dtype())
+                      .contiguous();
+      shard_parts.push_back(part);
       out.ranges.push_back(FlatParameterShardRange{
           static_cast<int64_t>(i),
           overlap_begin - tensor_begin,
@@ -74,6 +67,20 @@ FlatParameterShard flatten_tensor_list_shard(const std::vector<torch::Tensor>& t
       });
     }
     tensor_begin = tensor_end;
+  }
+  const int64_t valid_begin = std::min(out.shard_begin, original_numel);
+  const int64_t valid_end = std::min(out.shard_end, original_numel);
+  const int64_t valid_numel = std::max<int64_t>(0, valid_end - valid_begin);
+  const int64_t pad_numel = shard_size - valid_numel;
+  if (pad_numel > 0) {
+    shard_parts.push_back(torch::zeros({pad_numel}, shard_options));
+  }
+  if (shard_parts.empty()) {
+    out.shard = torch::zeros({shard_size}, shard_options);
+  } else if (shard_parts.size() == 1) {
+    out.shard = shard_parts[0].contiguous();
+  } else {
+    out.shard = torch::cat(shard_parts, 0).contiguous();
   }
   return out;
 }
