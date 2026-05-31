@@ -29,6 +29,7 @@ class SliceCollectives final : public cverl::distributed::Collectives {
   torch::Tensor all_reduce(const torch::Tensor& input,
                            cverl::distributed::ReduceOp /*op*/,
                            const std::vector<int64_t>& /*group*/) override {
+    ++all_reduce_calls;
     return input.clone();
   }
 
@@ -82,6 +83,7 @@ class SliceCollectives final : public cverl::distributed::Collectives {
 
   int64_t reduce_scatter_calls = 0;
   int64_t all_gather_calls = 0;
+  int64_t all_reduce_calls = 0;
   cverl::distributed::ReduceOp last_reduce_op = cverl::distributed::ReduceOp::Sum;
 
  private:
@@ -425,6 +427,34 @@ void test_flat_sharded_adamw_clipped_local_norm() {
   require_near(step.local_grad_norm, max_grad_norm, 1.0e-5, "flat clipped local norm should equal max norm");
 }
 
+void test_flat_sharded_adamw_single_dp_skips_data_collectives() {
+  cverl::torch_backend::Fp32MasterAdamWOptions opts;
+  opts.lr = 1.0e-4;
+  opts.beta1 = 0.9;
+  opts.beta2 = 0.95;
+  opts.eps = 1.0e-8;
+  opts.weight_decay = 0.0;
+  opts.use_master_weights = true;
+
+  auto p0 = torch::linspace(-1.0, 1.0, 5, torch::TensorOptions().dtype(torch::kBFloat16));
+  auto p1 = torch::linspace(2.0, 3.0, 3, torch::TensorOptions().dtype(torch::kBFloat16));
+  p0.set_requires_grad(true);
+  p1.set_requires_grad(true);
+  p0.mutable_grad() = torch::full({5}, 0.25, torch::TensorOptions().dtype(torch::kFloat32));
+  p1.mutable_grad() = torch::full({3}, -0.5, torch::TensorOptions().dtype(torch::kFloat32));
+  std::vector<torch::Tensor> params{p0, p1};
+
+  auto param_rank0 = cverl::distributed::flatten_parameter_shard(params, 1, 0);
+  cverl::torch_backend::FlatAdamW flat_rank0(param_rank0.shard, opts);
+  SliceCollectives comm0(0);
+  auto step = cverl::distributed::flat_sharded_adamw_step(
+      params, param_rank0, flat_rank0, comm0, {0}, comm0, {0}, 0.0, true, true, true, 4, 4);
+  require(step.gradient_shard.shard.numel() == param_rank0.shard.numel(), "single-DP grad shard size");
+  require(comm0.reduce_scatter_calls == 0, "single-DP flat step should skip reduce-scatter");
+  require(comm0.all_gather_calls == 0, "single-DP flat step should skip parameter all-gather");
+  require(comm0.all_reduce_calls == 1, "single-DP flat step should still report norm through norm collective");
+}
+
 }  // namespace
 
 int main() {
@@ -440,6 +470,7 @@ int main() {
     test_reduce_scatter_flat_gradient_shard();
     test_flat_sharded_adamw_matches_dense();
     test_flat_sharded_adamw_clipped_local_norm();
+    test_flat_sharded_adamw_single_dp_skips_data_collectives();
     std::cout << "optimizer sharding tests passed\n";
     return 0;
   } catch (const std::exception& e) {

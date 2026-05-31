@@ -332,6 +332,9 @@ FlatParameterShard reduce_scatter_flat_gradient_shard(const std::vector<torch::T
   const int64_t data_rank =
       rank_index_in_group(collectives.rank(), data_group, "reduce_scatter_flat_gradient_shard");
   const int64_t data_parallel = static_cast<int64_t>(data_group.size());
+  if (data_parallel == 1) {
+    return flatten_gradient_shard(parameters, 1, data_rank, require_grad);
+  }
   auto gradients = gradient_tensor_list(parameters, require_grad, "reduce_scatter_flat_gradient_shard");
   auto full_flat = flatten_tensor_list_shard(gradients, 1, 0, "reduce_scatter_flat_gradient_shard");
   auto metadata = flatten_tensor_list_shard(gradients, data_parallel, data_rank, "reduce_scatter_flat_gradient_shard");
@@ -362,6 +365,9 @@ FlatParameterShard reduce_scatter_flat_gradient_shard_bucketed(
   const int64_t data_rank =
       rank_index_in_group(collectives.rank(), data_group, "reduce_scatter_flat_gradient_shard_bucketed");
   const int64_t data_parallel = static_cast<int64_t>(data_group.size());
+  if (data_parallel == 1) {
+    return flatten_gradient_shard(parameters, 1, data_rank, require_grad);
+  }
   auto gradients = gradient_tensor_list(parameters, require_grad, "reduce_scatter_flat_gradient_shard_bucketed");
   std::vector<int64_t> tensor_numels;
   tensor_numels.reserve(gradients.size());
@@ -422,6 +428,9 @@ torch::Tensor all_gather_flat_parameter_shards(const FlatParameterShard& local_s
       local_shard.shard_end != local_shard.shard_begin + shard_size) {
     throw std::invalid_argument("all_gather_flat_parameter_shards local shard metadata mismatch");
   }
+  if (data_parallel == 1) {
+    return local_shard.shard.contiguous();
+  }
   auto gathered = collectives.all_gather(local_shard.shard.contiguous(), data_group, 0).contiguous();
   if (gathered.dim() != 1 || gathered.numel() != local_shard.padded_numel) {
     throw std::runtime_error("all_gather_flat_parameter_shards returned an unexpected tensor shape");
@@ -460,6 +469,10 @@ void all_gather_apply_flat_parameter_shard_bucketed(const FlatParameterShard& lo
       local_shard.shard_begin != data_rank * shard_size ||
       local_shard.shard_end != local_shard.shard_begin + shard_size) {
     throw std::invalid_argument("all_gather_apply_flat_parameter_shard_bucketed local shard metadata mismatch");
+  }
+  if (data_parallel == 1) {
+    apply_flat_parameter_shard(local_shard, parameters);
+    return;
   }
   const int64_t shard_bucket_numel = std::max<int64_t>(1, bucket_numel / data_parallel);
   for (int64_t shard_offset = 0; shard_offset < shard_size; shard_offset += shard_bucket_numel) {

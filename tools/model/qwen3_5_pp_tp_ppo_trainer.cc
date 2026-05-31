@@ -1685,7 +1685,7 @@ int main(int argc, char** argv) {
             auto ids = make_token_ids(
                 seq_len, action.micro_batch, step, vary_tokens_by_step, active_rollout, jsonl_batches, model.config(), device);
             auto response_ids = ids.slice(1, prompt_len, prompt_len + response_len);
-            auto response_hidden = out_it->second.slice(1, prompt_len - 1, prompt_len + response_len - 1);
+            auto response_hidden = stage_output.slice(1, prompt_len - 1, prompt_len + response_len - 1);
             auto log_probs = model.response_log_probs_tensor_parallel(response_hidden, response_ids, tp_group);
             torch::Tensor old_log_probs = log_probs.detach();
             torch::Tensor advantages;
