@@ -507,6 +507,47 @@ void test_flat_sharded_adamw_single_dp_skips_data_collectives() {
   require(comm0.all_reduce_calls == 0, "single-DP flat step should skip norm all-reduce");
 }
 
+void test_flat_sharded_adamw_no_master_keeps_model_dtype() {
+  cverl::torch_backend::Fp32MasterAdamWOptions opts;
+  opts.lr = 1.0e-2;
+  opts.beta1 = 0.9;
+  opts.beta2 = 0.95;
+  opts.eps = 1.0e-8;
+  opts.weight_decay = 0.0;
+  opts.use_master_weights = false;
+
+  auto dense_p = torch::linspace(-1.0, 1.0, 8, torch::TensorOptions().dtype(torch::kBFloat16));
+  dense_p.set_requires_grad(true);
+  auto sharded_p = dense_p.detach().clone();
+  sharded_p.set_requires_grad(true);
+  auto grad = torch::linspace(0.1, 0.8, 8, torch::TensorOptions().dtype(torch::kFloat32));
+  dense_p.mutable_grad() = grad.to(dense_p.scalar_type());
+  sharded_p.mutable_grad() = grad.to(sharded_p.scalar_type());
+
+  cverl::torch_backend::Fp32MasterAdamW dense_optimizer({dense_p}, opts);
+  dense_optimizer.accumulate_model_grads();
+  dense_optimizer.step();
+
+  std::vector<torch::Tensor> sharded_params{sharded_p};
+  auto param_rank0 =
+      cverl::distributed::flatten_parameter_shard(sharded_params, 1, 0, sharded_p.scalar_type());
+  require(param_rank0.shard.scalar_type() == torch::kBFloat16,
+          "no-master flat parameter shard should keep BF16 dtype");
+  cverl::torch_backend::FlatAdamW flat_rank0(param_rank0.shard, opts);
+  SliceCollectives comm0(0);
+  auto step = cverl::distributed::flat_sharded_adamw_step(
+      sharded_params, param_rank0, flat_rank0, comm0, {0}, comm0, {0}, 0.0, true, true, true, 4, 4);
+  require(step.gradient_shard.shard.scalar_type() == torch::kFloat32,
+          "no-master flat gradient shard should stay fp32");
+  require(flat_rank0.parameter_shard().scalar_type() == torch::kBFloat16,
+          "no-master flat optimizer parameter shard should stay BF16");
+  require_allclose(sharded_p.to(torch::kFloat32),
+                   dense_p.to(torch::kFloat32),
+                   "flat no-master sharded AdamW matches dense no-master model",
+                   1.0e-5,
+                   2.0e-5);
+}
+
 }  // namespace
 
 int main() {
@@ -525,6 +566,7 @@ int main() {
     test_flat_sharded_adamw_matches_dense();
     test_flat_sharded_adamw_clipped_local_norm();
     test_flat_sharded_adamw_single_dp_skips_data_collectives();
+    test_flat_sharded_adamw_no_master_keeps_model_dtype();
     std::cout << "optimizer sharding tests passed\n";
     return 0;
   } catch (const std::exception& e) {

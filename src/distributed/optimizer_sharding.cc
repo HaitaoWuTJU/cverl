@@ -17,6 +17,7 @@ void validate_dp_rank(int64_t data_parallel, int64_t data_rank) {
 FlatParameterShard flatten_tensor_list_shard(const std::vector<torch::Tensor>& tensors,
                                              int64_t data_parallel,
                                              int64_t data_rank,
+                                             torch::ScalarType shard_dtype,
                                              const char* name) {
   validate_dp_rank(data_parallel, data_rank);
   int64_t original_numel = 0;
@@ -47,7 +48,7 @@ FlatParameterShard flatten_tensor_list_shard(const std::vector<torch::Tensor>& t
 
   std::vector<torch::Tensor> shard_parts;
   shard_parts.reserve(tensors.size() + 1);
-  const auto shard_options = torch::TensorOptions().device(device).dtype(torch::kFloat32);
+  const auto shard_options = torch::TensorOptions().device(device).dtype(shard_dtype);
   int64_t tensor_begin = 0;
   for (size_t i = 0; i < tensors.size(); ++i) {
     const int64_t tensor_end = tensor_begin + tensors[i].numel();
@@ -84,6 +85,13 @@ FlatParameterShard flatten_tensor_list_shard(const std::vector<torch::Tensor>& t
     out.shard = torch::cat(shard_parts, 0).contiguous();
   }
   return out;
+}
+
+FlatParameterShard flatten_tensor_list_shard(const std::vector<torch::Tensor>& tensors,
+                                             int64_t data_parallel,
+                                             int64_t data_rank,
+                                             const char* name) {
+  return flatten_tensor_list_shard(tensors, data_parallel, data_rank, torch::kFloat32, name);
 }
 
 FlatParameterShard make_flat_shard_metadata(const std::vector<int64_t>& tensor_numels,
@@ -365,12 +373,20 @@ std::vector<int64_t> owned_parameter_indices(const std::vector<int64_t>& owner_b
 FlatParameterShard flatten_parameter_shard(const std::vector<torch::Tensor>& parameters,
                                            int64_t data_parallel,
                                            int64_t data_rank) {
+  return flatten_parameter_shard(parameters, data_parallel, data_rank, torch::kFloat32);
+}
+
+FlatParameterShard flatten_parameter_shard(const std::vector<torch::Tensor>& parameters,
+                                           int64_t data_parallel,
+                                           int64_t data_rank,
+                                           torch::ScalarType shard_dtype) {
   for (const auto& parameter : parameters) {
     if (!parameter.defined()) {
       throw std::invalid_argument("flatten_parameter_shard requires contiguous defined parameters");
     }
   }
-  return flatten_tensor_list_shard(parameters, data_parallel, data_rank, "flatten_parameter_shard");
+  return flatten_tensor_list_shard(
+      parameters, data_parallel, data_rank, shard_dtype, "flatten_parameter_shard");
 }
 
 FlatParameterShard flatten_gradient_shard(const std::vector<torch::Tensor>& parameters,

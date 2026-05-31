@@ -153,6 +153,35 @@ int main() {
     require_allclose(restored_flat.exp_avg(), flat_optimizer.exp_avg(), "restored flat exp_avg");
     require_allclose(restored_flat.exp_avg_sq(), flat_optimizer.exp_avg_sq(), "restored flat exp_avg_sq");
 
+    cverl::torch_backend::Fp32MasterAdamWOptions flat_no_master_opts = flat_opts;
+    flat_no_master_opts.use_master_weights = false;
+    flat_no_master_opts.lr = 1.0e-2;
+    auto dense_no_master_p =
+        torch::linspace(-1.0, 1.0, 8, torch::TensorOptions().dtype(torch::kBFloat16));
+    dense_no_master_p.set_requires_grad(true);
+    auto flat_no_master_initial = dense_no_master_p.detach().view({-1}).contiguous();
+    auto flat_no_master_grad = torch::linspace(0.1, 0.8, 8, torch::TensorOptions().dtype(torch::kFloat32));
+    cverl::torch_backend::Fp32MasterAdamW dense_no_master_optimizer(
+        {dense_no_master_p}, flat_no_master_opts);
+    cverl::torch_backend::FlatAdamW flat_no_master_optimizer(
+        flat_no_master_initial, flat_no_master_opts);
+    dense_no_master_p.mutable_grad() =
+        flat_no_master_grad.view_as(dense_no_master_p).to(dense_no_master_p.scalar_type());
+    dense_no_master_optimizer.accumulate_model_grads();
+    dense_no_master_optimizer.step();
+    flat_no_master_optimizer.step(flat_no_master_grad);
+    require(flat_no_master_optimizer.parameter_shard().scalar_type() == torch::kBFloat16,
+            "flat no-master parameter shard keeps model dtype");
+    require(flat_no_master_optimizer.exp_avg().scalar_type() == torch::kFloat32,
+            "flat no-master exp_avg stays fp32");
+    require(flat_no_master_optimizer.exp_avg_sq().scalar_type() == torch::kFloat32,
+            "flat no-master exp_avg_sq stays fp32");
+    require_allclose(flat_no_master_optimizer.parameter_shard().to(torch::kFloat32),
+                     dense_no_master_p.detach().view({-1}).to(torch::kFloat32),
+                     "flat no-master AdamW must match dense no-master AdamW",
+                     1.0e-5,
+                     2.0e-5);
+
     std::cout << "fp32 master AdamW test passed"
               << " master_delta=" << master_delta
               << " model_delta=" << model_delta

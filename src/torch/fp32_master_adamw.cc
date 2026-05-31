@@ -274,9 +274,11 @@ FlatAdamW::FlatAdamW(torch::Tensor parameter_shard, Fp32MasterAdamWOptions optio
     throw std::invalid_argument("FlatAdamW: parameter shard must be contiguous");
   }
   torch::NoGradGuard no_grad;
-  parameter_shard_ = parameter_shard.detach().to(torch::kFloat32).contiguous();
-  exp_avg_ = torch::zeros_like(parameter_shard_);
-  exp_avg_sq_ = torch::zeros_like(parameter_shard_);
+  parameter_shard_ = options_.use_master_weights ? parameter_shard.detach().to(torch::kFloat32).contiguous()
+                                                 : parameter_shard.detach().contiguous();
+  auto state_options = parameter_shard_.options().dtype(torch::kFloat32);
+  exp_avg_ = torch::zeros(parameter_shard_.sizes(), state_options);
+  exp_avg_sq_ = torch::zeros(parameter_shard_.sizes(), state_options);
 }
 
 void FlatAdamW::step(const torch::Tensor& gradient_shard) {
@@ -286,6 +288,7 @@ void FlatAdamW::step(const torch::Tensor& gradient_shard) {
   torch::NoGradGuard no_grad;
   ++step_;
   auto grad = gradient_shard.detach().to(parameter_shard_.device(), torch::kFloat32).view(parameter_shard_.sizes());
+  auto parameter_fp32 = options_.use_master_weights ? parameter_shard_ : parameter_shard_.to(torch::kFloat32);
   const double beta1 = options_.beta1;
   const double beta2 = options_.beta2;
   const double bias_correction1 = 1.0 - std::pow(beta1, static_cast<double>(step_));
@@ -295,10 +298,13 @@ void FlatAdamW::step(const torch::Tensor& gradient_shard) {
   exp_avg_.mul_(beta1).add_(grad, 1.0 - beta1);
   exp_avg_sq_.mul_(beta2).addcmul_(grad, grad, 1.0 - beta2);
   if (options_.weight_decay != 0.0) {
-    parameter_shard_.add_(parameter_shard_, -options_.lr * options_.weight_decay);
+    parameter_fp32.add_(parameter_fp32, -options_.lr * options_.weight_decay);
   }
   auto denom = (exp_avg_sq_ / bias_correction2).sqrt_().add_(options_.eps);
-  parameter_shard_.addcdiv_(exp_avg_, denom, -step_size);
+  parameter_fp32.addcdiv_(exp_avg_, denom, -step_size);
+  if (!options_.use_master_weights) {
+    parameter_shard_.copy_(parameter_fp32.to(parameter_shard_.scalar_type()));
+  }
 }
 
 void FlatAdamW::load_state(const torch::Tensor& parameter_value,
@@ -314,7 +320,9 @@ void FlatAdamW::load_state(const torch::Tensor& parameter_value,
     throw std::invalid_argument("FlatAdamW::load_state: state shape mismatch");
   }
   torch::NoGradGuard no_grad;
-  parameter_shard_.copy_(parameter_value.detach().to(parameter_shard_.device(), torch::kFloat32).view(parameter_shard_.sizes()));
+  const auto parameter_dtype = options_.use_master_weights ? torch::kFloat32 : parameter_shard_.scalar_type();
+  parameter_shard_.copy_(
+      parameter_value.detach().to(parameter_shard_.device(), parameter_dtype).view(parameter_shard_.sizes()));
   exp_avg_.copy_(exp_avg.detach().to(exp_avg_.device(), torch::kFloat32).view(exp_avg_.sizes()));
   exp_avg_sq_.copy_(exp_avg_sq.detach().to(exp_avg_sq_.device(), torch::kFloat32).view(exp_avg_sq_.sizes()));
   step_ = step;

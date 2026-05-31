@@ -714,6 +714,7 @@ void save_rank_flat_checkpoint(const std::string& checkpoint_dir,
   rank_meta["param_file"] = rank_file;
   rank_meta["optimizer_step"] = optimizer.step_count();
   rank_meta["optimizer_kind"] = "FlatAdamW";
+  rank_meta["use_master_weights"] = optimizer.options().use_master_weights;
   rank_meta["model_parameters_saved"] = save_model_params;
   rank_meta["optimizer_param_indices"] = full_index_list(params.size());
   rank_meta["flat_parameter_shard"] = {
@@ -722,6 +723,7 @@ void save_rank_flat_checkpoint(const std::string& checkpoint_dir,
       {"shard_begin", flat_param_shard.shard_begin},
       {"shard_end", flat_param_shard.shard_end},
       {"numel", flat_param_shard.shard.numel()},
+      {"dtype", c10::toString(flat_param_shard.shard.scalar_type())},
   };
   rank_meta["parameters"] = nlohmann::json::array();
   for (size_t i = 0; i < params.size(); ++i) {
@@ -813,6 +815,7 @@ void write_flat_checkpoint_manifest(const std::string& checkpoint_dir,
       save_model_params ? "cverl_pp_tp_rank_local_checkpoint_v3" : "cverl_pp_tp_flat_shard_checkpoint_v4";
   manifest["complete"] = true;
   manifest["optimizer_kind"] = "FlatAdamW";
+  manifest["use_master_weights"] = optimizer.options().use_master_weights;
   manifest["model_parameters_saved"] = save_model_params;
   manifest["world_size"] = world_size;
   manifest["data_parallel"] = dp_size;
@@ -1032,6 +1035,14 @@ int64_t load_rank_flat_checkpoint(const std::string& checkpoint_path,
       shard_meta.at("numel").get<int64_t>() != flat_param_shard.shard.numel()) {
     throw std::runtime_error("resume flat checkpoint shard metadata mismatch");
   }
+  if (rank_meta.contains("use_master_weights") &&
+      rank_meta.at("use_master_weights").get<bool>() != optimizer.options().use_master_weights) {
+    throw std::runtime_error("resume flat checkpoint master-weight mode mismatch");
+  }
+  if (shard_meta.contains("dtype") &&
+      shard_meta.at("dtype").get<std::string>() != c10::toString(flat_param_shard.shard.scalar_type())) {
+    throw std::runtime_error("resume flat checkpoint shard dtype mismatch");
+  }
 
   int64_t manifest_step = rank_meta.value("optimizer_step", 0);
   bool model_parameters_saved = rank_meta.value("model_parameters_saved", true);
@@ -1049,6 +1060,10 @@ int64_t load_rank_flat_checkpoint(const std::string& checkpoint_path,
       throw std::runtime_error("resume flat checkpoint manifest is not marked complete");
     }
     manifest_step = manifest.at("optimizer").at("step").get<int64_t>();
+    if (manifest.contains("use_master_weights") &&
+        manifest.at("use_master_weights").get<bool>() != optimizer.options().use_master_weights) {
+      throw std::runtime_error("resume flat checkpoint manifest master-weight mode mismatch");
+    }
     model_parameters_saved = manifest.value("model_parameters_saved", format == "cverl_pp_tp_rank_local_checkpoint_v3");
   }
 
@@ -1632,7 +1647,8 @@ int main(int argc, char** argv) {
     cverl::distributed::FlatParameterShard flat_param_shard;
     std::unique_ptr<cverl::torch_backend::FlatAdamW> flat_optimizer;
     if (dp_flat_shard_optimizer) {
-      flat_param_shard = cverl::distributed::flatten_parameter_shard(params, dp_size, info.data_rank);
+      flat_param_shard = cverl::distributed::flatten_parameter_shard(
+          params, dp_size, info.data_rank, use_master_weights ? torch::kFloat32 : dtype);
       flat_optimizer = std::make_unique<cverl::torch_backend::FlatAdamW>(flat_param_shard.shard, optim_options);
     }
     int64_t start_step = 0;
