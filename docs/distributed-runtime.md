@@ -231,12 +231,12 @@ Current code exposes the distributed shape directly:
   uses a recompute-autograd path: forward saves Q/K/V inputs and block
   metadata, not per-block score/probability tensors; backward recomputes the
   streaming attention and returns gradients to the ring-exchange owner-gradient
-  path. CUDA builds also expose a fused forward kernel for ring-ordered CP
-  causal attention that computes causal softmax over ring KV blocks without
-  materializing a `[Q,K]` matrix; backward still uses the recompute path. Full
-  industrial CP training still needs a fused CUDA backward kernel and a
-  lower-latency reduce-scatter ring schedule to replace the current per-owner
-  ring accumulation.
+  path. CUDA builds also expose fused forward and backward kernels for
+  ring-ordered CP causal attention that compute causal softmax over ring KV
+  blocks without materializing a `[Q,K]` matrix. The first CUDA backward is a
+  correctness-oriented recompute kernel; full industrial CP training still
+  needs tile/shared-memory optimization and a lower-latency reduce-scatter ring
+  schedule to replace the current per-owner ring accumulation.
 - `qwen3_5_pp_tp_ppo_trainer`: accepts DP/PP/CP/TP topology dimensions and
   records all four axes in metrics and checkpoint manifests. For `CP>1,TP=1`,
   PP stages now pass local sequence shards, Qwen range forward keeps
@@ -268,4 +268,4 @@ CPU regression coverage includes:
   deterministic weights, validating that CP rank-local forward shards match
   the corresponding dense forward slices.
 - `test_cp_attention_cuda` when `CVERL_ENABLE_CUDA=ON`: fused CUDA CP
-  ring-attention forward plus recompute backward against the dense reference.
+  ring-attention forward/backward against the dense reference.

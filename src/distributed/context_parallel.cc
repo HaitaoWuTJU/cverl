@@ -262,6 +262,23 @@ class ContextParallelRingAttentionRecomputeFunction final
     const double scale = ctx->saved_data["scale"].toDouble();
     const auto key_begin_positions = vector_from_cpu_i64_tensor(saved.at(3));
 
+    if (cp_attention_cuda_available() && saved.at(0).is_cuda() && saved.at(1).is_cuda() && saved.at(2).is_cuda() &&
+        saved.at(0).scalar_type() == torch::kFloat32 && saved.at(1).scalar_type() == torch::kFloat32 &&
+        saved.at(2).scalar_type() == torch::kFloat32 && grad_outputs.at(0).is_cuda() &&
+        grad_outputs.at(0).scalar_type() == torch::kFloat32) {
+      auto grads = cp_ring_attention_cuda_backward(grad_outputs.at(0).contiguous(),
+                                                   saved.at(0).contiguous(),
+                                                   saved.at(1).contiguous(),
+                                                   saved.at(2).contiguous(),
+                                                   key_begin_positions,
+                                                   query_begin,
+                                                   original_sequence_length,
+                                                   shard_size,
+                                                   scale);
+      return {grads.at(0), grads.at(1), grads.at(2), torch::Tensor(), torch::Tensor(), torch::Tensor(), torch::Tensor(),
+              torch::Tensor()};
+    }
+
     torch::AutoGradMode enable_grad(true);
     auto query = saved.at(0).detach().set_requires_grad(true);
     auto key = saved.at(1).detach().set_requires_grad(true);
