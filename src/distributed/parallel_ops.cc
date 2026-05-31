@@ -1,6 +1,7 @@
 #include "cverl/distributed/parallel_ops.h"
 
 #include <cstddef>
+#include <optional>
 #include <stdexcept>
 #include <vector>
 
@@ -37,6 +38,10 @@ int64_t tensor_bytes(const torch::Tensor& tensor) {
   return tensor.numel() * static_cast<int64_t>(tensor.element_size());
 }
 
+int64_t scalar_type_bytes(torch::ScalarType dtype) {
+  return static_cast<int64_t>(torch::empty({0}, torch::TensorOptions().dtype(dtype)).element_size());
+}
+
 struct GradBucketEntry {
   torch::Tensor grad;
   int64_t parameter_index = -1;
@@ -44,7 +49,8 @@ struct GradBucketEntry {
 };
 
 torch::Tensor flatten_grad_bucket(const std::vector<GradBucketEntry>& bucket,
-                                  int64_t padded_numel = -1) {
+                                  int64_t padded_numel = -1,
+                                  std::optional<torch::ScalarType> communication_dtype = std::nullopt) {
   int64_t original_numel = 0;
   for (const auto& entry : bucket) {
     original_numel += entry.numel;
@@ -56,18 +62,27 @@ torch::Tensor flatten_grad_bucket(const std::vector<GradBucketEntry>& bucket,
     throw std::invalid_argument("flatten_grad_bucket padded_numel is smaller than original numel");
   }
   if (bucket.empty()) {
-    return torch::empty({padded_numel}, torch::TensorOptions().dtype(torch::kFloat32));
+    auto dtype = communication_dtype.value_or(torch::kFloat32);
+    return torch::empty({padded_numel}, torch::TensorOptions().dtype(dtype));
   }
   if (bucket.size() == 1 && padded_numel == original_numel) {
     const auto& entry = bucket.front();
-    return entry.grad.contiguous().view({entry.numel});
+    auto flat = entry.grad.contiguous().view({entry.numel});
+    return communication_dtype.has_value() ? flat.to(*communication_dtype) : flat;
   }
 
-  auto flat = torch::empty({padded_numel}, bucket.front().grad.options());
+  auto options = bucket.front().grad.options();
+  if (communication_dtype.has_value()) {
+    options = options.dtype(*communication_dtype);
+  }
+  auto flat = torch::empty({padded_numel}, options);
   int64_t offset = 0;
   for (const auto& entry : bucket) {
-    flat.narrow(0, offset, entry.numel)
-        .copy_(entry.grad.contiguous().view({entry.numel}));
+    auto source = entry.grad.contiguous().view({entry.numel});
+    if (communication_dtype.has_value()) {
+      source = source.to(*communication_dtype);
+    }
+    flat.narrow(0, offset, entry.numel).copy_(source);
     offset += entry.numel;
   }
   if (padded_numel > original_numel) {
@@ -79,12 +94,13 @@ torch::Tensor flatten_grad_bucket(const std::vector<GradBucketEntry>& bucket,
 void flush_grad_bucket(std::vector<GradBucketEntry>* bucket,
                        Collectives& collectives,
                        const std::vector<int64_t>& data_group,
-                       bool average) {
+                       bool average,
+                       std::optional<torch::ScalarType> communication_dtype) {
   if (bucket->empty()) {
     return;
   }
 
-  auto flat = flatten_grad_bucket(*bucket);
+  auto flat = flatten_grad_bucket(*bucket, -1, communication_dtype);
   auto synced = collectives.all_reduce(flat, average ? ReduceOp::Mean : ReduceOp::Sum, data_group).contiguous();
   int64_t offset = 0;
   for (const auto& entry : *bucket) {
@@ -99,6 +115,7 @@ void flush_grad_reduce_scatter_bucket(std::vector<GradBucketEntry>* bucket,
                                       Collectives& collectives,
                                       const std::vector<int64_t>& data_group,
                                       bool average,
+                                      std::optional<torch::ScalarType> communication_dtype,
                                       std::vector<GradientReduceScatterBucket>* out) {
   if (bucket->empty()) {
     return;
@@ -116,7 +133,7 @@ void flush_grad_reduce_scatter_bucket(std::vector<GradBucketEntry>* bucket,
     meta.parameter_indices.push_back(entry.parameter_index);
     meta.parameter_numels.push_back(entry.numel);
   }
-  auto flat = flatten_grad_bucket(*bucket);
+  auto flat = flatten_grad_bucket(*bucket, -1, communication_dtype);
   if (data_group.size() == 1) {
     meta.shard = flat.contiguous();
     meta.original_numel = original_numel;
@@ -130,7 +147,7 @@ void flush_grad_reduce_scatter_bucket(std::vector<GradBucketEntry>* bucket,
   const int64_t remainder = flat.numel() % group_size;
   const int64_t pad = remainder == 0 ? 0 : group_size - remainder;
   if (pad > 0) {
-    flat = flatten_grad_bucket(*bucket, flat.numel() + pad);
+    flat = flatten_grad_bucket(*bucket, flat.numel() + pad, communication_dtype);
   }
   auto shard = collectives.reduce_scatter(
       flat, average ? ReduceOp::Mean : ReduceOp::Sum, data_group, 0).contiguous();
@@ -210,7 +227,8 @@ void data_parallel_sync_gradients(const std::vector<torch::Tensor>& parameters,
                                   Collectives& collectives,
                                   const std::vector<int64_t>& data_group,
                                   bool average,
-                                  int64_t bucket_bytes) {
+                                  int64_t bucket_bytes,
+                                  std::optional<torch::ScalarType> communication_dtype) {
   if (bucket_bytes <= 0) {
     throw std::invalid_argument("data_parallel_sync_gradients bucket_bytes must be positive");
   }
@@ -230,25 +248,27 @@ void data_parallel_sync_gradients(const std::vector<torch::Tensor>& parameters,
       continue;
     }
     auto grad = param.grad();
-    const int64_t grad_bytes = tensor_bytes(grad);
+    const auto effective_dtype = communication_dtype.value_or(grad.scalar_type());
+    const int64_t grad_bytes =
+        communication_dtype.has_value() ? grad.numel() * scalar_type_bytes(effective_dtype) : tensor_bytes(grad);
     const bool incompatible =
-        have_bucket && (grad.scalar_type() != current_dtype || grad.device() != current_device);
+        have_bucket && (effective_dtype != current_dtype || grad.device() != current_device);
     const bool would_overflow = have_bucket && current_bytes + grad_bytes > bucket_bytes;
     if (incompatible || would_overflow) {
-      flush_grad_bucket(&bucket, collectives, data_group, average);
+      flush_grad_bucket(&bucket, collectives, data_group, average, communication_dtype);
       current_bytes = 0;
       have_bucket = false;
     }
 
     if (!have_bucket) {
-      current_dtype = grad.scalar_type();
+      current_dtype = effective_dtype;
       current_device = grad.device();
       have_bucket = true;
     }
     bucket.push_back(GradBucketEntry{grad, -1, grad.numel()});
     current_bytes += grad_bytes;
   }
-  flush_grad_bucket(&bucket, collectives, data_group, average);
+  flush_grad_bucket(&bucket, collectives, data_group, average, communication_dtype);
 }
 
 std::vector<GradientReduceScatterBucket> data_parallel_reduce_scatter_gradients(
@@ -256,7 +276,8 @@ std::vector<GradientReduceScatterBucket> data_parallel_reduce_scatter_gradients(
     Collectives& collectives,
     const std::vector<int64_t>& data_group,
     bool average,
-    int64_t bucket_bytes) {
+    int64_t bucket_bytes,
+    std::optional<torch::ScalarType> communication_dtype) {
   if (bucket_bytes <= 0) {
     throw std::invalid_argument("data_parallel_reduce_scatter_gradients bucket_bytes must be positive");
   }
@@ -275,25 +296,27 @@ std::vector<GradientReduceScatterBucket> data_parallel_reduce_scatter_gradients(
       continue;
     }
     auto grad = param.grad();
-    const int64_t grad_bytes = tensor_bytes(grad);
+    const auto effective_dtype = communication_dtype.value_or(grad.scalar_type());
+    const int64_t grad_bytes =
+        communication_dtype.has_value() ? grad.numel() * scalar_type_bytes(effective_dtype) : tensor_bytes(grad);
     const bool incompatible =
-        have_bucket && (grad.scalar_type() != current_dtype || grad.device() != current_device);
+        have_bucket && (effective_dtype != current_dtype || grad.device() != current_device);
     const bool would_overflow = have_bucket && current_bytes + grad_bytes > bucket_bytes;
     if (incompatible || would_overflow) {
-      flush_grad_reduce_scatter_bucket(&bucket, collectives, data_group, average, &out);
+      flush_grad_reduce_scatter_bucket(&bucket, collectives, data_group, average, communication_dtype, &out);
       current_bytes = 0;
       have_bucket = false;
     }
 
     if (!have_bucket) {
-      current_dtype = grad.scalar_type();
+      current_dtype = effective_dtype;
       current_device = grad.device();
       have_bucket = true;
     }
     bucket.push_back(GradBucketEntry{grad, static_cast<int64_t>(i), grad.numel()});
     current_bytes += grad_bytes;
   }
-  flush_grad_reduce_scatter_bucket(&bucket, collectives, data_group, average, &out);
+  flush_grad_reduce_scatter_bucket(&bucket, collectives, data_group, average, communication_dtype, &out);
   return out;
 }
 

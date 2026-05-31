@@ -16,6 +16,8 @@ class CountingCollectives final : public cverl::distributed::Collectives {
   int64_t reduce_scatter_calls = 0;
   int64_t last_all_reduce_numel = 0;
   int64_t last_reduce_scatter_numel = 0;
+  torch::ScalarType last_all_reduce_dtype = torch::kFloat32;
+  torch::ScalarType last_reduce_scatter_dtype = torch::kFloat32;
 
   int64_t rank() const override { return rank_; }
   int64_t world_size() const override { return world_size_; }
@@ -37,6 +39,7 @@ class CountingCollectives final : public cverl::distributed::Collectives {
     require_group(group);
     ++all_reduce_calls;
     last_all_reduce_numel = input.numel();
+    last_all_reduce_dtype = input.scalar_type();
     return input.clone();
   }
 
@@ -54,6 +57,7 @@ class CountingCollectives final : public cverl::distributed::Collectives {
     require_group(group);
     ++reduce_scatter_calls;
     last_reduce_scatter_numel = input.numel();
+    last_reduce_scatter_dtype = input.scalar_type();
     if (input.size(0) % world_size_ != 0) {
       throw std::invalid_argument("CountingCollectives reduce_scatter expects an even first dimension");
     }
@@ -260,6 +264,43 @@ void test_dp_sync_bucketed() {
   }, "multi-rank dp sync should reject rank outside data group before collectives");
 }
 
+void test_dp_sync_forced_communication_dtype() {
+  CountingCollectives collectives(2, 0);
+  auto p0 = torch::ones({4}, torch::TensorOptions().dtype(torch::kBFloat16).requires_grad(true));
+  auto p1 = torch::full({4}, 2.0, torch::TensorOptions().dtype(torch::kBFloat16).requires_grad(true));
+  p0.mutable_grad() = torch::full({4}, 0.25, torch::TensorOptions().dtype(torch::kBFloat16));
+  p1.mutable_grad() = torch::full({4}, -0.5, torch::TensorOptions().dtype(torch::kBFloat16));
+
+  cverl::distributed::data_parallel_sync_gradients(
+      {p0, p1}, collectives, {0, 1}, true, 1024, torch::kFloat32);
+  if (collectives.all_reduce_calls != 1 || collectives.last_all_reduce_dtype != torch::kFloat32) {
+    throw std::runtime_error("forced DP all-reduce dtype should use one fp32 bucket");
+  }
+  if (p0.grad().scalar_type() != torch::kBFloat16 || p1.grad().scalar_type() != torch::kBFloat16) {
+    throw std::runtime_error("forced DP all-reduce should preserve original grad dtype");
+  }
+  require_allclose(p0.grad().to(torch::kFloat32),
+                   torch::full({4}, 0.25, torch::kFloat32),
+                   "forced dtype dp sync p0");
+  require_allclose(p1.grad().to(torch::kFloat32),
+                   torch::full({4}, -0.5, torch::kFloat32),
+                   "forced dtype dp sync p1");
+
+  collectives.reduce_scatter_calls = 0;
+  auto buckets = cverl::distributed::data_parallel_reduce_scatter_gradients(
+      {p0, p1}, collectives, {0, 1}, true, 1024, torch::kFloat32);
+  if (collectives.reduce_scatter_calls != 1 ||
+      collectives.last_reduce_scatter_dtype != torch::kFloat32 ||
+      buckets.size() != 1 || buckets[0].shard.scalar_type() != torch::kFloat32) {
+    throw std::runtime_error("forced DP reduce-scatter dtype should produce one fp32 shard");
+  }
+  require_allclose(buckets[0].shard,
+                   torch::cat({torch::full({4}, 0.25, torch::kFloat32),
+                               torch::full({4}, -0.5, torch::kFloat32)}, 0)
+                       .narrow(0, 0, 4),
+                   "forced dtype reduce-scatter shard");
+}
+
 void test_dp_reduce_scatter_bucketed_single_process() {
   CountingCollectives collectives;
   auto p0 = torch::randn({2, 3}, torch::requires_grad());
@@ -326,6 +367,7 @@ int main() {
     test_parallel_group_validation();
     test_dp_sync_single_process();
     test_dp_sync_bucketed();
+    test_dp_sync_forced_communication_dtype();
     test_dp_reduce_scatter_bucketed_single_process();
     test_single_process_collectives_validation();
   } catch (const std::exception& e) {

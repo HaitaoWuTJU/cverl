@@ -96,7 +96,9 @@ The first sharding layer is implemented in
 - `tensor_parallel_mlp_swiglu`: shard Qwen/SwiGLU gate and up projections by
   intermediate dimension, then shard down projection by input dimension.
 - `data_parallel_sync_gradients`: all-reduce or average parameter gradients
-  across a DP group.
+  across a DP group. It accepts an optional communication dtype, so BF16/FP16
+  training can choose FP32 gradient communication for numerical stability or
+  BF16/FP16 communication to save bandwidth.
 
 Qwen3.5 has TP entry points for:
 

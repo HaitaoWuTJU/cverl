@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 #include <torch/torch.h>
@@ -45,13 +46,15 @@ void data_parallel_sync_gradients(const std::vector<torch::Tensor>& parameters,
                                   Collectives& collectives,
                                   const std::vector<int64_t>& data_group,
                                   bool average,
-                                  int64_t bucket_bytes = 25 * 1024 * 1024);
+                                  int64_t bucket_bytes = 25 * 1024 * 1024,
+                                  std::optional<torch::ScalarType> communication_dtype = std::nullopt);
 
 std::vector<GradientReduceScatterBucket> data_parallel_reduce_scatter_gradients(
     const std::vector<torch::Tensor>& parameters,
     Collectives& collectives,
     const std::vector<int64_t>& data_group,
     bool average,
-    int64_t bucket_bytes = 25 * 1024 * 1024);
+    int64_t bucket_bytes = 25 * 1024 * 1024,
+    std::optional<torch::ScalarType> communication_dtype = std::nullopt);
 
 }  // namespace cverl::distributed
