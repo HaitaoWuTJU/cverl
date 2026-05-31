@@ -10,6 +10,8 @@
 namespace cverl::distributed {
 namespace {
 
+constexpr int kCpAttentionThreads = 128;
+
 void check_cuda(cudaError_t status, const char* what) {
   if (status != cudaSuccess) {
     throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(status));
@@ -55,6 +57,30 @@ torch::Tensor positions_tensor(const std::vector<int64_t>& key_begin_positions, 
       .contiguous();
 }
 
+__device__ float block_reduce_sum(float value, float* scratch) {
+  scratch[threadIdx.x] = value;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      scratch[threadIdx.x] += scratch[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+  return scratch[0];
+}
+
+__device__ float block_reduce_max(float value, float* scratch) {
+  scratch[threadIdx.x] = value;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      scratch[threadIdx.x] = fmaxf(scratch[threadIdx.x], scratch[threadIdx.x + stride]);
+    }
+    __syncthreads();
+  }
+  return scratch[0];
+}
+
 __global__ void cp_ring_attention_forward_kernel(const float* __restrict__ q,
                                                  const float* __restrict__ k,
                                                  const float* __restrict__ v,
@@ -85,44 +111,52 @@ __global__ void cp_ring_attention_forward_kernel(const float* __restrict__ q,
 
   __shared__ float shared_row_max;
   __shared__ float shared_row_sum;
+  __shared__ float reduction[kCpAttentionThreads];
+
+  float local_row_max = -CUDART_INF_F;
+  if (valid_query) {
+    const int total_keys = num_blocks * shard_size;
+    for (int flat = threadIdx.x; flat < total_keys; flat += blockDim.x) {
+      const int block = flat / shard_size;
+      const int local = flat - block * shard_size;
+      const int key_begin = static_cast<int>(key_begin_positions[block]);
+      const int k_pos = key_begin + local;
+      if (k_pos <= q_pos && k_pos < original_sequence_length) {
+        const int kt = block * shard_size + local;
+        float score = 0.0f;
+        for (int d = 0; d < D; ++d) {
+          score += q[q_base + d] * k[kv_bh_base_k + kt * D + d];
+        }
+        local_row_max = fmaxf(local_row_max, score * scale);
+      }
+    }
+  }
+  const float row_max = block_reduce_max(local_row_max, reduction);
   if (threadIdx.x == 0) {
-    float row_max = -CUDART_INF_F;
-    if (valid_query) {
-      for (int block = 0; block < num_blocks; ++block) {
-        const int key_begin = static_cast<int>(key_begin_positions[block]);
-        for (int local = 0; local < shard_size; ++local) {
-          const int k_pos = key_begin + local;
-          if (k_pos > q_pos || k_pos >= original_sequence_length) {
-            continue;
-          }
-          const int kt = block * shard_size + local;
-          float score = 0.0f;
-          for (int d = 0; d < D; ++d) {
-            score += q[q_base + d] * k[kv_bh_base_k + kt * D + d];
-          }
-          row_max = fmaxf(row_max, score * scale);
-        }
-      }
-    }
-    float row_sum = 0.0f;
-    if (isfinite(row_max)) {
-      for (int block = 0; block < num_blocks; ++block) {
-        const int key_begin = static_cast<int>(key_begin_positions[block]);
-        for (int local = 0; local < shard_size; ++local) {
-          const int k_pos = key_begin + local;
-          if (k_pos > q_pos || k_pos >= original_sequence_length) {
-            continue;
-          }
-          const int kt = block * shard_size + local;
-          float score = 0.0f;
-          for (int d = 0; d < D; ++d) {
-            score += q[q_base + d] * k[kv_bh_base_k + kt * D + d];
-          }
-          row_sum += expf(score * scale - row_max);
-        }
-      }
-    }
     shared_row_max = row_max;
+  }
+  __syncthreads();
+
+  float local_row_sum = 0.0f;
+  if (valid_query && isfinite(shared_row_max)) {
+    const int total_keys = num_blocks * shard_size;
+    for (int flat = threadIdx.x; flat < total_keys; flat += blockDim.x) {
+      const int block = flat / shard_size;
+      const int local = flat - block * shard_size;
+      const int key_begin = static_cast<int>(key_begin_positions[block]);
+      const int k_pos = key_begin + local;
+      if (k_pos <= q_pos && k_pos < original_sequence_length) {
+        const int kt = block * shard_size + local;
+        float score = 0.0f;
+        for (int d = 0; d < D; ++d) {
+          score += q[q_base + d] * k[kv_bh_base_k + kt * D + d];
+        }
+        local_row_sum += expf(score * scale - shared_row_max);
+      }
+    }
+  }
+  const float row_sum = block_reduce_sum(local_row_sum, reduction);
+  if (threadIdx.x == 0) {
     shared_row_sum = row_sum;
   }
   __syncthreads();
@@ -181,6 +215,11 @@ __global__ void cp_ring_attention_backward_q_kernel(const float* __restrict__ gr
   const int kv_bh_base_k = ((b * H + h) * Tk) * D;
   const int kv_bh_base_v = ((b * H + h) * Tk) * V;
 
+  __shared__ float shared_row_max;
+  __shared__ float shared_row_sum;
+  __shared__ float shared_dot_go_o;
+  __shared__ float reduction[kCpAttentionThreads];
+
   if (q_pos >= original_sequence_length) {
     for (int d = threadIdx.x; d < D; d += blockDim.x) {
       dq[q_base + d] = 0.0f;
@@ -188,48 +227,57 @@ __global__ void cp_ring_attention_backward_q_kernel(const float* __restrict__ gr
     return;
   }
 
-  float row_max = -CUDART_INF_F;
-  for (int block = 0; block < num_blocks; ++block) {
+  float local_row_max = -CUDART_INF_F;
+  const int total_keys = num_blocks * shard_size;
+  for (int flat = threadIdx.x; flat < total_keys; flat += blockDim.x) {
+    const int block = flat / shard_size;
+    const int local = flat - block * shard_size;
     const int key_begin = static_cast<int>(key_begin_positions[block]);
-    for (int local = 0; local < shard_size; ++local) {
-      const int k_pos = key_begin + local;
-      if (k_pos > q_pos || k_pos >= original_sequence_length) {
-        continue;
-      }
+    const int k_pos = key_begin + local;
+    if (k_pos <= q_pos && k_pos < original_sequence_length) {
       const int kt = block * shard_size + local;
       float score = 0.0f;
       for (int d = 0; d < D; ++d) {
         score += q[q_base + d] * k[kv_bh_base_k + kt * D + d];
       }
-      row_max = fmaxf(row_max, score * scale);
+      local_row_max = fmaxf(local_row_max, score * scale);
     }
   }
+  const float row_max = block_reduce_max(local_row_max, reduction);
+  if (threadIdx.x == 0) {
+    shared_row_max = row_max;
+  }
+  __syncthreads();
 
-  float row_sum = 0.0f;
-  float dot_go_o = 0.0f;
-  for (int block = 0; block < num_blocks; ++block) {
+  float local_row_sum = 0.0f;
+  float local_dot_go_o = 0.0f;
+  for (int flat = threadIdx.x; flat < total_keys; flat += blockDim.x) {
+    const int block = flat / shard_size;
+    const int local = flat - block * shard_size;
     const int key_begin = static_cast<int>(key_begin_positions[block]);
-    for (int local = 0; local < shard_size; ++local) {
-      const int k_pos = key_begin + local;
-      if (k_pos > q_pos || k_pos >= original_sequence_length) {
-        continue;
-      }
+    const int k_pos = key_begin + local;
+    if (k_pos <= q_pos && k_pos < original_sequence_length) {
       const int kt = block * shard_size + local;
       float score = 0.0f;
       for (int d = 0; d < D; ++d) {
         score += q[q_base + d] * k[kv_bh_base_k + kt * D + d];
       }
-      const float prob_num = expf(score * scale - row_max);
-      row_sum += prob_num;
+      const float prob_num = expf(score * scale - shared_row_max);
+      local_row_sum += prob_num;
       float dot_go_v = 0.0f;
       for (int j = 0; j < V; ++j) {
         dot_go_v += grad_out[go_base + j] * v[kv_bh_base_v + kt * V + j];
       }
-      dot_go_o += prob_num * dot_go_v;
+      local_dot_go_o += prob_num * dot_go_v;
     }
   }
-  row_sum = fmaxf(row_sum, 1.0e-20f);
-  dot_go_o /= row_sum;
+  const float row_sum = fmaxf(block_reduce_sum(local_row_sum, reduction), 1.0e-20f);
+  const float dot_go_o_num = block_reduce_sum(local_dot_go_o, reduction);
+  if (threadIdx.x == 0) {
+    shared_row_sum = row_sum;
+    shared_dot_go_o = dot_go_o_num / row_sum;
+  }
+  __syncthreads();
 
   for (int d = threadIdx.x; d < D; d += blockDim.x) {
     float acc = 0.0f;
@@ -249,8 +297,8 @@ __global__ void cp_ring_attention_backward_q_kernel(const float* __restrict__ gr
         for (int j = 0; j < V; ++j) {
           dot_go_v += grad_out[go_base + j] * v[kv_bh_base_v + kt * V + j];
         }
-        const float prob = expf(score * scale - row_max) / row_sum;
-        const float ds = prob * (dot_go_v - dot_go_o);
+        const float prob = expf(score * scale - shared_row_max) / shared_row_sum;
+        const float ds = prob * (dot_go_v - shared_dot_go_o);
         acc += ds * k[kv_bh_base_k + kt * D + d];
       }
     }
@@ -446,7 +494,7 @@ torch::Tensor cp_ring_attention_cuda_forward(const torch::Tensor& query_local,
   auto positions = positions_tensor(key_begin_positions, query_local.device());
   auto out = torch::empty({B, H, Tq, V}, query_local.options());
 
-  constexpr int threads = 128;
+  constexpr int threads = kCpAttentionThreads;
   const int rows = static_cast<int>(B * H * Tq);
   auto stream = at::cuda::getCurrentCUDAStream(query_local.get_device()).stream();
   cp_ring_attention_forward_kernel<<<rows, threads, 0, stream>>>(
@@ -499,7 +547,7 @@ std::vector<torch::Tensor> cp_ring_attention_cuda_backward(const torch::Tensor& 
   auto dk = torch::empty_like(key_ring);
   auto dv = torch::empty_like(value_ring);
 
-  constexpr int threads = 128;
+  constexpr int threads = kCpAttentionThreads;
   const int q_rows = static_cast<int>(B * H * Tq);
   auto stream = at::cuda::getCurrentCUDAStream(query_local.get_device()).stream();
   cp_ring_attention_backward_q_kernel<<<q_rows, threads, 0, stream>>>(
