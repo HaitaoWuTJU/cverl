@@ -1858,24 +1858,18 @@ int main(int argc, char** argv) {
         full_comm.barrier();
       }
 
-      auto grad_tensor = torch::tensor({local_grad_norm}, torch::TensorOptions().device(device).dtype(torch::kFloat32));
-      auto delta_tensor = torch::tensor({local_param_delta}, torch::TensorOptions().device(device).dtype(torch::kFloat32));
-      auto loss_tensor = torch::tensor({loss_sum}, torch::TensorOptions().device(device).dtype(torch::kFloat32));
-      auto kl_loss_tensor = torch::tensor({kl_loss_sum}, torch::TensorOptions().device(device).dtype(torch::kFloat32));
-      auto kl_tensor = torch::tensor({kl_sum}, torch::TensorOptions().device(device).dtype(torch::kFloat32));
-      auto clip_tensor = torch::tensor({clipfrac_sum}, torch::TensorOptions().device(device).dtype(torch::kFloat32));
-      auto global_grad_tensor =
-          torch::tensor({global_grad_norm}, torch::TensorOptions().device(device).dtype(torch::kFloat32));
-      auto grad_clip_tensor =
-          torch::tensor({grad_clip_scale}, torch::TensorOptions().device(device).dtype(torch::kFloat32));
-      auto grad_norms = full_comm.all_gather(grad_tensor.contiguous(), full_ranks, 0).cpu();
-      auto param_deltas = full_comm.all_gather(delta_tensor.contiguous(), full_ranks, 0).cpu();
-      auto loss_sums = full_comm.all_gather(loss_tensor.contiguous(), full_ranks, 0).cpu();
-      auto kl_loss_sums = full_comm.all_gather(kl_loss_tensor.contiguous(), full_ranks, 0).cpu();
-      auto kl_sums = full_comm.all_gather(kl_tensor.contiguous(), full_ranks, 0).cpu();
-      auto clip_sums = full_comm.all_gather(clip_tensor.contiguous(), full_ranks, 0).cpu();
-      auto global_grad_norms = full_comm.all_gather(global_grad_tensor.contiguous(), full_ranks, 0).cpu();
-      auto grad_clip_scales = full_comm.all_gather(grad_clip_tensor.contiguous(), full_ranks, 0).cpu();
+      constexpr int64_t kMetricFields = 8;
+      auto local_metrics = torch::tensor({local_grad_norm,
+                                          local_param_delta,
+                                          loss_sum,
+                                          kl_loss_sum,
+                                          kl_sum,
+                                          clipfrac_sum,
+                                          global_grad_norm,
+                                          grad_clip_scale},
+                                         torch::TensorOptions().device(device).dtype(torch::kFloat32));
+      auto gathered_metrics =
+          full_comm.all_gather(local_metrics.contiguous(), full_ranks, 0).cpu().view({world_size, kMetricFields});
       full_comm.barrier();
 
       if (global_rank == 0) {
@@ -1890,21 +1884,21 @@ int main(int argc, char** argv) {
         double total_param_delta = 0.0;
         double reported_global_grad_norm = 0.0;
         double reported_grad_clip_scale = 1.0;
-        for (int64_t i = 0; i < grad_norms.numel(); ++i) {
-          const double grad_value = grad_norms[i].item<double>();
-          const double delta_value = param_deltas[i].item<double>();
+        for (int64_t i = 0; i < world_size; ++i) {
+          const double grad_value = gathered_metrics[i][0].item<double>();
+          const double delta_value = gathered_metrics[i][1].item<double>();
           all_have_grad = all_have_grad && std::isfinite(grad_value) && grad_value > 0.0;
           all_updated = all_updated && std::isfinite(delta_value) && delta_value > 0.0;
           any_updated = any_updated || (std::isfinite(delta_value) && delta_value > 0.0);
           total_grad_norm += grad_value;
           total_param_delta += delta_value;
-          total_loss += loss_sums[i].item<double>();
-          total_kl_loss += kl_loss_sums[i].item<double>();
-          total_kl += kl_sums[i].item<double>();
-          total_clipfrac += clip_sums[i].item<double>();
+          total_loss += gathered_metrics[i][2].item<double>();
+          total_kl_loss += gathered_metrics[i][3].item<double>();
+          total_kl += gathered_metrics[i][4].item<double>();
+          total_clipfrac += gathered_metrics[i][5].item<double>();
           if (i == 0) {
-            reported_global_grad_norm = global_grad_norms[i].item<double>();
-            reported_grad_clip_scale = grad_clip_scales[i].item<double>();
+            reported_global_grad_norm = gathered_metrics[i][6].item<double>();
+            reported_grad_clip_scale = gathered_metrics[i][7].item<double>();
           }
         }
         append_metrics_csv(metrics_csv,
