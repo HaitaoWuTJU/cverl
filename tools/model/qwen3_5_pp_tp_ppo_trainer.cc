@@ -1770,10 +1770,9 @@ int main(int argc, char** argv) {
       if (!skip_optimizer_step) {
         if (dp_flat_shard_optimizer) {
           flat_optimizer->step(flat_gradient_shard);
-          auto gathered_flat =
-              dp_comm.all_gather(flat_optimizer->parameter_shard().contiguous(), dp_group.ranks, 0).contiguous();
-          cverl::distributed::apply_full_flat_parameters(
-              gathered_flat, flat_param_shard.original_numel, params);
+          flat_param_shard.shard.copy_(flat_optimizer->parameter_shard());
+          cverl::distributed::all_gather_apply_flat_parameter_shard(
+              flat_param_shard, dp_comm, dp_group.ranks, params);
         } else {
           optimizer.step();
         }

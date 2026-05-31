@@ -199,6 +199,40 @@ FlatParameterShard reduce_scatter_flat_gradient_shard(const std::vector<torch::T
   return metadata;
 }
 
+torch::Tensor all_gather_flat_parameter_shards(const FlatParameterShard& local_shard,
+                                               Collectives& collectives,
+                                               const std::vector<int64_t>& data_group) {
+  const int64_t data_rank =
+      rank_index_in_group(collectives.rank(), data_group, "all_gather_flat_parameter_shards");
+  const int64_t data_parallel = static_cast<int64_t>(data_group.size());
+  if (!local_shard.shard.defined() || local_shard.shard.dim() != 1 || !local_shard.shard.is_contiguous()) {
+    throw std::invalid_argument("all_gather_flat_parameter_shards requires a contiguous 1D local shard");
+  }
+  if (local_shard.original_numel < 0 || local_shard.padded_numel < local_shard.original_numel ||
+      local_shard.padded_numel % data_parallel != 0) {
+    throw std::invalid_argument("all_gather_flat_parameter_shards invalid shard numel metadata");
+  }
+  const int64_t shard_size = local_shard.padded_numel / data_parallel;
+  if (local_shard.shard.numel() != shard_size ||
+      local_shard.shard_begin != data_rank * shard_size ||
+      local_shard.shard_end != local_shard.shard_begin + shard_size) {
+    throw std::invalid_argument("all_gather_flat_parameter_shards local shard metadata mismatch");
+  }
+  auto gathered = collectives.all_gather(local_shard.shard.contiguous(), data_group, 0).contiguous();
+  if (gathered.dim() != 1 || gathered.numel() != local_shard.padded_numel) {
+    throw std::runtime_error("all_gather_flat_parameter_shards returned an unexpected tensor shape");
+  }
+  return gathered;
+}
+
+void all_gather_apply_flat_parameter_shard(const FlatParameterShard& local_shard,
+                                           Collectives& collectives,
+                                           const std::vector<int64_t>& data_group,
+                                           const std::vector<torch::Tensor>& parameters) {
+  auto gathered = all_gather_flat_parameter_shards(local_shard, collectives, data_group);
+  apply_full_flat_parameters(gathered, local_shard.original_numel, parameters);
+}
+
 void apply_flat_parameter_shard(const FlatParameterShard& shard,
                                 const std::vector<torch::Tensor>& parameters) {
   if (!shard.shard.defined() || shard.shard.dim() != 1 || !shard.shard.is_contiguous()) {

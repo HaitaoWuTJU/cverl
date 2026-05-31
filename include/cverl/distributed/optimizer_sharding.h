@@ -46,6 +46,15 @@ FlatParameterShard reduce_scatter_flat_gradient_shard(const std::vector<torch::T
                                                       bool average,
                                                       bool require_grad = true);
 
+torch::Tensor all_gather_flat_parameter_shards(const FlatParameterShard& local_shard,
+                                               Collectives& collectives,
+                                               const std::vector<int64_t>& data_group);
+
+void all_gather_apply_flat_parameter_shard(const FlatParameterShard& local_shard,
+                                           Collectives& collectives,
+                                           const std::vector<int64_t>& data_group,
+                                           const std::vector<torch::Tensor>& parameters);
+
 void apply_flat_parameter_shard(const FlatParameterShard& shard,
                                 const std::vector<torch::Tensor>& parameters);
 

@@ -12,6 +12,8 @@ namespace {
 class SliceCollectives final : public cverl::distributed::Collectives {
  public:
   explicit SliceCollectives(int64_t rank) : rank_(rank) {}
+  SliceCollectives(int64_t rank, std::vector<torch::Tensor> gather_shards)
+      : rank_(rank), gather_shards_(std::move(gather_shards)) {}
 
   int64_t rank() const override { return rank_; }
   int64_t world_size() const override { return 2; }
@@ -34,6 +36,18 @@ class SliceCollectives final : public cverl::distributed::Collectives {
                            int64_t dim) override {
     if (dim != 0) {
       throw std::invalid_argument("SliceCollectives all_gather dim must be 0");
+    }
+    ++all_gather_calls;
+    if (!gather_shards_.empty()) {
+      if (gather_shards_.size() != group.size()) {
+        throw std::invalid_argument("SliceCollectives gather shard count mismatch");
+      }
+      std::vector<torch::Tensor> shards;
+      shards.reserve(gather_shards_.size());
+      for (const auto& shard : gather_shards_) {
+        shards.push_back(shard.clone());
+      }
+      return torch::cat(shards, 0);
     }
     std::vector<torch::Tensor> copies;
     copies.reserve(group.size());
@@ -62,10 +76,12 @@ class SliceCollectives final : public cverl::distributed::Collectives {
   }
 
   int64_t reduce_scatter_calls = 0;
+  int64_t all_gather_calls = 0;
   cverl::distributed::ReduceOp last_reduce_op = cverl::distributed::ReduceOp::Sum;
 
  private:
   int64_t rank_ = 0;
+  std::vector<torch::Tensor> gather_shards_;
 };
 
 void require(bool cond, const char* msg) {
@@ -176,6 +192,35 @@ void test_flat_parameter_shard_update_slice() {
   cverl::distributed::apply_flat_parameter_shard(shard, params);
   require_allclose(p0, torch::zeros_like(p0), "rank1 should not touch p0");
   require_allclose(p1, torch::full_like(p1, 5.0), "rank1 should update p1");
+}
+
+void test_all_gather_apply_flat_parameter_shard() {
+  auto p0 = torch::arange(1, 7, torch::TensorOptions().dtype(torch::kFloat32)).reshape({2, 3}).contiguous();
+  auto p1 = torch::arange(11, 16, torch::TensorOptions().dtype(torch::kFloat32)).contiguous();
+  std::vector<torch::Tensor> params{p0, p1};
+  auto rank0 = cverl::distributed::flatten_parameter_shard(params, 2, 0);
+  auto rank1 = cverl::distributed::flatten_parameter_shard(params, 2, 1);
+  auto update0 = rank0.shard + 100.0;
+  auto update1 = rank1.shard + 200.0;
+  rank1.shard.copy_(update1);
+
+  auto target0 = torch::zeros_like(p0);
+  auto target1 = torch::zeros_like(p1);
+  std::vector<torch::Tensor> target{target0, target1};
+  SliceCollectives rank1_collectives(1, {update0, update1});
+  cverl::distributed::all_gather_apply_flat_parameter_shard(rank1, rank1_collectives, {0, 1}, target);
+  auto gathered = torch::cat({update0, update1}, 0).contiguous();
+  auto expected0 = gathered.narrow(0, 0, p0.numel()).view(p0.sizes());
+  auto expected1 = gathered.narrow(0, p0.numel(), p1.numel()).view(p1.sizes());
+  require(rank1_collectives.all_gather_calls == 1, "flat all-gather apply should issue one all_gather");
+  require_allclose(target0, expected0, "flat all-gather apply p0");
+  require_allclose(target1, expected1, "flat all-gather apply p1");
+
+  auto bad = rank1;
+  bad.shard_begin = 0;
+  require_throws([&]() {
+    (void)cverl::distributed::all_gather_flat_parameter_shards(bad, rank1_collectives, {0, 1});
+  }, "bad flat shard metadata rejected");
 }
 
 void test_apply_full_flat_validation() {
@@ -316,6 +361,7 @@ int main() {
     test_validation();
     test_flat_parameter_shards_roundtrip();
     test_flat_parameter_shard_update_slice();
+    test_all_gather_apply_flat_parameter_shard();
     test_apply_full_flat_validation();
     test_flat_gradient_shards();
     test_reduce_scatter_flat_gradient_shard();
