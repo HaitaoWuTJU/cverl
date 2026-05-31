@@ -28,6 +28,10 @@ class Fp32MasterAdamW {
   const std::vector<torch::Tensor>& model_parameters() const { return model_parameters_; }
   const std::vector<torch::Tensor>& master_parameters() const { return master_parameters_; }
   const std::vector<torch::Tensor>& main_grad_parameters() const { return main_grad_; }
+  const std::vector<torch::Tensor>& exp_avg() const { return exp_avg_; }
+  const std::vector<torch::Tensor>& exp_avg_sq() const { return exp_avg_sq_; }
+  int64_t step_count() const { return step_; }
+  const Fp32MasterAdamWOptions& options() const { return options_; }
   bool uses_master_weights() const { return options_.use_master_weights; }
 
  private:

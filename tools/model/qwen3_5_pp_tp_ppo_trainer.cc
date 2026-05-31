@@ -347,30 +347,99 @@ std::string rollout_ipc_path_for_step(const std::string& rollout_ipc_json,
 void save_rank_checkpoint(const std::string& checkpoint_dir,
                           int64_t step,
                           int64_t global_rank,
+                          int64_t world_size,
+                          int64_t pp_rank,
+                          int64_t pp_size,
+                          int64_t tp_rank,
+                          int64_t tp_size,
+                          int64_t layer_begin,
+                          int64_t layer_end,
+                          const std::vector<std::string>& param_names,
                           const std::vector<torch::Tensor>& params,
-                          const std::vector<torch::Tensor>& master_params,
-                          bool use_master_weights) {
+                          const cverl::torch_backend::Fp32MasterAdamW& optimizer) {
   if (checkpoint_dir.empty()) {
     return;
+  }
+  if (param_names.size() != params.size()) {
+    throw std::runtime_error("checkpoint parameter name/param size mismatch");
   }
   std::ostringstream step_name;
   step_name << "step_" << std::setw(6) << std::setfill('0') << (step + 1);
   const auto step_dir = std::filesystem::path(checkpoint_dir) / step_name.str();
   std::filesystem::create_directories(step_dir);
 
+  const bool use_master_weights = optimizer.uses_master_weights();
+  const auto& master_params = optimizer.master_parameters();
+  const auto& exp_avg = optimizer.exp_avg();
+  const auto& exp_avg_sq = optimizer.exp_avg_sq();
   torch::serialize::OutputArchive archive;
   const auto& source = use_master_weights ? master_params : params;
   for (size_t i = 0; i < source.size(); ++i) {
     archive.write("param_" + std::to_string(i), source[i].detach().to(torch::kCPU));
+    archive.write("optim_exp_avg_" + std::to_string(i), exp_avg[i].detach().to(torch::kCPU));
+    archive.write("optim_exp_avg_sq_" + std::to_string(i), exp_avg_sq[i].detach().to(torch::kCPU));
   }
-  archive.save_to((step_dir / ("rank_" + std::to_string(global_rank) + ".pt")).string());
+  archive.write("optim_step", torch::tensor(optimizer.step_count(), torch::kInt64));
+
+  const std::string rank_file = "rank_" + std::to_string(global_rank) + ".pt";
+  const std::string rank_meta_file = "rank_" + std::to_string(global_rank) + ".json";
+  archive.save_to((step_dir / rank_file).string());
+
+  nlohmann::json rank_meta;
+  rank_meta["global_rank"] = global_rank;
+  rank_meta["pipeline_rank"] = pp_rank;
+  rank_meta["tensor_rank"] = tp_rank;
+  rank_meta["layer_begin"] = layer_begin;
+  rank_meta["layer_end"] = layer_end;
+  rank_meta["param_file"] = rank_file;
+  rank_meta["optimizer_step"] = optimizer.step_count();
+  rank_meta["use_master_weights"] = use_master_weights;
+  rank_meta["parameters"] = nlohmann::json::array();
+  for (size_t i = 0; i < params.size(); ++i) {
+    nlohmann::json item;
+    item["index"] = i;
+    item["name"] = param_names[i];
+    item["dtype"] = c10::toString(params[i].scalar_type());
+    item["shape"] = std::vector<int64_t>(params[i].sizes().begin(), params[i].sizes().end());
+    item["checkpoint_key"] = "param_" + std::to_string(i);
+    item["optimizer_exp_avg_key"] = "optim_exp_avg_" + std::to_string(i);
+    item["optimizer_exp_avg_sq_key"] = "optim_exp_avg_sq_" + std::to_string(i);
+    rank_meta["parameters"].push_back(std::move(item));
+  }
+  {
+    std::ofstream out(step_dir / rank_meta_file);
+    out << rank_meta.dump(2) << "\n";
+  }
 
   if (global_rank == 0) {
     nlohmann::json manifest;
     manifest["step"] = step + 1;
-    manifest["format"] = "cverl_pp_tp_rank_local_params_v1";
+    manifest["format"] = "cverl_pp_tp_rank_local_checkpoint_v2";
     manifest["use_master_weights"] = use_master_weights;
+    manifest["world_size"] = world_size;
+    manifest["pipeline_parallel"] = pp_size;
+    manifest["tensor_parallel"] = tp_size;
+    manifest["optimizer"] = {
+        {"type", "Fp32MasterAdamW"},
+        {"lr", optimizer.options().lr},
+        {"beta1", optimizer.options().beta1},
+        {"beta2", optimizer.options().beta2},
+        {"eps", optimizer.options().eps},
+        {"weight_decay", optimizer.options().weight_decay},
+        {"step", optimizer.step_count()},
+    };
     manifest["rank_files"] = nlohmann::json::array();
+    for (int64_t rank = 0; rank < world_size; ++rank) {
+      const int64_t tp = rank % tp_size;
+      const int64_t pp = (rank / tp_size) % pp_size;
+      manifest["rank_files"].push_back({
+          {"global_rank", rank},
+          {"pipeline_rank", pp},
+          {"tensor_rank", tp},
+          {"param_file", "rank_" + std::to_string(rank) + ".pt"},
+          {"metadata_file", "rank_" + std::to_string(rank) + ".json"},
+      });
+    }
     std::ofstream out(step_dir / "manifest.json");
     out << manifest.dump(2) << "\n";
   }
@@ -1001,8 +1070,19 @@ int main(int argc, char** argv) {
                                           param_before, optimizer.master_parameters())
                                     : cverl::torch_backend::parameter_delta_sum(param_before, params));
       if (checkpoint_every > 0 && (step + 1) % checkpoint_every == 0) {
-        save_rank_checkpoint(
-            checkpoint_dir, step, global_rank, params, optimizer.master_parameters(), use_master_weights);
+        save_rank_checkpoint(checkpoint_dir,
+                             step,
+                             global_rank,
+                             world_size,
+                             info.pipeline_rank,
+                             pp_size,
+                             info.tensor_rank,
+                             tp_size,
+                             range.begin,
+                             range.end,
+                             param_names,
+                             params,
+                             optimizer);
       }
 
       auto grad_tensor = torch::tensor({local_grad_norm}, torch::TensorOptions().device(device).dtype(torch::kFloat32));

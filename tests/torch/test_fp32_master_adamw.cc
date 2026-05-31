@@ -38,6 +38,11 @@ int main() {
     require(p.grad().defined(), "accumulate_model_grads keeps grad tensor allocated");
     require(p.grad().to(torch::kFloat32).abs().sum().item<double>() == 0.0, "accumulate_model_grads clears model gradient");
     optimizer.step();
+    require(optimizer.step_count() == 1, "optimizer step count");
+    require(optimizer.exp_avg().size() == 1 && optimizer.exp_avg_sq().size() == 1, "optimizer state tensors exposed");
+    require(optimizer.exp_avg()[0].scalar_type() == torch::kFloat32, "exp_avg must be fp32");
+    require(optimizer.exp_avg_sq()[0].scalar_type() == torch::kFloat32, "exp_avg_sq must be fp32");
+    require(optimizer.options().lr == opts.lr, "optimizer options exposed");
 
     const double model_delta =
         (p.detach().to(torch::kFloat32) - model_before.to(torch::kFloat32)).abs().sum().item<double>();
