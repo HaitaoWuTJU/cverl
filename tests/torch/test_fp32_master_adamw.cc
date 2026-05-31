@@ -44,6 +44,20 @@ int main() {
     require(optimizer.exp_avg_sq()[0].scalar_type() == torch::kFloat32, "exp_avg_sq must be fp32");
     require(optimizer.options().lr == opts.lr, "optimizer options exposed");
 
+    auto restored_p = torch::empty_like(p);
+    restored_p.set_requires_grad(true);
+    cverl::torch_backend::Fp32MasterAdamW restored_optimizer({restored_p}, opts);
+    restored_optimizer.load_state(
+        cverl::torch_backend::clone_detached(optimizer.master_parameters()),
+        cverl::torch_backend::clone_detached(optimizer.exp_avg()),
+        cverl::torch_backend::clone_detached(optimizer.exp_avg_sq()),
+        optimizer.step_count());
+    require(restored_optimizer.step_count() == optimizer.step_count(), "restored optimizer step count");
+    require(torch::allclose(restored_optimizer.master_parameters()[0], optimizer.master_parameters()[0]),
+            "restored master parameter");
+    require(torch::allclose(restored_optimizer.exp_avg()[0], optimizer.exp_avg()[0]), "restored exp_avg");
+    require(torch::allclose(restored_optimizer.exp_avg_sq()[0], optimizer.exp_avg_sq()[0]), "restored exp_avg_sq");
+
     const double model_delta =
         (p.detach().to(torch::kFloat32) - model_before.to(torch::kFloat32)).abs().sum().item<double>();
     const double master_delta =
@@ -69,6 +83,17 @@ int main() {
     no_master_optimizer.step();
     const double no_master_delta = (q.detach().to(torch::kFloat32) - q_before.to(torch::kFloat32)).abs().sum().item<double>();
     require(no_master_delta > 0.0, "no-master BF16 mode must update model parameter when update exceeds BF16 quantum");
+    auto restored_q = torch::empty_like(q);
+    restored_q.set_requires_grad(true);
+    cverl::torch_backend::Fp32MasterAdamW restored_no_master({restored_q}, opts);
+    std::vector<torch::Tensor> no_master_params = {q};
+    restored_no_master.load_state(
+        cverl::torch_backend::clone_detached(no_master_params),
+        cverl::torch_backend::clone_detached(no_master_optimizer.exp_avg()),
+        cverl::torch_backend::clone_detached(no_master_optimizer.exp_avg_sq()),
+        no_master_optimizer.step_count());
+    require(restored_no_master.master_parameters().empty(), "restored no-master mode keeps master weights disabled");
+    require(torch::allclose(restored_q.to(torch::kFloat32), q.to(torch::kFloat32)), "restored no-master parameter");
 
     std::cout << "fp32 master AdamW test passed"
               << " master_delta=" << master_delta

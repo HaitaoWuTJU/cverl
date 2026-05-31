@@ -445,6 +445,89 @@ void save_rank_checkpoint(const std::string& checkpoint_dir,
   }
 }
 
+int64_t load_rank_checkpoint(const std::string& checkpoint_path,
+                             int64_t global_rank,
+                             int64_t pp_rank,
+                             int64_t tp_rank,
+                             const std::vector<std::string>& param_names,
+                             std::vector<torch::Tensor>& params,
+                             cverl::torch_backend::Fp32MasterAdamW& optimizer) {
+  if (checkpoint_path.empty()) {
+    return 0;
+  }
+  const auto step_dir = std::filesystem::path(checkpoint_path);
+  const auto rank_meta_path = step_dir / ("rank_" + std::to_string(global_rank) + ".json");
+  const auto manifest_path = step_dir / "manifest.json";
+  if (!std::filesystem::exists(rank_meta_path)) {
+    throw std::runtime_error("resume checkpoint missing rank metadata: " + rank_meta_path.string());
+  }
+
+  nlohmann::json rank_meta;
+  {
+    std::ifstream in(rank_meta_path);
+    in >> rank_meta;
+  }
+  if (rank_meta.value("global_rank", global_rank) != global_rank ||
+      rank_meta.value("pipeline_rank", pp_rank) != pp_rank ||
+      rank_meta.value("tensor_rank", tp_rank) != tp_rank) {
+    throw std::runtime_error("resume checkpoint rank metadata does not match current rank topology");
+  }
+  const auto& param_meta = rank_meta.at("parameters");
+  if (!param_meta.is_array() || param_meta.size() != param_names.size() || param_names.size() != params.size()) {
+    throw std::runtime_error("resume checkpoint parameter metadata size mismatch");
+  }
+  for (size_t i = 0; i < param_names.size(); ++i) {
+    const auto& item = param_meta.at(i);
+    if (item.at("index").get<size_t>() != i || item.at("name").get<std::string>() != param_names[i]) {
+      throw std::runtime_error("resume checkpoint parameter order/name mismatch at index " + std::to_string(i));
+    }
+    const auto shape = item.at("shape").get<std::vector<int64_t>>();
+    if (shape != std::vector<int64_t>(params[i].sizes().begin(), params[i].sizes().end())) {
+      throw std::runtime_error("resume checkpoint parameter shape mismatch for " + param_names[i]);
+    }
+  }
+
+  int64_t manifest_step = rank_meta.value("optimizer_step", 0);
+  if (std::filesystem::exists(manifest_path)) {
+    nlohmann::json manifest;
+    std::ifstream in(manifest_path);
+    in >> manifest;
+    if (manifest.value("format", std::string{}) != "cverl_pp_tp_rank_local_checkpoint_v2") {
+      throw std::runtime_error("unsupported resume checkpoint format");
+    }
+    manifest_step = manifest.at("optimizer").at("step").get<int64_t>();
+  }
+
+  const std::string rank_file = rank_meta.value("param_file", "rank_" + std::to_string(global_rank) + ".pt");
+  torch::serialize::InputArchive archive;
+  archive.load_from((step_dir / rank_file).string());
+  std::vector<torch::Tensor> checkpoint_params;
+  std::vector<torch::Tensor> exp_avg;
+  std::vector<torch::Tensor> exp_avg_sq;
+  checkpoint_params.reserve(params.size());
+  exp_avg.reserve(params.size());
+  exp_avg_sq.reserve(params.size());
+  for (size_t i = 0; i < params.size(); ++i) {
+    torch::Tensor param;
+    torch::Tensor m;
+    torch::Tensor v;
+    archive.read("param_" + std::to_string(i), param);
+    archive.read("optim_exp_avg_" + std::to_string(i), m);
+    archive.read("optim_exp_avg_sq_" + std::to_string(i), v);
+    checkpoint_params.push_back(param);
+    exp_avg.push_back(m);
+    exp_avg_sq.push_back(v);
+  }
+  torch::Tensor optim_step_tensor;
+  archive.read("optim_step", optim_step_tensor);
+  const int64_t archive_step = optim_step_tensor.item<int64_t>();
+  if (manifest_step != archive_step) {
+    throw std::runtime_error("resume checkpoint optimizer step mismatch");
+  }
+  optimizer.load_state(checkpoint_params, exp_avg, exp_avg_sq, archive_step);
+  return archive_step;
+}
+
 void append_metrics_csv(const std::string& path,
                         int64_t step,
                         int64_t pp_size,
@@ -844,6 +927,7 @@ int main(int argc, char** argv) {
     const int64_t jsonl_max_examples = arg_i64(argc, argv, "--jsonl-max-examples", 16);
     const std::string checkpoint_dir = arg_str(argc, argv, "--checkpoint-dir", "");
     const int64_t checkpoint_every = arg_i64(argc, argv, "--checkpoint-every", 0);
+    const std::string resume_checkpoint = arg_str(argc, argv, "--resume-checkpoint", "");
     const std::string metrics_csv = arg_str(argc, argv, "--metrics-csv", "");
     const auto dtype = parse_dtype(arg_str(argc, argv, "--dtype", "bfloat16"));
     const std::string id_prefix = arg_str(argc, argv, "--id-prefix", "/tmp/cverl_qwen_pp_tp_ppo");
@@ -932,12 +1016,25 @@ int main(int argc, char** argv) {
     optim_options.weight_decay = 0.01;
     optim_options.use_master_weights = use_master_weights;
     cverl::torch_backend::Fp32MasterAdamW optimizer(params, optim_options);
+    int64_t start_step = 0;
+    if (!resume_checkpoint.empty()) {
+      start_step = load_rank_checkpoint(resume_checkpoint,
+                                        global_rank,
+                                        info.pipeline_rank,
+                                        info.tensor_rank,
+                                        param_names,
+                                        params,
+                                        optimizer);
+      if (start_step > steps) {
+        throw std::runtime_error("resume checkpoint step is greater than requested --steps");
+      }
+    }
 
     const std::vector<int64_t> hidden_shape{1, seq_len, model.config().hidden_size};
     const auto full_ranks = full_group(world_size);
     bool trainer_ok = true;
 
-    for (int64_t step = 0; step < steps; ++step) {
+    for (int64_t step = start_step; step < steps; ++step) {
       optimizer.zero_grad();
       auto param_before = use_master_weights
                               ? cverl::torch_backend::clone_detached(optimizer.master_parameters())
@@ -1143,6 +1240,7 @@ int main(int argc, char** argv) {
                   << " prompt_len=" << prompt_len
                   << " response_len=" << response_len
                   << " master_weights=" << (use_master_weights ? "true" : "false")
+                  << " resumed_from_step=" << start_step
                   << " skip_optimizer_step=" << (skip_optimizer_step ? "true" : "false")
                   << " vary_tokens_by_step=" << (vary_tokens_by_step ? "true" : "false")
                   << " jsonl_examples=" << jsonl_batches.size()

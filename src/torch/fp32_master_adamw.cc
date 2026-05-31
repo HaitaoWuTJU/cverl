@@ -117,6 +117,47 @@ void Fp32MasterAdamW::step() {
   }
 }
 
+void Fp32MasterAdamW::load_state(const std::vector<torch::Tensor>& parameter_values,
+                                 const std::vector<torch::Tensor>& exp_avg,
+                                 const std::vector<torch::Tensor>& exp_avg_sq,
+                                 int64_t step) {
+  if (step < 0) {
+    throw std::invalid_argument("Fp32MasterAdamW::load_state: negative step");
+  }
+  if (parameter_values.size() != model_parameters_.size() ||
+      exp_avg.size() != model_parameters_.size() ||
+      exp_avg_sq.size() != model_parameters_.size()) {
+    throw std::invalid_argument("Fp32MasterAdamW::load_state: state size mismatch");
+  }
+  torch::NoGradGuard no_grad;
+  for (size_t i = 0; i < model_parameters_.size(); ++i) {
+    auto& model = model_parameters_[i];
+    const auto& value = parameter_values[i];
+    if (!value.defined() || value.sizes() != model.sizes()) {
+      throw std::invalid_argument("Fp32MasterAdamW::load_state: parameter shape mismatch");
+    }
+    if (!exp_avg[i].defined() || exp_avg[i].sizes() != main_grad_[i].sizes() ||
+        !exp_avg_sq[i].defined() || exp_avg_sq[i].sizes() != main_grad_[i].sizes()) {
+      throw std::invalid_argument("Fp32MasterAdamW::load_state: optimizer state shape mismatch");
+    }
+
+    if (options_.use_master_weights) {
+      master_parameters_[i].copy_(value.detach().to(master_parameters_[i].device(), torch::kFloat32));
+      model.copy_(master_parameters_[i].to(model.scalar_type()));
+    } else {
+      model.copy_(value.detach().to(model.device(), model.scalar_type()));
+    }
+    exp_avg_[i].copy_(exp_avg[i].detach().to(exp_avg_[i].device(), torch::kFloat32));
+    exp_avg_sq_[i].copy_(exp_avg_sq[i].detach().to(exp_avg_sq_[i].device(), torch::kFloat32));
+    main_grad_[i].zero_();
+    has_main_grad_[i] = false;
+    if (model.grad().defined()) {
+      model.mutable_grad().zero_();
+    }
+  }
+  step_ = step;
+}
+
 double Fp32MasterAdamW::grad_norm_sum() const {
   double out = 0.0;
   for (size_t i = 0; i < model_parameters_.size(); ++i) {
