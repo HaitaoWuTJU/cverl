@@ -60,6 +60,18 @@ int main() {
   torch::Tensor adv_t = torch::from_blob(adv.data(), {rows, cols}, torch::kFloat32).clone();
   torch::Tensor mask_t = torch::from_blob(mask.data(), {rows, cols}, torch::kFloat32).clone();
 
+  auto masked_values = torch::tensor({{1.0f, -2.0f, 3.0f}, {4.0f, 5.0f, -6.0f}}, torch::kFloat32);
+  auto masked_weights = torch::tensor({{1.0f, 0.0f, 0.5f}, {0.0f, -1.0f, 1.0f}}, torch::kFloat32);
+  require_close(cverl::torch_backend::masked_sum(masked_values, masked_weights).item<float>(),
+                -8.5f,
+                1.0e-6f,
+                "torch masked weighted sum");
+  auto bool_mask = torch::tensor({{true, false, true}, {false, true, false}}, torch::kBool);
+  require_close(cverl::torch_backend::masked_sum(masked_values, bool_mask).item<float>(),
+                9.0f,
+                1.0e-6f,
+                "torch masked bool sum");
+
   auto t_result = cverl::torch_backend::ppo_clipped_loss(
       old_lp_t, lp_t, adv_t, mask_t, 0.2, -1.0, -1.0, 3.0, CVERL_LOSS_AGG_TOKEN_MEAN);
   require_close(t_result.pg_loss.item<float>(), c_result.pg_loss, 1.0e-6f, "torch ppo loss");

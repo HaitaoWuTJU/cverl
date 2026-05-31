@@ -31,7 +31,7 @@ torch::Tensor aggregate_loss(
 }  // namespace
 
 torch::Tensor masked_sum(const torch::Tensor& values, const torch::Tensor& mask) {
-  return torch::where(mask.to(torch::kBool), values, torch::zeros_like(values)).mul(mask).sum();
+  return (values * mask.to(values.scalar_type())).sum();
 }
 
 torch::Tensor masked_mean(const torch::Tensor& values, const torch::Tensor& mask) {
