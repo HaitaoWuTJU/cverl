@@ -240,9 +240,10 @@ Current code exposes the distributed shape directly:
   blocks without materializing a `[Q,K]` matrix. The CUDA forward computes row
   max/sum once per query row with block-level reductions across the K dimension
   and saves per-query log-sum-exp metadata for backward. For Qwen-sized heads
-  (`D,V<=128`), the CUDA forward output pass now computes each query-key score
-  once and shares it across V lanes instead of recomputing q*k for every output
-  channel. CUDA `dq/dk/dv` backward uses that saved LSE instead of recomputing
+  (`D,V<=128`), the CUDA forward now uses one-pass online softmax accumulation:
+  each query-key score is computed once, the running row max/sum is updated in
+  fp32, and the score numerator is shared across V lanes for the output
+  accumulator. CUDA `dq/dk/dv` backward uses that saved LSE instead of recomputing
   row max/sum. Backward now precomputes per-query `dot(grad_out, out)` once and
   shares it across `dq/dk/dv`, instead of recomputing that scalar inside every
   KV-row CTA. The CUDA `dq` CTA computes each query-key score and
