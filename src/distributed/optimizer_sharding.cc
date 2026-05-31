@@ -224,6 +224,44 @@ torch::Tensor flat_tensor_range_padded(const std::vector<torch::Tensor>& tensors
   return parts.size() == 1 ? parts[0].contiguous() : torch::cat(parts, 0).contiguous();
 }
 
+void apply_flat_parameter_range(const torch::Tensor& flat_slice,
+                                int64_t global_begin,
+                                int64_t original_numel,
+                                const std::vector<torch::Tensor>& parameters) {
+  if (!flat_slice.defined() || flat_slice.dim() != 1 || !flat_slice.is_contiguous()) {
+    throw std::invalid_argument("apply_flat_parameter_range requires a contiguous 1D tensor");
+  }
+  if (global_begin < 0 || original_numel < 0) {
+    throw std::invalid_argument("apply_flat_parameter_range invalid offsets");
+  }
+  const int64_t global_end = global_begin + flat_slice.numel();
+  if (global_begin >= original_numel) {
+    return;
+  }
+  torch::NoGradGuard no_grad;
+  int64_t parameter_begin = 0;
+  for (const auto& parameter : parameters) {
+    if (!parameter.defined() || !parameter.is_contiguous()) {
+      throw std::invalid_argument("apply_flat_parameter_range requires contiguous defined parameters");
+    }
+    const int64_t parameter_end = parameter_begin + parameter.numel();
+    const int64_t overlap_begin = std::max(parameter_begin, global_begin);
+    const int64_t overlap_end = std::min({parameter_end, global_end, original_numel});
+    if (overlap_begin < overlap_end) {
+      const int64_t source_offset = overlap_begin - global_begin;
+      const int64_t parameter_offset = overlap_begin - parameter_begin;
+      const int64_t numel = overlap_end - overlap_begin;
+      auto source = flat_slice.narrow(0, source_offset, numel)
+                        .to(parameter.device(), parameter.scalar_type());
+      parameter.view({parameter.numel()}).narrow(0, parameter_offset, numel).copy_(source);
+    }
+    parameter_begin = parameter_end;
+    if (parameter_begin >= global_end) {
+      break;
+    }
+  }
+}
+
 }  // namespace
 
 std::vector<int64_t> greedy_parameter_owner_by_size(const std::vector<int64_t>& parameter_bytes,
@@ -399,6 +437,46 @@ void all_gather_apply_flat_parameter_shard(const FlatParameterShard& local_shard
   apply_full_flat_parameters(gathered, local_shard.original_numel, parameters);
 }
 
+void all_gather_apply_flat_parameter_shard_bucketed(const FlatParameterShard& local_shard,
+                                                    Collectives& collectives,
+                                                    const std::vector<int64_t>& data_group,
+                                                    const std::vector<torch::Tensor>& parameters,
+                                                    int64_t bucket_numel) {
+  if (bucket_numel <= 0) {
+    throw std::invalid_argument("all_gather_apply_flat_parameter_shard_bucketed bucket_numel must be positive");
+  }
+  const int64_t data_rank =
+      rank_index_in_group(collectives.rank(), data_group, "all_gather_apply_flat_parameter_shard_bucketed");
+  const int64_t data_parallel = static_cast<int64_t>(data_group.size());
+  if (!local_shard.shard.defined() || local_shard.shard.dim() != 1 || !local_shard.shard.is_contiguous()) {
+    throw std::invalid_argument("all_gather_apply_flat_parameter_shard_bucketed requires a contiguous 1D local shard");
+  }
+  if (local_shard.original_numel < 0 || local_shard.padded_numel < local_shard.original_numel ||
+      local_shard.padded_numel % data_parallel != 0) {
+    throw std::invalid_argument("all_gather_apply_flat_parameter_shard_bucketed invalid shard numel metadata");
+  }
+  const int64_t shard_size = local_shard.padded_numel / data_parallel;
+  if (local_shard.shard.numel() != shard_size ||
+      local_shard.shard_begin != data_rank * shard_size ||
+      local_shard.shard_end != local_shard.shard_begin + shard_size) {
+    throw std::invalid_argument("all_gather_apply_flat_parameter_shard_bucketed local shard metadata mismatch");
+  }
+  const int64_t shard_bucket_numel = std::max<int64_t>(1, bucket_numel / data_parallel);
+  for (int64_t shard_offset = 0; shard_offset < shard_size; shard_offset += shard_bucket_numel) {
+    const int64_t chunk = std::min(shard_bucket_numel, shard_size - shard_offset);
+    auto local_chunk = local_shard.shard.narrow(0, shard_offset, chunk).contiguous();
+    auto gathered = collectives.all_gather(local_chunk, data_group, 0).contiguous();
+    if (gathered.dim() != 1 || gathered.numel() != chunk * data_parallel) {
+      throw std::runtime_error("all_gather_apply_flat_parameter_shard_bucketed returned unexpected tensor shape");
+    }
+    for (int64_t rank = 0; rank < data_parallel; ++rank) {
+      const int64_t global_begin = rank * shard_size + shard_offset;
+      auto rank_slice = gathered.narrow(0, rank * chunk, chunk).contiguous();
+      apply_flat_parameter_range(rank_slice, global_begin, local_shard.original_numel, parameters);
+    }
+  }
+}
+
 FlatAdamWStepResult flat_sharded_adamw_step(const std::vector<torch::Tensor>& parameters,
                                             FlatParameterShard& parameter_shard,
                                             cverl::torch_backend::FlatAdamW& optimizer,
@@ -410,7 +488,8 @@ FlatAdamWStepResult flat_sharded_adamw_step(const std::vector<torch::Tensor>& pa
                                             bool average_gradients,
                                             bool require_grad,
                                             bool apply_parameters,
-                                            int64_t reduce_scatter_bucket_numel) {
+                                            int64_t reduce_scatter_bucket_numel,
+                                            int64_t all_gather_bucket_numel) {
   if (max_grad_norm < 0.0) {
     throw std::invalid_argument("flat_sharded_adamw_step max_grad_norm must be non-negative");
   }
@@ -450,7 +529,12 @@ FlatAdamWStepResult flat_sharded_adamw_step(const std::vector<torch::Tensor>& pa
   optimizer.step(result.gradient_shard.shard);
   parameter_shard.shard.copy_(optimizer.parameter_shard());
   if (apply_parameters) {
-    all_gather_apply_flat_parameter_shard(parameter_shard, data_collectives, data_group, parameters);
+    if (all_gather_bucket_numel > 0) {
+      all_gather_apply_flat_parameter_shard_bucketed(
+          parameter_shard, data_collectives, data_group, parameters, all_gather_bucket_numel);
+    } else {
+      all_gather_apply_flat_parameter_shard(parameter_shard, data_collectives, data_group, parameters);
+    }
   }
   return result;
 }

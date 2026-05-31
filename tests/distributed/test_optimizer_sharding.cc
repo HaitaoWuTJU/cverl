@@ -45,8 +45,12 @@ class SliceCollectives final : public cverl::distributed::Collectives {
       std::vector<torch::Tensor> shards;
       shards.reserve(gather_shards_.size());
       for (const auto& shard : gather_shards_) {
-        shards.push_back(shard.clone());
+        if (all_gather_offset_ + input.numel() > shard.numel()) {
+          throw std::invalid_argument("SliceCollectives gather shard slice out of range");
+        }
+        shards.push_back(shard.narrow(0, all_gather_offset_, input.numel()).clone());
       }
+      all_gather_offset_ += input.numel();
       return torch::cat(shards, 0);
     }
     std::vector<torch::Tensor> copies;
@@ -81,6 +85,7 @@ class SliceCollectives final : public cverl::distributed::Collectives {
 
  private:
   int64_t rank_ = 0;
+  int64_t all_gather_offset_ = 0;
   std::vector<torch::Tensor> gather_shards_;
 };
 
@@ -215,6 +220,17 @@ void test_all_gather_apply_flat_parameter_shard() {
   require(rank1_collectives.all_gather_calls == 1, "flat all-gather apply should issue one all_gather");
   require_allclose(target0, expected0, "flat all-gather apply p0");
   require_allclose(target1, expected1, "flat all-gather apply p1");
+
+  auto bucket_target0 = torch::zeros_like(p0);
+  auto bucket_target1 = torch::zeros_like(p1);
+  std::vector<torch::Tensor> bucket_target{bucket_target0, bucket_target1};
+  SliceCollectives bucket_rank1_collectives(1, {update0, update1});
+  cverl::distributed::all_gather_apply_flat_parameter_shard_bucketed(
+      rank1, bucket_rank1_collectives, {0, 1}, bucket_target, 4);
+  require(bucket_rank1_collectives.all_gather_calls == 3,
+          "bucketed flat all-gather apply should issue one all_gather per bucket");
+  require_allclose(bucket_target0, expected0, "bucketed flat all-gather apply p0");
+  require_allclose(bucket_target1, expected1, "bucketed flat all-gather apply p1");
 
   auto bad = rank1;
   bad.shard_begin = 0;

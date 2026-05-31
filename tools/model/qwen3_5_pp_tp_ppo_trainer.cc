@@ -1732,6 +1732,7 @@ int main(int argc, char** argv) {
       double grad_clip_scale = 1.0;
       double local_grad_norm = 0.0;
       if (dp_flat_shard_optimizer && !skip_optimizer_step) {
+        const int64_t dp_bucket_numel = std::max<int64_t>(1, dp_grad_bucket_bytes / 4);
         auto flat_step = cverl::distributed::flat_sharded_adamw_step(params,
                                                                      flat_param_shard,
                                                                      *flat_optimizer,
@@ -1743,7 +1744,8 @@ int main(int argc, char** argv) {
                                                                      true,
                                                                      false,
                                                                      true,
-                                                                     std::max<int64_t>(1, dp_grad_bucket_bytes / 4));
+                                                                     dp_bucket_numel,
+                                                                     dp_bucket_numel);
         flat_gradient_shard = flat_step.gradient_shard.shard;
         local_grad_norm_sq = flat_step.local_grad_norm_sq;
         global_grad_norm = flat_step.global_grad_norm;

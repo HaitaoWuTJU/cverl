@@ -72,6 +72,12 @@ void all_gather_apply_flat_parameter_shard(const FlatParameterShard& local_shard
                                            const std::vector<int64_t>& data_group,
                                            const std::vector<torch::Tensor>& parameters);
 
+void all_gather_apply_flat_parameter_shard_bucketed(const FlatParameterShard& local_shard,
+                                                    Collectives& collectives,
+                                                    const std::vector<int64_t>& data_group,
+                                                    const std::vector<torch::Tensor>& parameters,
+                                                    int64_t bucket_numel);
+
 FlatAdamWStepResult flat_sharded_adamw_step(const std::vector<torch::Tensor>& parameters,
                                             FlatParameterShard& parameter_shard,
                                             cverl::torch_backend::FlatAdamW& optimizer,
@@ -83,7 +89,8 @@ FlatAdamWStepResult flat_sharded_adamw_step(const std::vector<torch::Tensor>& pa
                                             bool average_gradients = true,
                                             bool require_grad = false,
                                             bool apply_parameters = true,
-                                            int64_t reduce_scatter_bucket_numel = 0);
+                                            int64_t reduce_scatter_bucket_numel = 0,
+                                            int64_t all_gather_bucket_numel = 0);
 
 void apply_flat_parameter_shard(const FlatParameterShard& shard,
                                 const std::vector<torch::Tensor>& parameters);
