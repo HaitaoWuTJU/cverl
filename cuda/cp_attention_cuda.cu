@@ -199,11 +199,74 @@ __global__ void cp_ring_attention_forward_kernel(const float* __restrict__ q,
   }
 }
 
+__global__ void cp_ring_attention_backward_query_dot_kernel(const float* __restrict__ grad_out,
+                                                            const float* __restrict__ q,
+                                                            const float* __restrict__ k,
+                                                            const float* __restrict__ v,
+                                                            const float* __restrict__ lse,
+                                                            const int64_t* __restrict__ key_begin_positions,
+                                                            float* __restrict__ query_dot,
+                                                            int B,
+                                                            int H,
+                                                            int Tq,
+                                                            int Tk,
+                                                            int D,
+                                                            int V,
+                                                            int num_blocks,
+                                                            int query_begin,
+                                                            int original_sequence_length,
+                                                            int shard_size,
+                                                            float scale) {
+  const int row = blockIdx.x;
+  const int t = row % Tq;
+  const int bh = row / Tq;
+  const int h = bh % H;
+  const int b = bh / H;
+  const int q_pos = query_begin + t;
+  const int q_base = (((b * H + h) * Tq + t) * D);
+  const int go_base = (((b * H + h) * Tq + t) * V);
+  const int kv_bh_base_k = ((b * H + h) * Tk) * D;
+  const int kv_bh_base_v = ((b * H + h) * Tk) * V;
+  const float row_lse = lse[row];
+
+  __shared__ float reduction[kCpAttentionThreads];
+
+  float local_dot = 0.0f;
+  if (q_pos < original_sequence_length && isfinite(row_lse)) {
+    const int total_keys = num_blocks * shard_size;
+    for (int flat = threadIdx.x; flat < total_keys; flat += blockDim.x) {
+      const int block = flat / shard_size;
+      const int local = flat - block * shard_size;
+      const int key_begin = static_cast<int>(key_begin_positions[block]);
+      const int k_pos = key_begin + local;
+      if (k_pos <= q_pos && k_pos < original_sequence_length) {
+        const int kt = block * shard_size + local;
+        float score = 0.0f;
+        for (int d = 0; d < D; ++d) {
+          score += q[q_base + d] * k[kv_bh_base_k + kt * D + d];
+        }
+        const float prob = expf(score * scale - row_lse);
+        float dot_go_v = 0.0f;
+        for (int j = 0; j < V; ++j) {
+          dot_go_v += grad_out[go_base + j] * v[kv_bh_base_v + kt * V + j];
+        }
+        local_dot += prob * dot_go_v;
+      }
+    }
+  }
+
+  const float dot = block_reduce_sum(local_dot, reduction);
+  if (threadIdx.x == 0) {
+    query_dot[row] = dot;
+  }
+}
+
 __global__ void cp_ring_attention_backward_q_kernel(const float* __restrict__ grad_out,
                                                     const float* __restrict__ q,
                                                     const float* __restrict__ k,
                                                     const float* __restrict__ v,
                                                     const float* __restrict__ lse,
+                                                    const float* __restrict__ query_dot,
                                                     const int64_t* __restrict__ key_begin_positions,
                                                     float* __restrict__ dq,
                                                     int B,
@@ -228,9 +291,7 @@ __global__ void cp_ring_attention_backward_q_kernel(const float* __restrict__ gr
   const int kv_bh_base_k = ((b * H + h) * Tk) * D;
   const int kv_bh_base_v = ((b * H + h) * Tk) * V;
   const float row_lse = lse[row];
-
-  __shared__ float shared_dot_go_o;
-  __shared__ float reduction[kCpAttentionThreads];
+  const float dot_go_o = query_dot[row];
 
   if (q_pos >= original_sequence_length || !isfinite(row_lse)) {
     for (int d = threadIdx.x; d < D; d += blockDim.x) {
@@ -238,33 +299,6 @@ __global__ void cp_ring_attention_backward_q_kernel(const float* __restrict__ gr
     }
     return;
   }
-
-  const int total_keys = num_blocks * shard_size;
-  float local_dot_go_o = 0.0f;
-  for (int flat = threadIdx.x; flat < total_keys; flat += blockDim.x) {
-    const int block = flat / shard_size;
-    const int local = flat - block * shard_size;
-    const int key_begin = static_cast<int>(key_begin_positions[block]);
-    const int k_pos = key_begin + local;
-    if (k_pos <= q_pos && k_pos < original_sequence_length) {
-      const int kt = block * shard_size + local;
-      float score = 0.0f;
-      for (int d = 0; d < D; ++d) {
-        score += q[q_base + d] * k[kv_bh_base_k + kt * D + d];
-      }
-      const float prob = expf(score * scale - row_lse);
-      float dot_go_v = 0.0f;
-      for (int j = 0; j < V; ++j) {
-        dot_go_v += grad_out[go_base + j] * v[kv_bh_base_v + kt * V + j];
-      }
-      local_dot_go_o += prob * dot_go_v;
-    }
-  }
-  const float dot_go_o = block_reduce_sum(local_dot_go_o, reduction);
-  if (threadIdx.x == 0) {
-    shared_dot_go_o = dot_go_o;
-  }
-  __syncthreads();
 
   for (int d = threadIdx.x; d < D; d += blockDim.x) {
     float acc = 0.0f;
@@ -285,7 +319,7 @@ __global__ void cp_ring_attention_backward_q_kernel(const float* __restrict__ gr
           dot_go_v += grad_out[go_base + j] * v[kv_bh_base_v + kt * V + j];
         }
         const float prob = expf(score * scale - row_lse);
-        const float ds = prob * (dot_go_v - shared_dot_go_o);
+        const float ds = prob * (dot_go_v - dot_go_o);
         acc += ds * k[kv_bh_base_k + kt * D + d];
       }
     }
@@ -298,6 +332,7 @@ __global__ void cp_ring_attention_backward_kv_kernel(const float* __restrict__ g
                                                      const float* __restrict__ k,
                                                      const float* __restrict__ v,
                                                      const float* __restrict__ lse,
+                                                     const float* __restrict__ query_dot,
                                                      const int64_t* __restrict__ key_begin_positions,
                                                      float* __restrict__ dk,
                                                      float* __restrict__ dv,
@@ -351,27 +386,7 @@ __global__ void cp_ring_attention_backward_kv_kernel(const float* __restrict__ g
       }
       const int q_base = q_bh_base + tq * D;
       const int go_base = go_bh_base + tq * V;
-      float dot_go_o = 0.0f;
-      for (int b2 = 0; b2 < num_blocks; ++b2) {
-        const int key_begin2 = static_cast<int>(key_begin_positions[b2]);
-        for (int l2 = 0; l2 < shard_size; ++l2) {
-          const int kp2 = key_begin2 + l2;
-          if (kp2 > q_pos || kp2 >= original_sequence_length) {
-            continue;
-          }
-          const int kt2 = b2 * shard_size + l2;
-          float score = 0.0f;
-          for (int kd = 0; kd < D; ++kd) {
-            score += q[q_base + kd] * k[((b * H + h) * Tk + kt2) * D + kd];
-          }
-          const float prob = expf(score * scale - row_lse);
-          float dot_go_v = 0.0f;
-          for (int j = 0; j < V; ++j) {
-            dot_go_v += grad_out[go_base + j] * v[((b * H + h) * Tk + kt2) * V + j];
-          }
-          dot_go_o += prob * dot_go_v;
-        }
-      }
+      const float dot_go_o = query_dot[(b * H + h) * Tq + tq];
       float score = 0.0f;
       for (int kd = 0; kd < D; ++kd) {
         score += q[q_base + kd] * k[k_base + kd];
@@ -530,16 +545,39 @@ std::vector<torch::Tensor> cp_ring_attention_cuda_backward_with_lse(const torch:
   auto dq = torch::empty_like(query_local);
   auto dk = torch::empty_like(key_ring);
   auto dv = torch::empty_like(value_ring);
+  auto query_dot = torch::empty({B, H, Tq}, query_local.options());
 
   constexpr int threads = kCpAttentionThreads;
   const int q_rows = static_cast<int>(B * H * Tq);
   auto stream = at::cuda::getCurrentCUDAStream(query_local.get_device()).stream();
+  cp_ring_attention_backward_query_dot_kernel<<<q_rows, threads, 0, stream>>>(
+      grad_out.data_ptr<float>(),
+      query_local.data_ptr<float>(),
+      key_ring.data_ptr<float>(),
+      value_ring.data_ptr<float>(),
+      query_lse.data_ptr<float>(),
+      positions.data_ptr<int64_t>(),
+      query_dot.data_ptr<float>(),
+      static_cast<int>(B),
+      static_cast<int>(H),
+      static_cast<int>(Tq),
+      static_cast<int>(Tk),
+      static_cast<int>(D),
+      static_cast<int>(V),
+      static_cast<int>(key_begin_positions.size()),
+      static_cast<int>(query_begin),
+      static_cast<int>(original_sequence_length),
+      static_cast<int>(shard_size),
+      static_cast<float>(scale));
+  check_cuda(cudaGetLastError(), "cp_ring_attention_backward_query_dot_kernel");
+
   cp_ring_attention_backward_q_kernel<<<q_rows, threads, 0, stream>>>(
       grad_out.data_ptr<float>(),
       query_local.data_ptr<float>(),
       key_ring.data_ptr<float>(),
       value_ring.data_ptr<float>(),
       query_lse.data_ptr<float>(),
+      query_dot.data_ptr<float>(),
       positions.data_ptr<int64_t>(),
       dq.data_ptr<float>(),
       static_cast<int>(B),
@@ -562,6 +600,7 @@ std::vector<torch::Tensor> cp_ring_attention_cuda_backward_with_lse(const torch:
       key_ring.data_ptr<float>(),
       value_ring.data_ptr<float>(),
       query_lse.data_ptr<float>(),
+      query_dot.data_ptr<float>(),
       positions.data_ptr<int64_t>(),
       dk.data_ptr<float>(),
       dv.data_ptr<float>(),
