@@ -181,6 +181,23 @@ int main() {
                      "flat no-master AdamW must match dense no-master AdamW",
                      1.0e-5,
                      2.0e-5);
+    cverl::torch_backend::FlatAdamW restored_flat_no_master(
+        torch::zeros_like(flat_no_master_initial), flat_no_master_opts);
+    restored_flat_no_master.load_state(flat_no_master_optimizer.parameter_shard(),
+                                       flat_no_master_optimizer.exp_avg(),
+                                       flat_no_master_optimizer.exp_avg_sq(),
+                                       flat_no_master_optimizer.step_count());
+    require(restored_flat_no_master.parameter_shard().scalar_type() == torch::kBFloat16,
+            "restored flat no-master parameter shard keeps model dtype");
+    require(restored_flat_no_master.exp_avg().scalar_type() == torch::kFloat32,
+            "restored flat no-master exp_avg stays fp32");
+    require(restored_flat_no_master.exp_avg_sq().scalar_type() == torch::kFloat32,
+            "restored flat no-master exp_avg_sq stays fp32");
+    require(restored_flat_no_master.step_count() == flat_no_master_optimizer.step_count(),
+            "restored flat no-master step count");
+    require_allclose(restored_flat_no_master.parameter_shard().to(torch::kFloat32),
+                     flat_no_master_optimizer.parameter_shard().to(torch::kFloat32),
+                     "restored flat no-master parameter");
 
     std::cout << "fp32 master AdamW test passed"
               << " master_delta=" << master_delta

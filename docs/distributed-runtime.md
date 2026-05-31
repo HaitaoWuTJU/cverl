@@ -128,10 +128,13 @@ The runtime config separates memory decisions from model code:
 - Activation checkpointing enabled by default.
 - Qwen linear-attention CUDA training defaults to chunk checkpointing rather
   than full-state saving or pure recompute. Full-state mode is only for golden
-  tests/debugging; pure recompute is available by env override but routes
-  through the same tiled checkpointed backward kernel with a zero initial
-  checkpoint.
+  tests/debugging; pure recompute is available by env override and runs a
+  tiled recompute backward kernel without allocating full states, checkpoints,
+  or per-chunk replay cache.
 - Sharded optimizer and sharded gradients enabled by default.
+- DP flat sharded AdamW supports both Megatron-style no-master BF16/FP16
+  parameter shards and FP32 master shards. Gradients and Adam moments stay
+  FP32 in both modes.
 - Flat sharded AdamW keeps grad-norm math on device and transfers one compact
   norm tensor to host per step. Avoid splitting this back into separate
   `Tensor::item()` calls on local norm, global norm, and clipped norm.
