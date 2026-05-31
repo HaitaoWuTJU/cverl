@@ -57,16 +57,22 @@ torch::Tensor flatten_parameter_bucket(const std::vector<ParameterBucketEntry>& 
   if (bucket.empty()) {
     throw std::invalid_argument("flatten_parameter_bucket requires a non-empty bucket");
   }
+  int64_t total_numel = 0;
+  for (const auto& entry : bucket) {
+    total_numel += entry.numel;
+  }
   if (bucket.size() == 1) {
     const auto& entry = bucket.front();
     return entry.parameter->tensor.contiguous().view({entry.numel});
   }
-  std::vector<torch::Tensor> flat;
-  flat.reserve(bucket.size());
+  auto payload = torch::empty({total_numel}, bucket.front().parameter->tensor.options());
+  int64_t offset = 0;
   for (const auto& entry : bucket) {
-    flat.push_back(entry.parameter->tensor.contiguous().view({entry.numel}));
+    payload.narrow(0, offset, entry.numel)
+        .copy_(entry.parameter->tensor.contiguous().view({entry.numel}));
+    offset += entry.numel;
   }
-  return torch::cat(flat, 0).contiguous();
+  return payload;
 }
 
 void flush_broadcast_bucket(std::vector<ParameterBucketEntry>* bucket,
