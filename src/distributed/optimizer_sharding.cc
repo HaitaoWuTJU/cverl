@@ -134,6 +134,35 @@ int64_t rank_index_in_group(int64_t rank, const std::vector<int64_t>& group, con
   throw std::invalid_argument(std::string(name) + " collectives rank is not in data group");
 }
 
+struct FlatShardGroupInfo {
+  int64_t data_rank = 0;
+  int64_t data_parallel = 1;
+  int64_t shard_size = 0;
+};
+
+FlatShardGroupInfo validate_flat_shard_for_group(const FlatParameterShard& local_shard,
+                                                 int64_t collectives_rank,
+                                                 const std::vector<int64_t>& data_group,
+                                                 const char* name) {
+  FlatShardGroupInfo info;
+  info.data_rank = rank_index_in_group(collectives_rank, data_group, name);
+  info.data_parallel = static_cast<int64_t>(data_group.size());
+  if (!local_shard.shard.defined() || local_shard.shard.dim() != 1 || !local_shard.shard.is_contiguous()) {
+    throw std::invalid_argument(std::string(name) + " requires a contiguous 1D local shard");
+  }
+  if (local_shard.original_numel < 0 || local_shard.padded_numel < local_shard.original_numel ||
+      local_shard.padded_numel % info.data_parallel != 0) {
+    throw std::invalid_argument(std::string(name) + " invalid shard numel metadata");
+  }
+  info.shard_size = local_shard.padded_numel / info.data_parallel;
+  if (local_shard.shard.numel() != info.shard_size ||
+      local_shard.shard_begin != info.data_rank * info.shard_size ||
+      local_shard.shard_end != local_shard.shard_begin + info.shard_size) {
+    throw std::invalid_argument(std::string(name) + " local shard metadata mismatch");
+  }
+  return info;
+}
+
 std::vector<torch::Tensor> gradient_tensor_list(const std::vector<torch::Tensor>& parameters,
                                                 bool require_grad,
                                                 const char* name) {
@@ -428,23 +457,9 @@ FlatParameterShard reduce_scatter_flat_gradient_shard_bucketed(
 torch::Tensor all_gather_flat_parameter_shards(const FlatParameterShard& local_shard,
                                                Collectives& collectives,
                                                const std::vector<int64_t>& data_group) {
-  const int64_t data_rank =
-      rank_index_in_group(collectives.rank(), data_group, "all_gather_flat_parameter_shards");
-  const int64_t data_parallel = static_cast<int64_t>(data_group.size());
-  if (!local_shard.shard.defined() || local_shard.shard.dim() != 1 || !local_shard.shard.is_contiguous()) {
-    throw std::invalid_argument("all_gather_flat_parameter_shards requires a contiguous 1D local shard");
-  }
-  if (local_shard.original_numel < 0 || local_shard.padded_numel < local_shard.original_numel ||
-      local_shard.padded_numel % data_parallel != 0) {
-    throw std::invalid_argument("all_gather_flat_parameter_shards invalid shard numel metadata");
-  }
-  const int64_t shard_size = local_shard.padded_numel / data_parallel;
-  if (local_shard.shard.numel() != shard_size ||
-      local_shard.shard_begin != data_rank * shard_size ||
-      local_shard.shard_end != local_shard.shard_begin + shard_size) {
-    throw std::invalid_argument("all_gather_flat_parameter_shards local shard metadata mismatch");
-  }
-  if (data_parallel == 1) {
+  const auto info = validate_flat_shard_for_group(
+      local_shard, collectives.rank(), data_group, "all_gather_flat_parameter_shards");
+  if (info.data_parallel == 1) {
     return local_shard.shard.contiguous();
   }
   auto gathered = collectives.all_gather(local_shard.shard.contiguous(), data_group, 0).contiguous();
@@ -458,6 +473,12 @@ void all_gather_apply_flat_parameter_shard(const FlatParameterShard& local_shard
                                            Collectives& collectives,
                                            const std::vector<int64_t>& data_group,
                                            const std::vector<torch::Tensor>& parameters) {
+  const auto info = validate_flat_shard_for_group(
+      local_shard, collectives.rank(), data_group, "all_gather_apply_flat_parameter_shard");
+  if (info.data_parallel == 1) {
+    apply_flat_parameter_shard(local_shard, parameters);
+    return;
+  }
   auto gathered = all_gather_flat_parameter_shards(local_shard, collectives, data_group);
   apply_full_flat_parameters(gathered, local_shard.original_numel, parameters);
 }
@@ -470,23 +491,11 @@ void all_gather_apply_flat_parameter_shard_bucketed(const FlatParameterShard& lo
   if (bucket_numel <= 0) {
     throw std::invalid_argument("all_gather_apply_flat_parameter_shard_bucketed bucket_numel must be positive");
   }
-  const int64_t data_rank =
-      rank_index_in_group(collectives.rank(), data_group, "all_gather_apply_flat_parameter_shard_bucketed");
-  const int64_t data_parallel = static_cast<int64_t>(data_group.size());
-  if (!local_shard.shard.defined() || local_shard.shard.dim() != 1 || !local_shard.shard.is_contiguous()) {
-    throw std::invalid_argument("all_gather_apply_flat_parameter_shard_bucketed requires a contiguous 1D local shard");
-  }
-  if (local_shard.original_numel < 0 || local_shard.padded_numel < local_shard.original_numel ||
-      local_shard.padded_numel % data_parallel != 0) {
-    throw std::invalid_argument("all_gather_apply_flat_parameter_shard_bucketed invalid shard numel metadata");
-  }
-  const int64_t shard_size = local_shard.padded_numel / data_parallel;
-  if (local_shard.shard.numel() != shard_size ||
-      local_shard.shard_begin != data_rank * shard_size ||
-      local_shard.shard_end != local_shard.shard_begin + shard_size) {
-    throw std::invalid_argument("all_gather_apply_flat_parameter_shard_bucketed local shard metadata mismatch");
-  }
-  if (data_parallel == 1) {
+  const auto info = validate_flat_shard_for_group(
+      local_shard, collectives.rank(), data_group, "all_gather_apply_flat_parameter_shard_bucketed");
+  const int64_t data_parallel = info.data_parallel;
+  const int64_t shard_size = info.shard_size;
+  if (info.data_parallel == 1) {
     apply_flat_parameter_shard(local_shard, parameters);
     return;
   }

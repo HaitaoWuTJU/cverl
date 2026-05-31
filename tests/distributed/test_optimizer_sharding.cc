@@ -242,6 +242,17 @@ void test_all_gather_apply_flat_parameter_shard() {
   require_allclose(bucket_target0, expected0, "bucketed flat all-gather apply p0");
   require_allclose(bucket_target1, expected1, "bucketed flat all-gather apply p1");
 
+  auto single_rank = cverl::distributed::flatten_parameter_shard(params, 1, 0);
+  single_rank.shard.add_(300.0);
+  auto single_target0 = torch::zeros_like(p0);
+  auto single_target1 = torch::zeros_like(p1);
+  std::vector<torch::Tensor> single_target{single_target0, single_target1};
+  SliceCollectives single_collectives(0);
+  cverl::distributed::all_gather_apply_flat_parameter_shard(single_rank, single_collectives, {0}, single_target);
+  require(single_collectives.all_gather_calls == 0, "single-rank flat all-gather apply should skip all_gather");
+  require_allclose(single_target0, p0 + 300.0, "single-rank flat apply p0");
+  require_allclose(single_target1, p1 + 300.0, "single-rank flat apply p1");
+
   auto bad = rank1;
   bad.shard_begin = 0;
   require_throws([&]() {
