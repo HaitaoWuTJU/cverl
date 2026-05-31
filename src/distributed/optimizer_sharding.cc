@@ -448,8 +448,7 @@ FlatParameterShard reduce_scatter_flat_gradient_shard_bucketed(
   const int64_t padded_numel = original_numel + (remainder == 0 ? 0 : data_parallel - remainder);
   const int64_t shard_size = padded_numel / data_parallel;
   const int64_t shard_bucket_numel = std::max<int64_t>(1, bucket_numel / data_parallel);
-  std::vector<torch::Tensor> shard_chunks;
-  shard_chunks.reserve(static_cast<size_t>((shard_size + shard_bucket_numel - 1) / shard_bucket_numel));
+  auto shard = torch::empty({shard_size}, options);
 
   for (int64_t shard_offset = 0; shard_offset < shard_size; shard_offset += shard_bucket_numel) {
     const int64_t chunk = std::min(shard_bucket_numel, shard_size - shard_offset);
@@ -461,11 +460,13 @@ FlatParameterShard reduce_scatter_flat_gradient_shard_bucketed(
           gradients, original_numel, padded_numel, global_begin, chunk, options));
     }
     auto input = torch::cat(input_segments, 0).contiguous();
-    shard_chunks.push_back(
-        collectives.reduce_scatter(input, average ? ReduceOp::Mean : ReduceOp::Sum, data_group, 0).contiguous());
+    auto reduced =
+        collectives.reduce_scatter(input, average ? ReduceOp::Mean : ReduceOp::Sum, data_group, 0).contiguous();
+    if (reduced.dim() != 1 || reduced.numel() != chunk) {
+      throw std::runtime_error("reduce_scatter_flat_gradient_shard_bucketed returned an unexpected chunk shape");
+    }
+    shard.narrow(0, shard_offset, chunk).copy_(reduced);
   }
-  auto shard = shard_chunks.empty() ? torch::zeros({shard_size}, options)
-                                    : torch::cat(shard_chunks, 0).contiguous();
   return make_flat_shard_metadata(
       tensor_numels, data_parallel, data_rank, shard, "reduce_scatter_flat_gradient_shard_bucketed");
 }
