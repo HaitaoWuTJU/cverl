@@ -487,6 +487,17 @@ std::optional<torch::ScalarType> parse_optional_dtype(const std::string& dtype) 
   return parse_dtype(dtype);
 }
 
+int64_t scalar_type_bytes(torch::ScalarType dtype) {
+  return static_cast<int64_t>(torch::empty({0}, torch::TensorOptions().dtype(dtype)).element_size());
+}
+
+int64_t bucket_numel_for_bytes(int64_t bucket_bytes, torch::ScalarType dtype) {
+  if (bucket_bytes <= 0) {
+    throw std::invalid_argument("bucket bytes must be positive");
+  }
+  return std::max<int64_t>(1, bucket_bytes / scalar_type_bytes(dtype));
+}
+
 cverl_kl_penalty_t parse_kl_penalty_mode(const std::string& mode) {
   if (mode == "k1") {
     return CVERL_KL_K1;
@@ -1536,7 +1547,10 @@ int main(int argc, char** argv) {
     }
     const int64_t dp_grad_bucket_bytes = dp_grad_bucket_mb * 1024 * 1024;
     const int64_t tp_grad_bucket_bytes = tp_grad_bucket_mb * 1024 * 1024;
-    const int64_t dp_bucket_numel = std::max<int64_t>(1, dp_grad_bucket_bytes / 4);
+    const torch::ScalarType dp_grad_bucket_dtype = dp_grad_comm_dtype.value_or(torch::kFloat32);
+    const torch::ScalarType flat_param_bucket_dtype = use_master_weights ? torch::kFloat32 : dtype;
+    const int64_t dp_grad_bucket_numel = bucket_numel_for_bytes(dp_grad_bucket_bytes, dp_grad_bucket_dtype);
+    const int64_t dp_param_bucket_numel = bucket_numel_for_bytes(dp_grad_bucket_bytes, flat_param_bucket_dtype);
 
     const int64_t seq_len = prompt_len + response_len;
     const auto device = torch::Device(torch::kCUDA, static_cast<int>(device_idx));
@@ -1678,7 +1692,7 @@ int main(int argc, char** argv) {
                                                *flat_optimizer);
         flat_param_shard.shard.copy_(flat_optimizer->parameter_shard());
         cverl::distributed::all_gather_apply_flat_parameter_shard_bucketed(
-            flat_param_shard, dp_comm, dp_group.ranks, params, dp_bucket_numel);
+            flat_param_shard, dp_comm, dp_group.ranks, params, dp_param_bucket_numel);
       } else {
         start_step = load_rank_checkpoint(resume_checkpoint,
                                           global_rank,
@@ -1889,8 +1903,8 @@ int main(int argc, char** argv) {
                                                                      true,
                                                                      false,
                                                                      true,
-                                                                     dp_bucket_numel,
-                                                                     dp_bucket_numel,
+                                                                     dp_grad_bucket_numel,
+                                                                     dp_param_bucket_numel,
                                                                      dp_grad_comm_dtype);
         flat_gradient_shard = flat_step.gradient_shard.shard;
         local_grad_norm_sq = flat_step.local_grad_norm_sq;
