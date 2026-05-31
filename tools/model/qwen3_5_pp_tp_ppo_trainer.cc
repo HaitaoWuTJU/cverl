@@ -244,7 +244,8 @@ bool qwen_tp_replicated_parameter(const std::string& name) {
 
 void sync_tp_replicated_gradients(const std::vector<std::string>& names,
                                   const std::vector<torch::Tensor>& params,
-                                  cverl::distributed::ParallelGroup& tp_group) {
+                                  cverl::distributed::ParallelGroup& tp_group,
+                                  int64_t bucket_bytes) {
   if (tp_group.world_size == 1) {
     return;
   }
@@ -254,6 +255,7 @@ void sync_tp_replicated_gradients(const std::vector<std::string>& names,
   if (names.size() != params.size()) {
     throw std::runtime_error("TP replicated gradient sync name/param size mismatch");
   }
+  std::vector<torch::Tensor> replicated_params;
   for (size_t i = 0; i < params.size(); ++i) {
     if (!qwen_tp_replicated_parameter(names[i])) {
       continue;
@@ -262,10 +264,10 @@ void sync_tp_replicated_gradients(const std::vector<std::string>& names,
     if (!p.defined() || !p.grad().defined()) {
       continue;
     }
-    auto synced = tp_group.collectives->all_reduce(
-        p.grad().contiguous(), cverl::distributed::ReduceOp::Mean, tp_group.ranks);
-    p.mutable_grad().copy_(synced);
+    replicated_params.push_back(p);
   }
+  cverl::distributed::data_parallel_sync_gradients(
+      replicated_params, *tp_group.collectives, tp_group.ranks, true, bucket_bytes);
 }
 
 struct PpPpoBatch {
@@ -1015,6 +1017,7 @@ int main(int argc, char** argv) {
     const auto kl_penalty_mode = parse_kl_penalty_mode(arg_str(argc, argv, "--kl-penalty", "k1"));
     const double max_grad_norm = arg_f64(argc, argv, "--max-grad-norm", 1.0);
     const int64_t dp_grad_bucket_mb = arg_i64(argc, argv, "--dp-grad-bucket-mb", 25);
+    const int64_t tp_grad_bucket_mb = arg_i64(argc, argv, "--tp-grad-bucket-mb", dp_grad_bucket_mb);
     const double advantage_scale = arg_f64(argc, argv, "--advantage-scale", 1.0);
     const bool use_master_weights = arg_bool(argc, argv, "--master-weights", false);
     const bool skip_optimizer_step = arg_bool(argc, argv, "--skip-optimizer-step", false);
@@ -1050,7 +1053,11 @@ int main(int argc, char** argv) {
     if (dp_grad_bucket_mb <= 0) {
       throw std::invalid_argument("--dp-grad-bucket-mb must be positive");
     }
+    if (tp_grad_bucket_mb <= 0) {
+      throw std::invalid_argument("--tp-grad-bucket-mb must be positive");
+    }
     const int64_t dp_grad_bucket_bytes = dp_grad_bucket_mb * 1024 * 1024;
+    const int64_t tp_grad_bucket_bytes = tp_grad_bucket_mb * 1024 * 1024;
 
     const int64_t seq_len = prompt_len + response_len;
     const auto device = torch::Device(torch::kCUDA, static_cast<int>(device_idx));
@@ -1301,7 +1308,7 @@ int main(int argc, char** argv) {
         }
       }
 
-      sync_tp_replicated_gradients(param_names, params, tp_group);
+      sync_tp_replicated_gradients(param_names, params, tp_group, tp_grad_bucket_bytes);
       cverl::distributed::data_parallel_sync_gradients(
           params, dp_comm, dp_group.ranks, true, dp_grad_bucket_bytes);
       const double local_grad_norm_sq = optimizer.grad_l2_norm_sq();
@@ -1429,6 +1436,7 @@ int main(int argc, char** argv) {
                   << " response_len=" << response_len
                   << " master_weights=" << (use_master_weights ? "true" : "false")
                   << " dp_grad_bucket_mb=" << dp_grad_bucket_mb
+                  << " tp_grad_bucket_mb=" << tp_grad_bucket_mb
                   << " resumed_from_step=" << start_step
                   << " skip_optimizer_step=" << (skip_optimizer_step ? "true" : "false")
                   << " vary_tokens_by_step=" << (vary_tokens_by_step ? "true" : "false")
