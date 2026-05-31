@@ -1615,12 +1615,13 @@ int main(int argc, char** argv) {
               ? cverl::torch_backend::clone_detached(optimizer.master_parameters())
               : std::vector<torch::Tensor>{};
       torch::Tensor flat_gradient_shard;
-      std::unordered_map<int64_t, torch::Tensor> stage_inputs;
-      std::unordered_map<int64_t, torch::Tensor> stage_outputs;
-      double loss_sum = 0.0;
-      double kl_loss_sum = 0.0;
-      double kl_sum = 0.0;
-      double clipfrac_sum = 0.0;
+      std::vector<torch::Tensor> stage_inputs(static_cast<size_t>(micro_batches));
+      std::vector<torch::Tensor> stage_outputs(static_cast<size_t>(micro_batches));
+      const auto metric_options = torch::TensorOptions().device(device).dtype(torch::kFloat32);
+      auto loss_sum_tensor = torch::zeros({}, metric_options);
+      auto kl_loss_sum_tensor = torch::zeros({}, metric_options);
+      auto kl_sum_tensor = torch::zeros({}, metric_options);
+      auto clipfrac_sum_tensor = torch::zeros({}, metric_options);
       double mean_reward = 0.0;
       double success_rate = 0.0;
       double adv_abs_sum = 0.0;
@@ -1667,17 +1668,17 @@ int main(int argc, char** argv) {
           } else {
             auto like = torch::empty(hidden_shape, torch::TensorOptions().device(device).dtype(dtype));
             input = full_comm.recv_like(like, peers.previous_rank).detach().set_requires_grad(true);
-            stage_inputs[action.micro_batch] = input;
+            stage_inputs[static_cast<size_t>(action.micro_batch)] = input;
           }
           auto output = model.forward_hidden_range_tensor_parallel(
               input, range.begin, range.end, tp_group, peers.is_last_stage);
-          stage_outputs[action.micro_batch] = output;
+          stage_outputs[static_cast<size_t>(action.micro_batch)] = output;
           if (!peers.is_last_stage) {
             full_comm.send(output.contiguous(), peers.next_rank);
           }
         } else {
-          auto out_it = stage_outputs.find(action.micro_batch);
-          if (out_it == stage_outputs.end()) {
+          auto& stage_output = stage_outputs[static_cast<size_t>(action.micro_batch)];
+          if (!stage_output.defined()) {
             throw std::runtime_error("missing stage activation for backward");
           }
           if (peers.is_last_stage) {
@@ -1723,25 +1724,25 @@ int main(int argc, char** argv) {
               total_loss = total_loss + kl_coef * kl_loss;
             }
             auto scaled_loss = total_loss / static_cast<double>(micro_batches);
-            loss_sum += scaled_loss.item<double>();
-            kl_loss_sum += kl_loss.item<double>();
-            kl_sum += loss.ppo_kl.item<double>();
-            clipfrac_sum += loss.pg_clipfrac.item<double>();
+            loss_sum_tensor.add_(scaled_loss.detach().to(torch::kFloat32));
+            kl_loss_sum_tensor.add_(kl_loss.detach().to(torch::kFloat32));
+            kl_sum_tensor.add_(loss.ppo_kl.detach().to(torch::kFloat32));
+            clipfrac_sum_tensor.add_(loss.pg_clipfrac.detach().to(torch::kFloat32));
             scaled_loss.backward();
           } else {
-            auto grad = full_comm.recv_like(out_it->second.contiguous(), peers.next_rank);
-            out_it->second.backward(grad);
+            auto grad = full_comm.recv_like(stage_output.contiguous(), peers.next_rank);
+            stage_output.backward(grad);
           }
 
           if (!peers.is_first_stage) {
-            auto in_it = stage_inputs.find(action.micro_batch);
-            if (in_it == stage_inputs.end()) {
+            auto& stage_input = stage_inputs[static_cast<size_t>(action.micro_batch)];
+            if (!stage_input.defined()) {
               throw std::runtime_error("missing stage input for backward");
             }
-            full_comm.send(in_it->second.grad().contiguous(), peers.previous_rank);
-            stage_inputs.erase(in_it);
+            full_comm.send(stage_input.grad().contiguous(), peers.previous_rank);
+            stage_input = torch::Tensor();
           }
-          stage_outputs.erase(out_it);
+          stage_output = torch::Tensor();
         }
       }
 
@@ -1887,15 +1888,15 @@ int main(int argc, char** argv) {
       }
 
       constexpr int64_t kMetricFields = 8;
-      auto local_metrics = torch::tensor({local_grad_norm,
-                                          local_param_delta,
-                                          loss_sum,
-                                          kl_loss_sum,
-                                          kl_sum,
-                                          clipfrac_sum,
-                                          global_grad_norm,
-                                          grad_clip_scale},
-                                         torch::TensorOptions().device(device).dtype(torch::kFloat32));
+      auto local_metrics = torch::empty({kMetricFields}, metric_options);
+      local_metrics.index_put_({0}, local_grad_norm);
+      local_metrics.index_put_({1}, local_param_delta);
+      local_metrics.index_put_({2}, loss_sum_tensor);
+      local_metrics.index_put_({3}, kl_loss_sum_tensor);
+      local_metrics.index_put_({4}, kl_sum_tensor);
+      local_metrics.index_put_({5}, clipfrac_sum_tensor);
+      local_metrics.index_put_({6}, global_grad_norm);
+      local_metrics.index_put_({7}, grad_clip_scale);
       auto gathered_metrics =
           full_comm.all_gather(local_metrics.contiguous(), full_ranks, 0).cpu().view({world_size, kMetricFields});
 

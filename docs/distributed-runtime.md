@@ -70,6 +70,10 @@ CUDA stream with events, and temporary inputs are kept alive until completion.
 Explicit barriers, checkpoint boundaries, and communicator destruction still
 call `synchronize()`.
 
+The PP/TP trainer also keeps per-micro-batch loss metrics on device and only
+gathers one compact metric tensor per step. Do not call `Tensor::item()` inside
+the 1F1B micro-batch loop; it serializes the CUDA stream and destroys overlap.
+
 ## Current TP/DP Implementation
 
 The first sharding layer is implemented in
