@@ -75,6 +75,10 @@ torch::Tensor l2norm(const torch::Tensor& x) {
   return x * torch::rsqrt((x * x).sum(-1, true) + 1e-6);
 }
 
+std::string tensor_cache_key(int64_t seq_len, torch::Device device, torch::ScalarType dtype) {
+  return std::to_string(seq_len) + "|" + device.str() + "|" + c10::toString(dtype);
+}
+
 torch::Tensor repeat_kv(const torch::Tensor& x, int64_t n_rep) {
   if (n_rep == 1) {
     return x;
@@ -375,6 +379,8 @@ void Qwen35TextModel::to(torch::Device device) {
   for (auto& item : weights_) {
     item.second = item.second.to(device_).contiguous();
   }
+  causal_mask_cache_.clear();
+  rotary_cache_.clear();
 }
 
 void Qwen35TextModel::set_weight_override(const std::string& name, torch::Tensor tensor) {
@@ -443,11 +449,22 @@ torch::Tensor Qwen35TextModel::rms_norm(const torch::Tensor& x, const torch::Ten
 }
 
 torch::Tensor Qwen35TextModel::rms_norm_gated(const torch::Tensor& x,
-                                             const torch::Tensor& gate,
-                                             const torch::Tensor& w) const {
+                                              const torch::Tensor& gate,
+                                              const torch::Tensor& w) const {
   auto xf = x.to(torch::kFloat32);
   auto out = xf * torch::rsqrt((xf * xf).mean(-1, true) + config_.rms_norm_eps);
   return ((out * w.to(torch::kFloat32)) * torch::silu(gate.to(torch::kFloat32))).to(x.scalar_type());
+}
+
+torch::Tensor Qwen35TextModel::causal_mask(int64_t seq_len, torch::Device device) const {
+  const std::string key = std::to_string(seq_len) + "|" + device.str();
+  auto it = causal_mask_cache_.find(key);
+  if (it != causal_mask_cache_.end()) {
+    return it->second;
+  }
+  auto mask = torch::ones({seq_len, seq_len}, torch::TensorOptions().dtype(torch::kBool).device(device)).triu(1);
+  auto inserted = causal_mask_cache_.emplace(key, mask);
+  return inserted.first->second;
 }
 
 std::pair<torch::Tensor, torch::Tensor> Qwen35TextModel::rotary_embeddings(int64_t batch_size,
@@ -455,13 +472,23 @@ std::pair<torch::Tensor, torch::Tensor> Qwen35TextModel::rotary_embeddings(int64
                                                                            torch::Device device,
                                                                            torch::ScalarType dtype) const {
   int64_t rotary_dim = static_cast<int64_t>(config_.head_dim * config_.partial_rotary_factor);
+  const std::string key = tensor_cache_key(seq_len, device, dtype) + "|" + std::to_string(rotary_dim);
+  auto it = rotary_cache_.find(key);
+  if (it != rotary_cache_.end()) {
+    return {it->second.first.expand({batch_size, seq_len, rotary_dim}),
+            it->second.second.expand({batch_size, seq_len, rotary_dim})};
+  }
   auto arange_opts = torch::TensorOptions().dtype(torch::kFloat32).device(device);
   auto inv_idx = torch::arange(0, rotary_dim, 2, arange_opts);
   auto inv_freq = torch::pow(config_.rope_theta, -(inv_idx / static_cast<double>(rotary_dim)));
   auto pos = torch::arange(0, seq_len, arange_opts);
   auto freqs = torch::ger(pos, inv_freq);
-  auto emb = torch::cat({freqs, freqs}, -1).unsqueeze(0).expand({batch_size, seq_len, rotary_dim});
-  return {torch::cos(emb).to(dtype), torch::sin(emb).to(dtype)};
+  auto emb = torch::cat({freqs, freqs}, -1).unsqueeze(0);
+  auto cos = torch::cos(emb).to(dtype).contiguous();
+  auto sin = torch::sin(emb).to(dtype).contiguous();
+  auto inserted = rotary_cache_.emplace(key, std::make_pair(cos, sin));
+  return {inserted.first->second.first.expand({batch_size, seq_len, rotary_dim}),
+          inserted.first->second.second.expand({batch_size, seq_len, rotary_dim})};
 }
 
 torch::Tensor Qwen35TextModel::mlp(const torch::Tensor& x, int64_t layer_idx) {
@@ -525,7 +552,7 @@ torch::Tensor Qwen35TextModel::full_attention(const torch::Tensor& x, int64_t la
   k = repeat_kv(k, h / kvh);
   v = repeat_kv(v, h / kvh);
   auto attn = torch::matmul(q, k.transpose(2, 3)) * (1.0 / std::sqrt(static_cast<double>(d)));
-  auto mask = torch::ones({s, s}, torch::TensorOptions().dtype(torch::kBool).device(x.device())).triu(1);
+  auto mask = causal_mask(s, x.device());
   attn = attn.masked_fill(mask.unsqueeze(0).unsqueeze(0), -1.0e9);
   attn = torch::softmax(attn.to(torch::kFloat32), -1);
   auto out = torch::matmul(attn, v.to(torch::kFloat32)).transpose(1, 2).contiguous().reshape({b, s, h * d});
@@ -580,7 +607,7 @@ torch::Tensor Qwen35TextModel::full_attention_tensor_parallel(const torch::Tenso
   k = repeat_kv(k, h / kvh).contiguous();
   v = repeat_kv(v, h / kvh).contiguous();
   auto attn = torch::matmul(q, k.transpose(2, 3)) * (1.0 / std::sqrt(static_cast<double>(d)));
-  auto mask = torch::ones({s, s}, torch::TensorOptions().dtype(torch::kBool).device(x.device())).triu(1);
+  auto mask = causal_mask(s, x.device());
   attn = attn.masked_fill(mask.unsqueeze(0).unsqueeze(0), -1.0e9);
   attn = torch::softmax(attn.to(torch::kFloat32), -1);
   auto local = torch::matmul(attn, v.to(torch::kFloat32)).transpose(1, 2).contiguous().reshape({b, s, h_local * d});

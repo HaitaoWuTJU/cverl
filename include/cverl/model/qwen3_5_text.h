@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <torch/torch.h>
@@ -86,6 +87,7 @@ class Qwen35TextModel {
   torch::Tensor mlp(const torch::Tensor& x, int64_t layer_idx);
   torch::Tensor full_attention(const torch::Tensor& x, int64_t layer_idx);
   torch::Tensor linear_attention(const torch::Tensor& x, int64_t layer_idx);
+  torch::Tensor causal_mask(int64_t seq_len, torch::Device device) const;
   std::pair<torch::Tensor, torch::Tensor> rotary_embeddings(int64_t batch_size,
                                                             int64_t seq_len,
                                                             torch::Device device,
@@ -94,6 +96,8 @@ class Qwen35TextModel {
   HfModelLoader loader_;
   Qwen35TextConfig config_;
   std::unordered_map<std::string, torch::Tensor> weights_;
+  mutable std::unordered_map<std::string, torch::Tensor> causal_mask_cache_;
+  mutable std::unordered_map<std::string, std::pair<torch::Tensor, torch::Tensor>> rotary_cache_;
   torch::Device device_ = torch::kCPU;
 };
 
