@@ -19,15 +19,18 @@ void require(bool cond, const std::string& msg) {
 
 class DeterministicEosPolicy final : public cverl::torch_backend::CausalLmPolicy {
  public:
+  explicit DeterministicEosPolicy(bool all_eos = false) : all_eos_(all_eos) {}
+
   torch::Tensor forward(const torch::Tensor& prompt_ids,
                         const torch::Tensor& response_ids) override {
     (void)prompt_ids;
+    ++forward_calls_;
     const int64_t batch = response_ids.size(0);
     const int64_t response_len = response_ids.size(1);
     auto logits = torch::full({batch, response_len, vocab_size()}, -1000.0f,
                               response_ids.options().dtype(torch::kFloat32));
     for (int64_t row = 0; row < batch; ++row) {
-      const int64_t token = (row == 0) ? eos_id_ : normal_id_;
+      const int64_t token = (all_eos_ || row == 0) ? eos_id_ : normal_id_;
       logits.index_put_({row, torch::indexing::Slice(), token}, 1000.0f);
     }
     return logits;
@@ -40,10 +43,14 @@ class DeterministicEosPolicy final : public cverl::torch_backend::CausalLmPolicy
     return std::make_shared<DeterministicEosPolicy>(*this);
   }
 
+  int64_t forward_calls() const { return forward_calls_; }
+
  private:
   static constexpr int32_t pad_id_ = 0;
   static constexpr int64_t eos_id_ = 2;
   static constexpr int64_t normal_id_ = 3;
+  bool all_eos_ = false;
+  int64_t forward_calls_ = 0;
 };
 
 }  // namespace
@@ -90,6 +97,29 @@ int main() {
               "eos lengths count emitted eos and active non-eos tokens");
       require(torch::all(out.logprobs[0].slice(/*dim=*/0, /*start=*/1) == 0).item<bool>(),
               "eos leaves inactive logprob slots zero");
+    }
+    {
+      auto no_sync_policy = std::make_shared<DeterministicEosPolicy>(true);
+      cverl::rollout::PolicyRolloutWorker no_sync_worker(no_sync_policy);
+      cverl::rollout::TokenBatch prompts;
+      prompts.token_ids = torch::tensor({{1, 2}, {3, 4}}, torch::kLong);
+
+      cverl::rollout::GenerationConfig config;
+      config.max_new_tokens = 3;
+      config.temperature = 0.0;
+      config.eos_token_id = 2;
+      auto no_sync_out = no_sync_worker.generate(prompts, config);
+      require(no_sync_policy->forward_calls() == 3, "default eos check should avoid host-sync early exit");
+      require(torch::equal(no_sync_out.token_ids.cpu(), torch::tensor({{2, 0, 0}, {2, 0, 0}}, torch::kLong)),
+              "default no-sync eos still leaves inactive token slots padded");
+
+      auto sync_policy = std::make_shared<DeterministicEosPolicy>(true);
+      cverl::rollout::PolicyRolloutWorker sync_worker(sync_policy);
+      config.eos_check_interval = 1;
+      auto sync_out = sync_worker.generate(prompts, config);
+      require(sync_policy->forward_calls() == 1, "eos_check_interval=1 should early exit");
+      require(torch::equal(sync_out.token_ids.cpu(), torch::tensor({{2, 0, 0}, {2, 0, 0}}, torch::kLong)),
+              "sync eos leaves inactive token slots padded");
     }
 
     std::string model_dir;

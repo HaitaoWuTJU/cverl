@@ -23,6 +23,9 @@ struct GenerationConfig {
   double top_p = 1.0;
   int64_t top_k = -1;
   int64_t eos_token_id = -1;
+  // 0 disables per-token host synchronization for early-exit checks. Set to 1
+  // for lowest-latency early exit, or a larger interval to amortize the sync.
+  int64_t eos_check_interval = 0;
   uint64_t seed = 0;
 };
 

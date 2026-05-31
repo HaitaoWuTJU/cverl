@@ -74,6 +74,9 @@ GenerationOutput PolicyRolloutWorker::generate(const TokenBatch& prompts,
   if (config.max_new_tokens <= 0) {
     throw std::invalid_argument("PolicyRolloutWorker max_new_tokens must be positive");
   }
+  if (config.eos_check_interval < 0) {
+    throw std::invalid_argument("PolicyRolloutWorker eos_check_interval must be non-negative");
+  }
 
   torch::NoGradGuard no_grad;
   if (config.seed != 0) {
@@ -111,7 +114,10 @@ GenerationOutput PolicyRolloutWorker::generate(const TokenBatch& prompts,
 
     if (config.eos_token_id >= 0) {
       finished = torch::logical_or(finished, torch::logical_and(active, next == config.eos_token_id));
-      if (finished.all().item<bool>()) {
+      const bool should_check_eos =
+          config.eos_check_interval > 0 &&
+          (((step + 1) % config.eos_check_interval == 0) || step + 1 == config.max_new_tokens);
+      if (should_check_eos && finished.all().item<bool>()) {
         break;
       }
     }
