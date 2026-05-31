@@ -1871,7 +1871,6 @@ int main(int argc, char** argv) {
                                          torch::TensorOptions().device(device).dtype(torch::kFloat32));
       auto gathered_metrics =
           full_comm.all_gather(local_metrics.contiguous(), full_ranks, 0).cpu().view({world_size, kMetricFields});
-      full_comm.barrier();
 
       if (global_rank == 0) {
         bool all_have_grad = true;
