@@ -107,9 +107,14 @@ RolloutBatch build_gsm8k_rollout_batch(const RolloutResponse& response,
                       options.max_prompt_tokens,
                       pad_id);
 
-    auto response_ids = tokenizer.encode(seq.text, response_encode);
-    int64_t real_len = std::min<int64_t>(static_cast<int64_t>(response_ids.size()), options.max_response_tokens);
-    right_pad_into_row(response_ids,
+    std::vector<int32_t> encoded_response_ids;
+    const std::vector<int32_t>* response_ids = &seq.token_ids;
+    if (response_ids->empty()) {
+      encoded_response_ids = tokenizer.encode(seq.text, response_encode);
+      response_ids = &encoded_response_ids;
+    }
+    int64_t real_len = std::min<int64_t>(static_cast<int64_t>(response_ids->size()), options.max_response_tokens);
+    right_pad_into_row(*response_ids,
                        response_ptr + i * options.max_response_tokens,
                        options.max_response_tokens,
                        pad_id);

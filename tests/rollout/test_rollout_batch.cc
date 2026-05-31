@@ -36,6 +36,9 @@ int main() {
         if (s == 0) {
           // Correct answer.
           seq.text = "The answer is\n#### " + ground_truths[p];
+          if (p == 0) {
+            seq.token_ids = {17, 18, 19};
+          }
         } else if (s == 1) {
           // Wrong but parseable.
           seq.text = "wrong answer\n#### 999";
@@ -60,6 +63,7 @@ int main() {
         resp, prompts, ground_truths, reward_opts, tok, opts);
 
     const int64_t B = static_cast<int64_t>(prompts.size()) * n;
+    auto pad_id = cverl::text::ByteTokenizer::kPadId;
     require(batch.prompt_ids.sizes() == torch::IntArrayRef({B, 32}), "prompt shape");
     require(batch.response_ids.sizes() == torch::IntArrayRef({B, 48}), "response shape");
     require(batch.response_mask.sizes() == torch::IntArrayRef({B, 48}), "mask shape");
@@ -95,9 +99,17 @@ int main() {
       }
     }
 
+    // If rollout already returns token ids, the batch builder must use them
+    // directly instead of re-tokenizing response text.
+    require(batch.response_ids[0][0].item<int64_t>() == 17, "uses returned token id 0");
+    require(batch.response_ids[0][1].item<int64_t>() == 18, "uses returned token id 1");
+    require(batch.response_ids[0][2].item<int64_t>() == 19, "uses returned token id 2");
+    require(batch.response_ids[0][3].item<int64_t>() == pad_id, "returned token ids are padded");
+    require(batch.response_mask[0].sum().item<double>() == 3.0, "returned token id length drives mask");
+    require(batch.token_rewards[0][2].item<double>() == 1.0, "returned token id length drives reward position");
+
     // Left-padded prompts: the last column is always a real token, not pad.
     auto last_col = batch.prompt_ids.select(1, opts.max_prompt_tokens - 1);
-    auto pad_id = cverl::text::ByteTokenizer::kPadId;
     for (int64_t i = 0; i < B; ++i) {
       require(last_col[i].item<int64_t>() != pad_id, "last prompt col is real token");
     }
