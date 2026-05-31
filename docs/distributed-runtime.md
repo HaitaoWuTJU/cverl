@@ -220,8 +220,11 @@ Current code exposes the distributed shape directly:
   wrappers on the `Collectives` interface.
 - `context_parallel`: sequence-dimension shard/gather helpers used as the
   base for CP attention. It also provides a differentiable all-gather-KV
-  causal-attention reference for local query shards; ring-attention kernels
-  should match this math while replacing the global KV materialization.
+  causal-attention reference for local query shards. The attention math now
+  uses FlashAttention-style streaming over KV blocks, maintaining row max,
+  row sum, and value accumulator instead of materializing the full `[Q,K]`
+  score/probability matrix; ring-attention kernels should match this math
+  while replacing the remaining global KV materialization.
   The NCCL smoke test runs this path on GPU ranks. The current differentiable
   gather uses all-gather in forward and reduce-scatter in backward, so local
   K/V owners receive gradients. Full industrial CP training still needs a

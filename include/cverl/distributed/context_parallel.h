@@ -64,6 +64,15 @@ torch::Tensor context_parallel_causal_attention(const torch::Tensor& query_local
                                                 int64_t query_begin,
                                                 double scale);
 
+torch::Tensor context_parallel_causal_attention_streaming_blocks(
+    const torch::Tensor& query_local,
+    const std::vector<torch::Tensor>& key_blocks,
+    const std::vector<torch::Tensor>& value_blocks,
+    const std::vector<int64_t>& key_begin_positions,
+    int64_t query_begin,
+    int64_t original_sequence_length,
+    double scale);
+
 torch::Tensor context_parallel_causal_attention_gather_kv(const torch::Tensor& query_local,
                                                           const torch::Tensor& key_local,
                                                           const torch::Tensor& value_local,

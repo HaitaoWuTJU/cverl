@@ -262,6 +262,86 @@ torch::Tensor context_parallel_causal_attention(const torch::Tensor& query_local
   return torch::matmul(probs, value_global.to(torch::kFloat32)).to(query_local.scalar_type());
 }
 
+torch::Tensor context_parallel_causal_attention_streaming_blocks(
+    const torch::Tensor& query_local,
+    const std::vector<torch::Tensor>& key_blocks,
+    const std::vector<torch::Tensor>& value_blocks,
+    const std::vector<int64_t>& key_begin_positions,
+    int64_t query_begin,
+    int64_t original_sequence_length,
+    double scale) {
+  require_attention_tensor(query_local, "query_local");
+  if (query_begin < 0 || original_sequence_length < 0) {
+    throw std::invalid_argument("query_begin and original_sequence_length must be non-negative");
+  }
+  if (key_blocks.size() != value_blocks.size() || key_blocks.size() != key_begin_positions.size()) {
+    throw std::invalid_argument("streaming CP attention block metadata size mismatch");
+  }
+  if (key_blocks.empty()) {
+    throw std::invalid_argument("streaming CP attention requires at least one KV block");
+  }
+  const int64_t local_seq = query_local.size(2);
+  const int64_t valid_query =
+      std::max<int64_t>(0, std::min<int64_t>(local_seq, original_sequence_length - query_begin));
+  auto out = torch::zeros({query_local.size(0), query_local.size(1), local_seq, value_blocks.front().size(3)},
+                          query_local.options());
+  if (valid_query == 0) {
+    return out;
+  }
+
+  auto query = query_local.narrow(2, 0, valid_query).contiguous().to(torch::kFloat32);
+  auto q_pos = torch::arange(query_begin,
+                             query_begin + valid_query,
+                             torch::TensorOptions().dtype(torch::kLong).device(query_local.device()))
+                   .view({valid_query, 1});
+  auto row_max = torch::full({query.size(0), query.size(1), valid_query, 1},
+                             -1.0e30,
+                             torch::TensorOptions().dtype(torch::kFloat32).device(query_local.device()));
+  auto row_sum = torch::zeros_like(row_max);
+  auto acc = torch::zeros({query.size(0), query.size(1), valid_query, value_blocks.front().size(3)},
+                          torch::TensorOptions().dtype(torch::kFloat32).device(query_local.device()));
+
+  for (size_t i = 0; i < key_blocks.size(); ++i) {
+    const auto& key_block = key_blocks[i];
+    const auto& value_block = value_blocks[i];
+    require_attention_tensor(key_block, "key_block");
+    require_attention_tensor(value_block, "value_block");
+    if (key_block.size(0) != query_local.size(0) || value_block.size(0) != query_local.size(0) ||
+        key_block.size(1) != query_local.size(1) || value_block.size(1) != query_local.size(1) ||
+        key_block.size(2) != value_block.size(2) || key_block.size(3) != query_local.size(3)) {
+      throw std::invalid_argument("streaming CP attention block shape mismatch");
+    }
+    if (key_begin_positions[i] < 0) {
+      throw std::invalid_argument("streaming CP attention key block position must be non-negative");
+    }
+    const int64_t valid_key =
+        std::max<int64_t>(0, std::min<int64_t>(key_block.size(2), original_sequence_length - key_begin_positions[i]));
+    if (valid_key == 0) {
+      continue;
+    }
+    auto key = key_block.narrow(2, 0, valid_key).contiguous().to(torch::kFloat32);
+    auto value = value_block.narrow(2, 0, valid_key).contiguous().to(torch::kFloat32);
+    auto scores = torch::matmul(query, key.transpose(2, 3)) * scale;
+    auto k_pos = torch::arange(key_begin_positions[i],
+                               key_begin_positions[i] + valid_key,
+                               torch::TensorOptions().dtype(torch::kLong).device(query_local.device()))
+                     .view({1, valid_key});
+    scores = scores.masked_fill((k_pos > q_pos).unsqueeze(0).unsqueeze(0), -1.0e30);
+
+    auto block_max = std::get<0>(scores.max(-1, true));
+    auto next_max = torch::maximum(row_max, block_max);
+    auto old_scale = torch::exp(row_max - next_max);
+    auto exp_scores = torch::exp(scores - next_max);
+    acc = acc * old_scale + torch::matmul(exp_scores, value);
+    row_sum = row_sum * old_scale + exp_scores.sum(-1, true);
+    row_max = next_max;
+  }
+
+  auto valid_out = (acc / row_sum.clamp_min(1.0e-20)).to(query_local.scalar_type());
+  out.narrow(2, 0, valid_query).copy_(valid_out);
+  return out;
+}
+
 torch::Tensor context_parallel_causal_attention_gather_kv(const torch::Tensor& query_local,
                                                           const torch::Tensor& key_local,
                                                           const torch::Tensor& value_local,
@@ -284,20 +364,24 @@ torch::Tensor context_parallel_causal_attention_gather_kv(const torch::Tensor& q
   if (key_global.size(2) < original_sequence_length || value_global.size(2) < original_sequence_length) {
     throw std::invalid_argument("gathered CP KV is shorter than original_sequence_length");
   }
-  key_global = key_global.narrow(2, 0, original_sequence_length).contiguous();
-  value_global = value_global.narrow(2, 0, original_sequence_length).contiguous();
-  const int64_t query_begin = context_rank * shard;
-  const int64_t valid_query = std::max<int64_t>(0, std::min<int64_t>(shard, original_sequence_length - query_begin));
-  if (valid_query == shard) {
-    return context_parallel_causal_attention(query_local, key_global, value_global, query_begin, scale);
+  std::vector<torch::Tensor> key_blocks;
+  std::vector<torch::Tensor> value_blocks;
+  std::vector<int64_t> key_begin_positions;
+  key_blocks.reserve(context_group.size());
+  value_blocks.reserve(context_group.size());
+  key_begin_positions.reserve(context_group.size());
+  for (int64_t rank_index = 0; rank_index < static_cast<int64_t>(context_group.size()); ++rank_index) {
+    const int64_t begin = rank_index * shard;
+    if (begin >= key_global.size(2)) {
+      break;
+    }
+    const int64_t block = std::min<int64_t>(shard, key_global.size(2) - begin);
+    key_blocks.push_back(key_global.narrow(2, begin, block).contiguous());
+    value_blocks.push_back(value_global.narrow(2, begin, block).contiguous());
+    key_begin_positions.push_back(begin);
   }
-  auto out = torch::zeros({query_local.size(0), query_local.size(1), shard, value_global.size(3)}, query_local.options());
-  if (valid_query > 0) {
-    auto valid = context_parallel_causal_attention(
-        query_local.narrow(2, 0, valid_query).contiguous(), key_global, value_global, query_begin, scale);
-    out.narrow(2, 0, valid_query).copy_(valid);
-  }
-  return out;
+  return context_parallel_causal_attention_streaming_blocks(
+      query_local, key_blocks, value_blocks, key_begin_positions, context_rank * shard, original_sequence_length, scale);
 }
 
 }  // namespace cverl::distributed

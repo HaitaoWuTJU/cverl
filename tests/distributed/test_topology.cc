@@ -387,6 +387,42 @@ void test_context_parallel_causal_attention() {
   auto local = cverl::distributed::context_parallel_causal_attention(local_q, k, v, 3, scale);
   require(torch::allclose(local, dense.narrow(2, 3, 3), 1.0e-5, 1.0e-5), "CP local causal attention");
 
+  auto stream_q = q.narrow(2, 3, 3).contiguous().set_requires_grad(true);
+  auto stream_k0 = k.narrow(2, 0, 3).contiguous().set_requires_grad(true);
+  auto stream_v0 = v.narrow(2, 0, 3).contiguous().set_requires_grad(true);
+  auto stream_k1 = k.narrow(2, 3, 3).contiguous().set_requires_grad(true);
+  auto stream_v1 = v.narrow(2, 3, 3).contiguous().set_requires_grad(true);
+  auto stream_out = cverl::distributed::context_parallel_causal_attention_streaming_blocks(
+      stream_q, {stream_k1, stream_k0}, {stream_v1, stream_v0}, {3, 0}, 3, 6, scale);
+  require(torch::allclose(stream_out, dense.narrow(2, 3, 3), 1.0e-5, 1.0e-5),
+          "CP streaming causal attention matches dense regardless of ring block order");
+  auto stream_dense_q = q.detach().clone().set_requires_grad(true);
+  auto stream_dense_k = k.detach().clone().set_requires_grad(true);
+  auto stream_dense_v = v.detach().clone().set_requires_grad(true);
+  auto stream_dense_local =
+      cverl::distributed::context_parallel_causal_attention(stream_dense_q.narrow(2, 3, 3).contiguous(),
+                                                            stream_dense_k,
+                                                            stream_dense_v,
+                                                            3,
+                                                            scale);
+  stream_dense_local.sum().backward();
+  stream_out.sum().backward();
+  require(stream_q.grad().defined() &&
+              torch::allclose(stream_q.grad(), stream_dense_q.grad().narrow(2, 3, 3), 1.0e-5, 1.0e-5),
+          "CP streaming query gradient matches dense");
+  require(stream_k0.grad().defined() &&
+              torch::allclose(stream_k0.grad(), stream_dense_k.grad().narrow(2, 0, 3), 1.0e-5, 1.0e-5),
+          "CP streaming key block 0 gradient matches dense");
+  require(stream_k1.grad().defined() &&
+              torch::allclose(stream_k1.grad(), stream_dense_k.grad().narrow(2, 3, 3), 1.0e-5, 1.0e-5),
+          "CP streaming key block 1 gradient matches dense");
+  require(stream_v0.grad().defined() &&
+              torch::allclose(stream_v0.grad(), stream_dense_v.grad().narrow(2, 0, 3), 1.0e-5, 1.0e-5),
+          "CP streaming value block 0 gradient matches dense");
+  require(stream_v1.grad().defined() &&
+              torch::allclose(stream_v1.grad(), stream_dense_v.grad().narrow(2, 3, 3), 1.0e-5, 1.0e-5),
+          "CP streaming value block 1 gradient matches dense");
+
   auto dense_q = q.detach().clone().set_requires_grad(true);
   auto dense_k = k.detach().clone().set_requires_grad(true);
   auto dense_v = v.detach().clone().set_requires_grad(true);
