@@ -402,6 +402,8 @@ void sync_tp_replicated_gradients(const std::vector<torch::Tensor>& replicated_p
 }
 
 struct PpPpoBatch {
+  torch::Tensor prompt_ids;
+  torch::Tensor response_ids;
   torch::Tensor token_ids;
   torch::Tensor advantages;
   torch::Tensor response_masks;
@@ -445,6 +447,22 @@ torch::Tensor rollout_row(const torch::Tensor& tensor, int64_t row, int64_t widt
     return {};
   }
   return tensor.narrow(0, row, 1).view({1, width});
+}
+
+torch::Tensor rollout_token_row(const PpPpoBatch& batch, int64_t row, int64_t prompt_len, int64_t response_len) {
+  if (batch.prompt_ids.defined() && batch.response_ids.defined()) {
+    auto prompt = rollout_row(batch.prompt_ids, row, prompt_len);
+    auto response = rollout_row(batch.response_ids, row, response_len);
+    return torch::cat({prompt, response}, 1).contiguous();
+  }
+  return rollout_row(batch.token_ids, row, prompt_len + response_len);
+}
+
+torch::Tensor rollout_response_row(const PpPpoBatch& batch, int64_t row, int64_t prompt_len, int64_t response_len) {
+  if (batch.response_ids.defined()) {
+    return rollout_row(batch.response_ids, row, response_len);
+  }
+  return rollout_row(batch.token_ids, row, prompt_len + response_len).slice(1, prompt_len, prompt_len + response_len);
 }
 
 torch::ScalarType parse_dtype(const std::string& dtype) {
@@ -1180,7 +1198,8 @@ PpPpoBatch load_rollout_ppo_batch(const std::string& path,
   PpPpoBatch out;
   out.rows = prompt_ids.size(0);
   assign_rollout_batch_metrics(out, rollout_batch.scalar_rewards, advantages, reward_opts.correct_score - 1e-6);
-  out.token_ids = torch::cat({prompt_ids, response_ids}, 1).contiguous();
+  out.prompt_ids = prompt_ids.contiguous();
+  out.response_ids = response_ids.contiguous();
   out.advantages = advantages.contiguous();
   out.response_masks = response_mask.contiguous();
   return out;
@@ -1296,7 +1315,8 @@ PpPpoBatch load_rollout_ipc_batch(const std::string& path,
   out.mean_reward = doc.value("mean_reward", 0.0);
   out.success_rate = doc.value("success_rate", 0.0);
   assign_rollout_batch_metrics(out, torch::Tensor(), advantages, 1.0 - 1e-6);
-  out.token_ids = torch::cat({prompt_ids, response_ids}, 1).contiguous();
+  out.prompt_ids = prompt_ids.contiguous();
+  out.response_ids = response_ids.contiguous();
   out.advantages = advantages.contiguous();
   out.response_masks = response_mask.contiguous();
   out.old_log_probs = old_log_probs.defined() ? old_log_probs.contiguous() : torch::Tensor();
@@ -1325,7 +1345,8 @@ PpPpoBatch convert_gpu_rollout_batch(const cverl::rollout::GpuRolloutBatch& gpu_
   auto advantages = gpu_batch.advantages.to(torch::kFloat32);
   torch::Tensor old_log_probs = gpu_batch.old_log_probs.defined() ? gpu_batch.old_log_probs.to(torch::kFloat32) : torch::Tensor();
   torch::Tensor ref_log_probs = gpu_batch.ref_log_probs.defined() ? gpu_batch.ref_log_probs.to(torch::kFloat32) : torch::Tensor();
-  out.token_ids = torch::cat({gpu_batch.prompt_ids, gpu_batch.response_ids}, 1).contiguous();
+  out.prompt_ids = gpu_batch.prompt_ids.contiguous();
+  out.response_ids = gpu_batch.response_ids.contiguous();
   out.advantages = advantages.contiguous();
   out.response_masks = response_mask.contiguous();
   out.old_log_probs = old_log_probs.defined() ? old_log_probs.contiguous() : torch::Tensor();
@@ -1387,13 +1408,19 @@ torch::Tensor make_token_ids(int64_t seq_len,
                              int64_t micro_batch,
                              int64_t step,
                              bool vary_tokens_by_step,
+                             int64_t prompt_len,
+                             int64_t response_len,
                              const PpPpoBatch* rollout_batch,
                              const std::vector<torch::Tensor>& jsonl_batches,
                              const cverl::Qwen35TextConfig& config,
                              torch::Device device) {
   if (rollout_batch != nullptr && rollout_batch->rows > 0) {
     const int64_t idx = micro_batch % rollout_batch->rows;
-    return rollout_row(rollout_batch->token_ids, idx, seq_len);
+    auto ids = rollout_token_row(*rollout_batch, idx, prompt_len, response_len);
+    if (ids.size(1) != seq_len) {
+      throw std::runtime_error("rollout token row length mismatch");
+    }
+    return ids;
   }
   if (!jsonl_batches.empty()) {
     const int64_t idx = (step * 1024 + micro_batch) % static_cast<int64_t>(jsonl_batches.size());
@@ -1708,7 +1735,16 @@ int main(int argc, char** argv) {
           torch::Tensor input;
           if (peers.is_first_stage) {
             auto ids = make_token_ids(
-                seq_len, action.micro_batch, step, vary_tokens_by_step, active_rollout, jsonl_batches, model.config(), device);
+                seq_len,
+                action.micro_batch,
+                step,
+                vary_tokens_by_step,
+                prompt_len,
+                response_len,
+                active_rollout,
+                jsonl_batches,
+                model.config(),
+                device);
             input = model.token_embeddings_tensor_parallel(ids, tp_group);
           } else {
             auto like = torch::empty(hidden_shape, torch::TensorOptions().device(device).dtype(dtype));
@@ -1727,9 +1763,24 @@ int main(int argc, char** argv) {
             throw std::runtime_error("missing stage activation for backward");
           }
           if (peers.is_last_stage) {
-            auto ids = make_token_ids(
-                seq_len, action.micro_batch, step, vary_tokens_by_step, active_rollout, jsonl_batches, model.config(), device);
-            auto response_ids = ids.slice(1, prompt_len, prompt_len + response_len);
+            torch::Tensor response_ids;
+            if (active_rollout != nullptr) {
+              const int64_t idx = action.micro_batch % active_rollout->rows;
+              response_ids = rollout_response_row(*active_rollout, idx, prompt_len, response_len);
+            } else {
+              auto ids = make_token_ids(
+                  seq_len,
+                  action.micro_batch,
+                  step,
+                  vary_tokens_by_step,
+                  prompt_len,
+                  response_len,
+                  active_rollout,
+                  jsonl_batches,
+                  model.config(),
+                  device);
+              response_ids = ids.slice(1, prompt_len, prompt_len + response_len);
+            }
             auto response_hidden = stage_output.slice(1, prompt_len - 1, prompt_len + response_len - 1);
             auto log_probs = model.response_log_probs_tensor_parallel(response_hidden, response_ids, tp_group);
             torch::Tensor old_log_probs = log_probs.detach();
