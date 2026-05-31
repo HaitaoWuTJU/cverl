@@ -149,6 +149,9 @@ std::vector<PromptAnswerExample> load_prompt_answer_jsonl(const JsonlDatasetOpti
   if (options.prompt_field.empty() || options.answer_field.empty()) {
     throw std::invalid_argument("prompt_field and answer_field are required");
   }
+  if (options.max_examples == 0) {
+    return {};
+  }
 
   std::ifstream in(options.path);
   if (!in) {
@@ -156,6 +159,9 @@ std::vector<PromptAnswerExample> load_prompt_answer_jsonl(const JsonlDatasetOpti
   }
 
   std::vector<PromptAnswerExample> examples;
+  if (options.max_examples > 0) {
+    examples.reserve(static_cast<size_t>(options.max_examples));
+  }
   std::string line;
   int64_t line_no = 0;
 #ifdef CVERL_HAS_SIMDJSON

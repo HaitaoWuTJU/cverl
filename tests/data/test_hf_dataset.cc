@@ -35,8 +35,12 @@ void test_jsonl_reader() {
 
   cverl::data::JsonlDatasetOptions options;
   options.path = path.string();
-  options.max_examples = 2;
+  options.max_examples = 0;
   auto examples = cverl::data::load_prompt_answer_jsonl(options);
+  require(examples.empty(), "max_examples=0 should avoid loading rows");
+
+  options.max_examples = 2;
+  examples = cverl::data::load_prompt_answer_jsonl(options);
   require(examples.size() == 2, "max_examples should limit rows");
   require(examples[0].prompt == "What is 2+2?", "first prompt");
   require(examples[0].answer == "4", "first answer");
