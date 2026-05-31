@@ -456,7 +456,7 @@ void test_flat_sharded_adamw_single_dp_skips_data_collectives() {
   require(step.gradient_shard.shard.numel() == param_rank0.shard.numel(), "single-DP grad shard size");
   require(comm0.reduce_scatter_calls == 0, "single-DP flat step should skip reduce-scatter");
   require(comm0.all_gather_calls == 0, "single-DP flat step should skip parameter all-gather");
-  require(comm0.all_reduce_calls == 1, "single-DP flat step should still report norm through norm collective");
+  require(comm0.all_reduce_calls == 0, "single-DP flat step should skip norm all-reduce");
 }
 
 }  // namespace

@@ -542,21 +542,38 @@ FlatAdamWStepResult flat_sharded_adamw_step(const std::vector<torch::Tensor>& pa
   FlatAdamWStepResult result;
   result.gradient_shard = std::move(grad_shard);
   auto grad_sq_tensor = result.gradient_shard.shard.pow(2).sum().to(torch::kFloat32).reshape({1});
-  auto global_grad_sq_tensor =
-      norm_collectives.all_reduce(grad_sq_tensor.contiguous(), ReduceOp::Sum, norm_group);
-  auto norm_metrics = torch::cat({grad_sq_tensor.contiguous(), global_grad_sq_tensor.contiguous()}, 0)
+  torch::Tensor global_grad_sq_tensor;
+  if (norm_group.size() == 1) {
+    (void)rank_index_in_group(norm_collectives.rank(), norm_group, "flat_sharded_adamw_step norm_group");
+    global_grad_sq_tensor = grad_sq_tensor.contiguous();
+  } else {
+    global_grad_sq_tensor =
+        norm_collectives.all_reduce(grad_sq_tensor.contiguous(), ReduceOp::Sum, norm_group).contiguous();
+  }
+  auto clip_scale_tensor = torch::ones_like(global_grad_sq_tensor);
+  if (max_grad_norm > 0.0) {
+    auto global_norm_tensor = global_grad_sq_tensor.sqrt();
+    auto should_clip = torch::logical_and(torch::isfinite(global_norm_tensor), global_norm_tensor > max_grad_norm);
+    clip_scale_tensor = torch::where(
+        should_clip,
+        torch::full_like(global_norm_tensor, max_grad_norm) / (global_norm_tensor + 1.0e-6),
+        clip_scale_tensor);
+    result.gradient_shard.shard.mul_(clip_scale_tensor);
+  }
+  optimizer.step(result.gradient_shard.shard);
+  parameter_shard.shard.copy_(optimizer.parameter_shard());
+
+  auto norm_metrics = torch::cat(
+                          {grad_sq_tensor.contiguous(),
+                           global_grad_sq_tensor.contiguous(),
+                           clip_scale_tensor.contiguous()},
+                          0)
                           .to(torch::kCPU)
                           .contiguous();
   result.local_grad_norm_sq = static_cast<double>(norm_metrics[0].item<float>());
   result.global_grad_norm = std::sqrt(static_cast<double>(norm_metrics[1].item<float>()));
-  if (max_grad_norm > 0.0 && std::isfinite(result.global_grad_norm) &&
-      result.global_grad_norm > max_grad_norm) {
-    result.grad_clip_scale = max_grad_norm / (result.global_grad_norm + 1.0e-6);
-    result.gradient_shard.shard.mul_(result.grad_clip_scale);
-  }
+  result.grad_clip_scale = static_cast<double>(norm_metrics[2].item<float>());
   result.local_grad_norm = std::sqrt(result.local_grad_norm_sq) * result.grad_clip_scale;
-  optimizer.step(result.gradient_shard.shard);
-  parameter_shard.shard.copy_(optimizer.parameter_shard());
   if (apply_parameters) {
     if (all_gather_bucket_numel > 0) {
       all_gather_apply_flat_parameter_shard_bucketed(
