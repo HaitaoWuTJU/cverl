@@ -64,8 +64,10 @@ int main() {
       grad_out, q, k, v, beta, g, std::get<1>(saved_forward));
   auto recompute_grads = cverl::qwen_linear_attention_cuda_backward_recompute(
       grad_out, q, k, v, beta, g);
+  setenv("CVERL_LINEAR_ATTN_CHUNK_REPLAY_BACKWARD", "0", 1);
   auto checkpointed_grads = cverl::qwen_linear_attention_cuda_backward_checkpointed(
       grad_out, q, k, v, beta, g, std::get<1>(checkpointed_forward), 2);
+  unsetenv("CVERL_LINEAR_ATTN_CHUNK_REPLAY_BACKWARD");
   setenv("CVERL_LINEAR_ATTN_CHUNK_REPLAY_BACKWARD", "1", 1);
   auto chunk_replay_grads = cverl::qwen_linear_attention_cuda_backward_checkpointed(
       grad_out, q, k, v, beta, g, std::get<1>(checkpointed_forward), 2);

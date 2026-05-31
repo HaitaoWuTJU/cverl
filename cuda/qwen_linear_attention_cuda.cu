@@ -34,10 +34,16 @@ int value_tile_size(int value_dim) {
 bool use_chunk_replay_backward() {
   const char* env = std::getenv("CVERL_LINEAR_ATTN_CHUNK_REPLAY_BACKWARD");
   if (env == nullptr || *env == '\0') {
-    return false;
+    return true;
   }
   const std::string value(env);
-  return value == "1" || value == "true" || value == "on";
+  if (value == "1" || value == "true" || value == "on" || value == "yes") {
+    return true;
+  }
+  if (value == "0" || value == "false" || value == "off" || value == "no") {
+    return false;
+  }
+  throw std::invalid_argument("CVERL_LINEAR_ATTN_CHUNK_REPLAY_BACKWARD must be 0|1|false|true|off|on");
 }
 
 __global__ void qwen_linear_attn_forward_kernel(const float* __restrict__ q,
