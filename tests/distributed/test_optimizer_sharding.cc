@@ -1,4 +1,5 @@
 #include "cverl/distributed/optimizer_sharding.h"
+#include "cverl/torch/fp32_master_adamw.h"
 
 #include <iostream>
 #include <stdexcept>
@@ -128,6 +129,94 @@ void test_apply_full_flat_validation() {
   }, "original numel beyond flat rejected");
 }
 
+void test_flat_gradient_shards() {
+  auto p0 = torch::zeros({2, 3}, torch::TensorOptions().dtype(torch::kBFloat16));
+  auto p1 = torch::zeros({5}, torch::TensorOptions().dtype(torch::kBFloat16));
+  p0.set_requires_grad(true);
+  p1.set_requires_grad(true);
+  p0.mutable_grad() = torch::arange(1, 7, torch::TensorOptions().dtype(torch::kFloat32)).reshape({2, 3});
+  p1.mutable_grad() = torch::arange(11, 16, torch::TensorOptions().dtype(torch::kFloat32));
+  std::vector<torch::Tensor> params{p0, p1};
+
+  auto rank0 = cverl::distributed::flatten_gradient_shard(params, 2, 0);
+  auto rank1 = cverl::distributed::flatten_gradient_shard(params, 2, 1);
+  auto gathered = torch::cat({rank0.shard, rank1.shard}, 0).contiguous();
+  auto expected = torch::cat({p0.grad().to(torch::kFloat32).view({-1}),
+                              p1.grad().to(torch::kFloat32).view({-1}),
+                              torch::zeros({1}, torch::kFloat32)}, 0).contiguous();
+  require_allclose(gathered, expected, "flat gradient shards should match parameter layout");
+
+  auto no_grad = torch::zeros({3}, torch::TensorOptions().dtype(torch::kFloat32));
+  no_grad.set_requires_grad(true);
+  require_throws([&]() {
+    (void)cverl::distributed::flatten_gradient_shard({no_grad}, 1, 0);
+  }, "missing gradient rejected");
+  auto optional = cverl::distributed::flatten_gradient_shard({no_grad}, 1, 0, false);
+  require_allclose(optional.shard, torch::zeros({3}, torch::kFloat32), "optional missing gradient zeros");
+}
+
+void test_flat_sharded_adamw_matches_dense() {
+  cverl::torch_backend::Fp32MasterAdamWOptions opts;
+  opts.lr = 2.0e-4;
+  opts.beta1 = 0.9;
+  opts.beta2 = 0.95;
+  opts.eps = 1.0e-8;
+  opts.weight_decay = 0.01;
+  opts.use_master_weights = true;
+
+  auto dense_p0 = torch::linspace(-1.0, 1.0, 7, torch::TensorOptions().dtype(torch::kBFloat16));
+  auto dense_p1 = torch::linspace(2.0, 3.0, 4, torch::TensorOptions().dtype(torch::kBFloat16));
+  dense_p0.set_requires_grad(true);
+  dense_p1.set_requires_grad(true);
+  auto sharded_p0 = dense_p0.detach().clone();
+  auto sharded_p1 = dense_p1.detach().clone();
+  sharded_p0.set_requires_grad(true);
+  sharded_p1.set_requires_grad(true);
+
+  auto grad0 = torch::linspace(0.01, 0.07, 7, torch::TensorOptions().dtype(torch::kFloat32));
+  auto grad1 = torch::linspace(-0.04, -0.01, 4, torch::TensorOptions().dtype(torch::kFloat32));
+  dense_p0.mutable_grad() = grad0.to(dense_p0.scalar_type());
+  dense_p1.mutable_grad() = grad1.to(dense_p1.scalar_type());
+  sharded_p0.mutable_grad() = grad0.to(sharded_p0.scalar_type());
+  sharded_p1.mutable_grad() = grad1.to(sharded_p1.scalar_type());
+
+  std::vector<torch::Tensor> dense_params{dense_p0, dense_p1};
+  std::vector<torch::Tensor> sharded_params{sharded_p0, sharded_p1};
+  cverl::torch_backend::Fp32MasterAdamW dense_optimizer(dense_params, opts);
+  dense_optimizer.accumulate_model_grads();
+  dense_optimizer.step();
+
+  auto param_rank0 = cverl::distributed::flatten_parameter_shard(sharded_params, 2, 0);
+  auto param_rank1 = cverl::distributed::flatten_parameter_shard(sharded_params, 2, 1);
+  auto grad_rank0 = cverl::distributed::flatten_gradient_shard(sharded_params, 2, 0);
+  auto grad_rank1 = cverl::distributed::flatten_gradient_shard(sharded_params, 2, 1);
+  require(param_rank0.original_numel == grad_rank0.original_numel, "rank0 original numel metadata");
+  require(param_rank0.padded_numel == grad_rank0.padded_numel, "rank0 padded numel metadata");
+  require(param_rank1.original_numel == grad_rank1.original_numel, "rank1 original numel metadata");
+  require(param_rank1.padded_numel == grad_rank1.padded_numel, "rank1 padded numel metadata");
+
+  cverl::torch_backend::FlatAdamW flat_rank0(param_rank0.shard, opts);
+  cverl::torch_backend::FlatAdamW flat_rank1(param_rank1.shard, opts);
+  flat_rank0.step(grad_rank0.shard);
+  flat_rank1.step(grad_rank1.shard);
+  auto gathered =
+      torch::cat({flat_rank0.parameter_shard(), flat_rank1.parameter_shard()}, 0).contiguous();
+  cverl::distributed::apply_full_flat_parameters(gathered, param_rank0.original_numel, sharded_params);
+
+  require_allclose(sharded_p0.to(torch::kFloat32), dense_p0.to(torch::kFloat32),
+                   "flat sharded AdamW p0 matches dense model", 1.0e-5, 2.0e-5);
+  require_allclose(sharded_p1.to(torch::kFloat32), dense_p1.to(torch::kFloat32),
+                   "flat sharded AdamW p1 matches dense model", 1.0e-5, 2.0e-5);
+
+  auto flat_dense_master = torch::cat({dense_optimizer.master_parameters()[0].view({-1}),
+                                       dense_optimizer.master_parameters()[1].view({-1})}, 0);
+  require_allclose(gathered.narrow(0, 0, param_rank0.original_numel),
+                   flat_dense_master,
+                   "flat sharded AdamW fp32 master matches dense master",
+                   1.0e-5,
+                   2.0e-5);
+}
+
 }  // namespace
 
 int main() {
@@ -138,6 +227,8 @@ int main() {
     test_flat_parameter_shards_roundtrip();
     test_flat_parameter_shard_update_slice();
     test_apply_full_flat_validation();
+    test_flat_gradient_shards();
+    test_flat_sharded_adamw_matches_dense();
     std::cout << "optimizer sharding tests passed\n";
     return 0;
   } catch (const std::exception& e) {

@@ -33,6 +33,11 @@ FlatParameterShard flatten_parameter_shard(const std::vector<torch::Tensor>& par
                                            int64_t data_parallel,
                                            int64_t data_rank);
 
+FlatParameterShard flatten_gradient_shard(const std::vector<torch::Tensor>& parameters,
+                                          int64_t data_parallel,
+                                          int64_t data_rank,
+                                          bool require_grad = true);
+
 void apply_flat_parameter_shard(const FlatParameterShard& shard,
                                 const std::vector<torch::Tensor>& parameters);
 
