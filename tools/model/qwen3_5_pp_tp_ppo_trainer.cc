@@ -1449,6 +1449,7 @@ int main(int argc, char** argv) {
     }
     const int64_t dp_grad_bucket_bytes = dp_grad_bucket_mb * 1024 * 1024;
     const int64_t tp_grad_bucket_bytes = tp_grad_bucket_mb * 1024 * 1024;
+    const int64_t dp_bucket_numel = std::max<int64_t>(1, dp_grad_bucket_bytes / 4);
 
     const int64_t seq_len = prompt_len + response_len;
     const auto device = torch::Device(torch::kCUDA, static_cast<int>(device_idx));
@@ -1505,6 +1506,7 @@ int main(int argc, char** argv) {
     const int64_t model_parallel_rank = info.pipeline_rank * tp_size + info.tensor_rank;
     cverl::distributed::NcclCollectives model_comm(
         model_parallel_rank, model_parallel_size, static_cast<int>(device_idx), model_id, nccl_sync_after_collective);
+    const auto model_parallel_ranks = full_group(model_parallel_size);
     cverl::distributed::ParallelGroup tp_group{info.tensor_rank, tp_size, full_group(tp_size), &tp_comm};
     cverl::distributed::ParallelGroup dp_group{info.data_rank, dp_size, full_group(dp_size), &dp_comm};
     std::unique_ptr<cverl::distributed::NcclCollectives> rollout_data_comm;
@@ -1577,7 +1579,6 @@ int main(int argc, char** argv) {
     int64_t start_step = 0;
     if (!resume_checkpoint.empty()) {
       if (dp_flat_shard_optimizer) {
-        const int64_t dp_bucket_numel = std::max<int64_t>(1, dp_grad_bucket_bytes / 4);
         start_step = load_rank_flat_checkpoint(resume_checkpoint,
                                                global_rank,
                                                info.data_rank,
@@ -1765,7 +1766,6 @@ int main(int argc, char** argv) {
       double grad_clip_scale = 1.0;
       double local_grad_norm = 0.0;
       if (dp_flat_shard_optimizer && !skip_optimizer_step) {
-        const int64_t dp_bucket_numel = std::max<int64_t>(1, dp_grad_bucket_bytes / 4);
         auto flat_step = cverl::distributed::flat_sharded_adamw_step(params,
                                                                      flat_param_shard,
                                                                      *flat_optimizer,
@@ -1811,7 +1811,7 @@ int main(int argc, char** argv) {
             dp_flat_shard_optimizer
                 ? full_comm.all_reduce(grad_sq_tensor.contiguous(), cverl::distributed::ReduceOp::Sum, full_ranks)
                 : model_comm.all_reduce(
-                      grad_sq_tensor.contiguous(), cverl::distributed::ReduceOp::Sum, full_group(model_parallel_size));
+                      grad_sq_tensor.contiguous(), cverl::distributed::ReduceOp::Sum, model_parallel_ranks);
         auto grad_metrics =
             torch::cat({grad_sq_tensor.contiguous(), global_grad_sq_tensor.contiguous(), local_norm_tensor.contiguous()},
                        0)

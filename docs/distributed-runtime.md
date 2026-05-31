@@ -83,6 +83,8 @@ Qwen TP replicated parameters are classified once at trainer startup; the
 per-step gradient sync should only walk the precomputed tensor list.
 Pipeline activation slot vectors are allocated once before the step loop and
 cleared in place each step to avoid allocator churn in long PPO/GRPO runs.
+Static topology helpers such as model-parallel rank lists and DP bucket numel
+are computed before the loop; do not rebuild them every step.
 
 ## Current TP/DP Implementation
 
