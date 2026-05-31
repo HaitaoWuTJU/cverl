@@ -11,6 +11,7 @@ namespace {
 class CountingCollectives final : public cverl::distributed::Collectives {
  public:
   int64_t all_reduce_calls = 0;
+  int64_t reduce_scatter_calls = 0;
 
   int64_t rank() const override { return 0; }
   int64_t world_size() const override { return 1; }
@@ -46,6 +47,7 @@ class CountingCollectives final : public cverl::distributed::Collectives {
                                const std::vector<int64_t>& group,
                                int64_t /*dim*/) override {
     require_group(group);
+    ++reduce_scatter_calls;
     return input.clone();
   }
 
@@ -219,6 +221,40 @@ void test_dp_sync_bucketed() {
   }
 }
 
+void test_dp_reduce_scatter_bucketed_single_process() {
+  CountingCollectives collectives;
+  auto p0 = torch::randn({2, 3}, torch::requires_grad());
+  auto p1 = torch::randn({4}, torch::requires_grad());
+  auto p2 = torch::randn({5}, torch::requires_grad());
+  auto loss = (p0 * 2).sum() + (p1 * -3).sum() + (p2 * p2).sum();
+  loss.backward();
+  auto g0 = p0.grad().clone().view({-1});
+  auto g1 = p1.grad().clone().view({-1});
+  auto g2 = p2.grad().clone().view({-1});
+
+  auto buckets = cverl::distributed::data_parallel_reduce_scatter_gradients(
+      {p0, p1, p2}, collectives, {0}, true, 1024 * 1024);
+  if (collectives.reduce_scatter_calls != 1 || buckets.size() != 1) {
+    throw std::runtime_error("reduce-scatter gradients should use one bucket for same dtype/device");
+  }
+  require_allclose(buckets[0].shard, torch::cat({g0, g1, g2}, 0), "reduce-scatter flat shard");
+  if (buckets[0].original_numel != g0.numel() + g1.numel() + g2.numel() ||
+      buckets[0].padded_numel != buckets[0].original_numel) {
+    throw std::runtime_error("reduce-scatter bucket numel metadata mismatch");
+  }
+  if (buckets[0].parameter_indices != std::vector<int64_t>{0, 1, 2} ||
+      buckets[0].parameter_numels != std::vector<int64_t>{g0.numel(), g1.numel(), g2.numel()}) {
+    throw std::runtime_error("reduce-scatter bucket parameter metadata mismatch");
+  }
+
+  collectives.reduce_scatter_calls = 0;
+  buckets = cverl::distributed::data_parallel_reduce_scatter_gradients(
+      {p0, p1, p2}, collectives, {0}, true, 16);
+  if (collectives.reduce_scatter_calls <= 1 || buckets.size() <= 1) {
+    throw std::runtime_error("small reduce-scatter bucket should split calls");
+  }
+}
+
 void test_single_process_collectives_validation() {
   cverl::distributed::SingleProcessCollectives collectives;
   auto x = torch::ones({2, 2});
@@ -239,6 +275,7 @@ int main() {
     test_parallel_group_validation();
     test_dp_sync_single_process();
     test_dp_sync_bucketed();
+    test_dp_reduce_scatter_bucketed_single_process();
     test_single_process_collectives_validation();
   } catch (const std::exception& e) {
     std::cerr << "test_parallel_ops failed: " << e.what() << "\n";

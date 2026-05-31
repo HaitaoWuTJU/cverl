@@ -27,6 +27,7 @@ int64_t tensor_bytes(const torch::Tensor& tensor) {
 
 struct GradBucketEntry {
   torch::Tensor grad;
+  int64_t parameter_index = -1;
   int64_t numel = 0;
 };
 
@@ -51,6 +52,46 @@ void flush_grad_bucket(std::vector<GradBucketEntry>* bucket,
     entry.grad.copy_(shard);
     offset += entry.numel;
   }
+  bucket->clear();
+}
+
+void flush_grad_reduce_scatter_bucket(std::vector<GradBucketEntry>* bucket,
+                                      Collectives& collectives,
+                                      const std::vector<int64_t>& data_group,
+                                      bool average,
+                                      std::vector<GradientReduceScatterBucket>* out) {
+  if (bucket->empty()) {
+    return;
+  }
+  if (data_group.empty()) {
+    throw std::invalid_argument("data_parallel_reduce_scatter_gradients requires non-empty data group");
+  }
+
+  std::vector<torch::Tensor> flat_grads;
+  flat_grads.reserve(bucket->size());
+  int64_t original_numel = 0;
+  GradientReduceScatterBucket meta;
+  meta.parameter_indices.reserve(bucket->size());
+  meta.parameter_numels.reserve(bucket->size());
+  for (const auto& entry : *bucket) {
+    flat_grads.push_back(entry.grad.contiguous().view({entry.numel}));
+    original_numel += entry.numel;
+    meta.parameter_indices.push_back(entry.parameter_index);
+    meta.parameter_numels.push_back(entry.numel);
+  }
+  auto flat = torch::cat(flat_grads, 0).contiguous();
+  const int64_t group_size = static_cast<int64_t>(data_group.size());
+  const int64_t remainder = flat.numel() % group_size;
+  const int64_t pad = remainder == 0 ? 0 : group_size - remainder;
+  if (pad > 0) {
+    flat = torch::cat({flat, torch::zeros({pad}, flat.options())}, 0).contiguous();
+  }
+  auto shard = collectives.reduce_scatter(
+      flat, average ? ReduceOp::Mean : ReduceOp::Sum, data_group, 0).contiguous();
+  meta.shard = shard;
+  meta.original_numel = original_numel;
+  meta.padded_numel = flat.numel();
+  out->push_back(std::move(meta));
   bucket->clear();
 }
 
@@ -154,10 +195,55 @@ void data_parallel_sync_gradients(const std::vector<torch::Tensor>& parameters,
       current_device = grad.device();
       have_bucket = true;
     }
-    bucket.push_back(GradBucketEntry{grad, grad.numel()});
+    bucket.push_back(GradBucketEntry{grad, -1, grad.numel()});
     current_bytes += grad_bytes;
   }
   flush_grad_bucket(&bucket, collectives, data_group, average);
+}
+
+std::vector<GradientReduceScatterBucket> data_parallel_reduce_scatter_gradients(
+    const std::vector<torch::Tensor>& parameters,
+    Collectives& collectives,
+    const std::vector<int64_t>& data_group,
+    bool average,
+    int64_t bucket_bytes) {
+  if (bucket_bytes <= 0) {
+    throw std::invalid_argument("data_parallel_reduce_scatter_gradients bucket_bytes must be positive");
+  }
+  std::vector<GradientReduceScatterBucket> out;
+  std::vector<GradBucketEntry> bucket;
+  bucket.reserve(parameters.size());
+  int64_t current_bytes = 0;
+  torch::ScalarType current_dtype = torch::kFloat32;
+  torch::Device current_device(torch::kCPU);
+  bool have_bucket = false;
+
+  for (size_t i = 0; i < parameters.size(); ++i) {
+    const auto& param = parameters[i];
+    if (!param.defined() || !param.requires_grad() || !param.grad().defined()) {
+      continue;
+    }
+    auto grad = param.grad();
+    const int64_t grad_bytes = tensor_bytes(grad);
+    const bool incompatible =
+        have_bucket && (grad.scalar_type() != current_dtype || grad.device() != current_device);
+    const bool would_overflow = have_bucket && current_bytes + grad_bytes > bucket_bytes;
+    if (incompatible || would_overflow) {
+      flush_grad_reduce_scatter_bucket(&bucket, collectives, data_group, average, &out);
+      current_bytes = 0;
+      have_bucket = false;
+    }
+
+    if (!have_bucket) {
+      current_dtype = grad.scalar_type();
+      current_device = grad.device();
+      have_bucket = true;
+    }
+    bucket.push_back(GradBucketEntry{grad, static_cast<int64_t>(i), grad.numel()});
+    current_bytes += grad_bytes;
+  }
+  flush_grad_reduce_scatter_bucket(&bucket, collectives, data_group, average, &out);
+  return out;
 }
 
 }  // namespace cverl::distributed
