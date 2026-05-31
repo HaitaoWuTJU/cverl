@@ -1742,7 +1742,8 @@ int main(int argc, char** argv) {
                                                                      max_grad_norm,
                                                                      true,
                                                                      false,
-                                                                     true);
+                                                                     true,
+                                                                     std::max<int64_t>(1, dp_grad_bucket_bytes / 4));
         flat_gradient_shard = flat_step.gradient_shard.shard;
         local_grad_norm_sq = flat_step.local_grad_norm_sq;
         global_grad_norm = flat_step.global_grad_norm;

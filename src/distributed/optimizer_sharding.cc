@@ -76,6 +76,52 @@ FlatParameterShard flatten_tensor_list_shard(const std::vector<torch::Tensor>& t
   return out;
 }
 
+FlatParameterShard make_flat_shard_metadata(const std::vector<int64_t>& tensor_numels,
+                                            int64_t data_parallel,
+                                            int64_t data_rank,
+                                            torch::Tensor shard,
+                                            const char* name) {
+  validate_dp_rank(data_parallel, data_rank);
+  int64_t original_numel = 0;
+  for (int64_t numel : tensor_numels) {
+    if (numel < 0) {
+      throw std::invalid_argument(std::string(name) + " requires non-negative tensor numel");
+    }
+    original_numel += numel;
+  }
+  const int64_t remainder = original_numel % data_parallel;
+  const int64_t pad = remainder == 0 ? 0 : data_parallel - remainder;
+  const int64_t padded_numel = original_numel + pad;
+  const int64_t shard_size = padded_numel / data_parallel;
+  if (!shard.defined() || shard.dim() != 1 || !shard.is_contiguous() || shard.numel() != shard_size) {
+    throw std::invalid_argument(std::string(name) + " requires a contiguous 1D shard with matching size");
+  }
+
+  FlatParameterShard out;
+  out.shard = std::move(shard);
+  out.original_numel = original_numel;
+  out.padded_numel = padded_numel;
+  out.shard_begin = data_rank * shard_size;
+  out.shard_end = out.shard_begin + shard_size;
+
+  int64_t tensor_begin = 0;
+  for (size_t i = 0; i < tensor_numels.size(); ++i) {
+    const int64_t tensor_end = tensor_begin + tensor_numels[i];
+    const int64_t overlap_begin = std::max(tensor_begin, out.shard_begin);
+    const int64_t overlap_end = std::min(tensor_end, out.shard_end);
+    if (overlap_begin < overlap_end) {
+      out.ranges.push_back(FlatParameterShardRange{
+          static_cast<int64_t>(i),
+          overlap_begin - tensor_begin,
+          overlap_begin - out.shard_begin,
+          overlap_end - overlap_begin,
+      });
+    }
+    tensor_begin = tensor_end;
+  }
+  return out;
+}
+
 int64_t rank_index_in_group(int64_t rank, const std::vector<int64_t>& group, const char* name) {
   if (group.empty()) {
     throw std::invalid_argument(std::string(name) + " requires a non-empty data group");
@@ -111,6 +157,71 @@ std::vector<torch::Tensor> gradient_tensor_list(const std::vector<torch::Tensor>
     gradients.push_back(grad.to(parameter.device(), torch::kFloat32).contiguous().view(parameter.sizes()));
   }
   return gradients;
+}
+
+torch::Tensor flat_tensor_range(const std::vector<torch::Tensor>& tensors,
+                                int64_t original_numel,
+                                int64_t begin,
+                                int64_t numel,
+                                const torch::TensorOptions& options) {
+  if (begin < 0 || numel < 0 || begin + numel > original_numel) {
+    throw std::invalid_argument("flat_tensor_range out of bounds");
+  }
+  std::vector<torch::Tensor> parts;
+  parts.reserve(tensors.size() + 1);
+  int64_t tensor_begin = 0;
+  int64_t remaining_begin = begin;
+  int64_t remaining_end = begin + numel;
+  for (const auto& tensor : tensors) {
+    const int64_t tensor_end = tensor_begin + tensor.numel();
+    const int64_t overlap_begin = std::max(tensor_begin, remaining_begin);
+    const int64_t overlap_end = std::min(tensor_end, remaining_end);
+    if (overlap_begin < overlap_end) {
+      parts.push_back(tensor.view({tensor.numel()})
+                          .narrow(0, overlap_begin - tensor_begin, overlap_end - overlap_begin)
+                          .to(options.device(), options.dtype())
+                          .contiguous());
+    }
+    tensor_begin = tensor_end;
+    if (tensor_begin >= remaining_end) {
+      break;
+    }
+  }
+  if (parts.empty()) {
+    return torch::empty({0}, options);
+  }
+  if (parts.size() == 1) {
+    return parts[0].contiguous();
+  }
+  return torch::cat(parts, 0).contiguous();
+}
+
+torch::Tensor flat_tensor_range_padded(const std::vector<torch::Tensor>& tensors,
+                                       int64_t original_numel,
+                                       int64_t padded_numel,
+                                       int64_t begin,
+                                       int64_t numel,
+                                       const torch::TensorOptions& options) {
+  if (begin < 0 || numel < 0 || begin + numel > padded_numel) {
+    throw std::invalid_argument("flat_tensor_range_padded out of bounds");
+  }
+  const int64_t valid_len = begin < original_numel ? std::min(numel, original_numel - begin) : 0;
+  torch::Tensor valid = valid_len > 0
+                            ? flat_tensor_range(tensors, original_numel, begin, valid_len, options)
+                            : torch::empty({0}, options);
+  const int64_t suffix_pad = numel - valid_len;
+  std::vector<torch::Tensor> parts;
+  parts.reserve(2);
+  if (valid.numel() > 0) {
+    parts.push_back(valid);
+  }
+  if (suffix_pad > 0) {
+    parts.push_back(torch::zeros({suffix_pad}, options));
+  }
+  if (parts.empty()) {
+    return torch::zeros({numel}, options);
+  }
+  return parts.size() == 1 ? parts[0].contiguous() : torch::cat(parts, 0).contiguous();
 }
 
 }  // namespace
@@ -200,6 +311,60 @@ FlatParameterShard reduce_scatter_flat_gradient_shard(const std::vector<torch::T
   return metadata;
 }
 
+FlatParameterShard reduce_scatter_flat_gradient_shard_bucketed(
+    const std::vector<torch::Tensor>& parameters,
+    Collectives& collectives,
+    const std::vector<int64_t>& data_group,
+    bool average,
+    int64_t bucket_numel,
+    bool require_grad) {
+  if (bucket_numel <= 0) {
+    throw std::invalid_argument("reduce_scatter_flat_gradient_shard_bucketed bucket_numel must be positive");
+  }
+  const int64_t data_rank =
+      rank_index_in_group(collectives.rank(), data_group, "reduce_scatter_flat_gradient_shard_bucketed");
+  const int64_t data_parallel = static_cast<int64_t>(data_group.size());
+  auto gradients = gradient_tensor_list(parameters, require_grad, "reduce_scatter_flat_gradient_shard_bucketed");
+  std::vector<int64_t> tensor_numels;
+  tensor_numels.reserve(gradients.size());
+  int64_t original_numel = 0;
+  torch::Device device(torch::kCPU);
+  bool have_tensor = false;
+  for (const auto& grad : gradients) {
+    tensor_numels.push_back(grad.numel());
+    original_numel += grad.numel();
+    if (!have_tensor) {
+      device = grad.device();
+      have_tensor = true;
+    }
+  }
+  auto options = torch::TensorOptions().device(device).dtype(torch::kFloat32);
+  const int64_t remainder = original_numel % data_parallel;
+  const int64_t padded_numel = original_numel + (remainder == 0 ? 0 : data_parallel - remainder);
+  const int64_t shard_size = padded_numel / data_parallel;
+  const int64_t shard_bucket_numel = std::max<int64_t>(1, bucket_numel / data_parallel);
+  std::vector<torch::Tensor> shard_chunks;
+  shard_chunks.reserve(static_cast<size_t>((shard_size + shard_bucket_numel - 1) / shard_bucket_numel));
+
+  for (int64_t shard_offset = 0; shard_offset < shard_size; shard_offset += shard_bucket_numel) {
+    const int64_t chunk = std::min(shard_bucket_numel, shard_size - shard_offset);
+    std::vector<torch::Tensor> input_segments;
+    input_segments.reserve(static_cast<size_t>(data_parallel));
+    for (int64_t rank = 0; rank < data_parallel; ++rank) {
+      const int64_t global_begin = rank * shard_size + shard_offset;
+      input_segments.push_back(flat_tensor_range_padded(
+          gradients, original_numel, padded_numel, global_begin, chunk, options));
+    }
+    auto input = torch::cat(input_segments, 0).contiguous();
+    shard_chunks.push_back(
+        collectives.reduce_scatter(input, average ? ReduceOp::Mean : ReduceOp::Sum, data_group, 0).contiguous());
+  }
+  auto shard = shard_chunks.empty() ? torch::zeros({shard_size}, options)
+                                    : torch::cat(shard_chunks, 0).contiguous();
+  return make_flat_shard_metadata(
+      tensor_numels, data_parallel, data_rank, shard, "reduce_scatter_flat_gradient_shard_bucketed");
+}
+
 torch::Tensor all_gather_flat_parameter_shards(const FlatParameterShard& local_shard,
                                                Collectives& collectives,
                                                const std::vector<int64_t>& data_group) {
@@ -244,12 +409,20 @@ FlatAdamWStepResult flat_sharded_adamw_step(const std::vector<torch::Tensor>& pa
                                             double max_grad_norm,
                                             bool average_gradients,
                                             bool require_grad,
-                                            bool apply_parameters) {
+                                            bool apply_parameters,
+                                            int64_t reduce_scatter_bucket_numel) {
   if (max_grad_norm < 0.0) {
     throw std::invalid_argument("flat_sharded_adamw_step max_grad_norm must be non-negative");
   }
-  auto grad_shard = reduce_scatter_flat_gradient_shard(
-      parameters, data_collectives, data_group, average_gradients, require_grad);
+  auto grad_shard = reduce_scatter_bucket_numel > 0
+                        ? reduce_scatter_flat_gradient_shard_bucketed(parameters,
+                                                                      data_collectives,
+                                                                      data_group,
+                                                                      average_gradients,
+                                                                      reduce_scatter_bucket_numel,
+                                                                      require_grad)
+                        : reduce_scatter_flat_gradient_shard(
+                              parameters, data_collectives, data_group, average_gradients, require_grad);
   if (grad_shard.original_numel != parameter_shard.original_numel ||
       grad_shard.padded_numel != parameter_shard.padded_numel ||
       grad_shard.shard_begin != parameter_shard.shard_begin ||

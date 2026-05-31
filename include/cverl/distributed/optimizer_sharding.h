@@ -55,6 +55,14 @@ FlatParameterShard reduce_scatter_flat_gradient_shard(const std::vector<torch::T
                                                       bool average,
                                                       bool require_grad = true);
 
+FlatParameterShard reduce_scatter_flat_gradient_shard_bucketed(
+    const std::vector<torch::Tensor>& parameters,
+    Collectives& collectives,
+    const std::vector<int64_t>& data_group,
+    bool average,
+    int64_t bucket_numel,
+    bool require_grad = true);
+
 torch::Tensor all_gather_flat_parameter_shards(const FlatParameterShard& local_shard,
                                                Collectives& collectives,
                                                const std::vector<int64_t>& data_group);
@@ -74,7 +82,8 @@ FlatAdamWStepResult flat_sharded_adamw_step(const std::vector<torch::Tensor>& pa
                                             double max_grad_norm,
                                             bool average_gradients = true,
                                             bool require_grad = false,
-                                            bool apply_parameters = true);
+                                            bool apply_parameters = true,
+                                            int64_t reduce_scatter_bucket_numel = 0);
 
 void apply_flat_parameter_shard(const FlatParameterShard& shard,
                                 const std::vector<torch::Tensor>& parameters);

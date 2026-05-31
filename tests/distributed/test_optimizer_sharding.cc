@@ -284,6 +284,17 @@ void test_reduce_scatter_flat_gradient_shard() {
   require_allclose(shard0.shard, expected.narrow(0, 0, 6), "rank0 flat reduce-scatter shard");
   require_allclose(shard1.shard, expected.narrow(0, 6, 6), "rank1 flat reduce-scatter shard");
 
+  SliceCollectives bucket_rank0(0);
+  SliceCollectives bucket_rank1(1);
+  auto bucket0 = cverl::distributed::reduce_scatter_flat_gradient_shard_bucketed(
+      params, bucket_rank0, {0, 1}, false, 4);
+  auto bucket1 = cverl::distributed::reduce_scatter_flat_gradient_shard_bucketed(
+      params, bucket_rank1, {0, 1}, false, 4);
+  require(bucket_rank0.reduce_scatter_calls == 3 && bucket_rank1.reduce_scatter_calls == 3,
+          "bucketed flat reduce-scatter should split by bucket");
+  require_allclose(bucket0.shard, expected.narrow(0, 0, 6), "rank0 bucketed flat reduce-scatter shard");
+  require_allclose(bucket1.shard, expected.narrow(0, 6, 6), "rank1 bucketed flat reduce-scatter shard");
+
   SliceCollectives bad_rank(1);
   require_throws([&]() {
     (void)cverl::distributed::reduce_scatter_flat_gradient_shard(params, bad_rank, {0}, true);
@@ -335,15 +346,15 @@ void test_flat_sharded_adamw_matches_dense() {
   SliceCollectives comm0(0);
   SliceCollectives comm1(1);
   auto step0 = cverl::distributed::flat_sharded_adamw_step(
-      sharded_params, param_rank0, flat_rank0, comm0, {0, 1}, comm0, {0, 1}, 0.0, false, true, false);
+      sharded_params, param_rank0, flat_rank0, comm0, {0, 1}, comm0, {0, 1}, 0.0, false, true, false, 4);
   auto step1 = cverl::distributed::flat_sharded_adamw_step(
-      sharded_params, param_rank1, flat_rank1, comm1, {0, 1}, comm1, {0, 1}, 0.0, false, true, false);
+      sharded_params, param_rank1, flat_rank1, comm1, {0, 1}, comm1, {0, 1}, 0.0, false, true, false, 4);
   require(step0.gradient_shard.shard.numel() == param_rank0.shard.numel(), "rank0 flat step grad shard");
   require(step1.gradient_shard.shard.numel() == param_rank1.shard.numel(), "rank1 flat step grad shard");
   require(step0.grad_clip_scale == 1.0 && step1.grad_clip_scale == 1.0, "flat step unclipped");
   require(step0.local_grad_norm > 0.0 && step1.local_grad_norm > 0.0, "flat step grad norms");
-  require(comm0.reduce_scatter_calls == 1 && comm1.reduce_scatter_calls == 1,
-          "flat sharded AdamW step should reduce-scatter once per rank");
+  require(comm0.reduce_scatter_calls == 3 && comm1.reduce_scatter_calls == 3,
+          "flat sharded AdamW bucketed step should reduce-scatter once per bucket per rank");
   auto gathered =
       torch::cat({flat_rank0.parameter_shard(), flat_rank1.parameter_shard()}, 0).contiguous();
   cverl::distributed::apply_full_flat_parameters(gathered, param_rank0.original_numel, sharded_params);
