@@ -62,14 +62,20 @@ class PrecomputedAllGatherCollectives final : public cverl::distributed::Collect
 
   PrecomputedAllGatherCollectives(std::vector<std::vector<torch::Tensor>> responses,
                                   std::vector<torch::Tensor> send_recv_responses,
-                                  int64_t world_size = 2)
-      : responses_(std::move(responses)), send_recv_responses_(std::move(send_recv_responses)), world_size_(world_size) {
+                                  int64_t world_size = 2,
+                                  int64_t rank = 0,
+                                  bool reduce_scatter_throws = false)
+      : responses_(std::move(responses)),
+        send_recv_responses_(std::move(send_recv_responses)),
+        world_size_(world_size),
+        rank_(rank),
+        reduce_scatter_throws_(reduce_scatter_throws) {
     if (!responses_.empty()) {
       world_size_ = static_cast<int64_t>(responses_.front().size());
     }
   }
 
-  int64_t rank() const override { return 0; }
+  int64_t rank() const override { return rank_; }
   int64_t world_size() const override {
     return world_size_;
   }
@@ -99,13 +105,20 @@ class PrecomputedAllGatherCollectives final : public cverl::distributed::Collect
                                cverl::distributed::ReduceOp /*op*/,
                                const std::vector<int64_t>& /*group*/,
                                int64_t dim) override {
+    ++reduce_scatter_calls;
+    if (reduce_scatter_throws_) {
+      throw std::invalid_argument("forced reduce_scatter fallback");
+    }
+    if (reduce_scatter_response.defined()) {
+      return reduce_scatter_response;
+    }
     if (dim != 0 || responses_.empty()) {
       if (dim != 0 || world_size_ <= 1) {
         return input;
       }
-      return input.narrow(0, 0, input.size(0) / world_size_).contiguous();
+      return input.narrow(0, rank_ * (input.size(0) / world_size_), input.size(0) / world_size_).contiguous();
     }
-    return input.narrow(0, 0, input.size(0) / world_size_).contiguous();
+    return input.narrow(0, rank_ * (input.size(0) / world_size_), input.size(0) / world_size_).contiguous();
   }
 
   void send(const torch::Tensor& /*input*/, int64_t /*peer*/) override {}
@@ -128,6 +141,12 @@ class PrecomputedAllGatherCollectives final : public cverl::distributed::Collect
   int64_t world_size_ = 0;
   size_t call_count_ = 0;
   size_t send_recv_call_count_ = 0;
+  int64_t rank_ = 0;
+  bool reduce_scatter_throws_ = false;
+
+ public:
+  int64_t reduce_scatter_calls = 0;
+  torch::Tensor reduce_scatter_response;
 };
 
 cverl::distributed::ClusterSpec make_spec() {
@@ -619,7 +638,9 @@ void test_context_parallel_ring_exchange_owner_gradient_cp3() {
           zeros,
           zeros,
       },
-      3);
+      3,
+      1,
+      true);
 
   auto exchanged =
       cverl::distributed::context_parallel_ring_exchange_autograd(local, collectives, {0, 1, 2}, 1, 1);
@@ -636,6 +657,26 @@ void test_context_parallel_ring_exchange_owner_gradient_cp3() {
       grad_owner1 + remote_owner1_from_rank0.transpose(0, 1) + remote_owner1_from_rank2.transpose(0, 1);
   require(local.grad().defined() && torch::allclose(local.grad(), expected_local_grad, 1.0e-5, 1.0e-5),
           "CP3 ring exchange backward accumulates remote owner gradients");
+
+  auto local_rs = local.detach().clone().set_requires_grad(true);
+  PrecomputedAllGatherCollectives reduce_scatter_collectives(
+      {},
+      {
+          moved_owner0,
+          moved_owner2,
+      },
+      3,
+      1);
+  reduce_scatter_collectives.reduce_scatter_response = expected_local_grad.transpose(0, 1).contiguous();
+  auto exchanged_rs =
+      cverl::distributed::context_parallel_ring_exchange_autograd(local_rs, reduce_scatter_collectives, {0, 1, 2}, 1, 1);
+  require(torch::allclose(exchanged_rs, expected, 1.0e-5, 1.0e-5),
+          "CP3 ring exchange reduce-scatter forward order");
+  torch::autograd::backward({exchanged_rs}, {torch::cat({grad_owner1, grad_owner0, grad_owner2}, 1)});
+  require(reduce_scatter_collectives.reduce_scatter_calls == 1,
+          "CP3 ring exchange backward should prefer reduce-scatter");
+  require(local_rs.grad().defined() && torch::allclose(local_rs.grad(), expected_local_grad, 1.0e-5, 1.0e-5),
+          "CP3 ring exchange reduce-scatter backward returns owner gradient");
 }
 
 void test_dtype_names() {

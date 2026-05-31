@@ -226,8 +226,10 @@ Current code exposes the distributed shape directly:
   score/probability matrix. Qwen CP full attention consumes blocks in the
   same order as the CP ring schedule. The current ring-exchange path obtains
   those blocks through grouped `send_recv` and has an autograd wrapper that
-  sends owner-gradient blocks around the reverse ring so K/V owners receive
-  accumulated gradients without all-gather. Ring-exchanged KV attention now
+  reorders ring gradients into rank order and prefers `reduce_scatter` so K/V
+  owners receive accumulated gradients without all-gather; it falls back to
+  reverse-ring accumulation when the active collectives backend cannot
+  reduce-scatter the CP group. Ring-exchanged KV attention now
   uses a recompute-autograd path: forward saves Q/K/V inputs and block
   metadata, not per-block score/probability tensors; backward recomputes the
   streaming attention and returns gradients to the ring-exchange owner-gradient
@@ -235,8 +237,8 @@ Current code exposes the distributed shape directly:
   ring-ordered CP causal attention that compute causal softmax over ring KV
   blocks without materializing a `[Q,K]` matrix. The first CUDA backward is a
   correctness-oriented recompute kernel; full industrial CP training still
-  needs tile/shared-memory optimization and a lower-latency reduce-scatter ring
-  schedule to replace the current per-owner ring accumulation.
+  needs tile/shared-memory optimization and subgroup NCCL communicator support
+  so every CP group can use the reduce-scatter path directly.
 - `qwen3_5_pp_tp_ppo_trainer`: accepts DP/PP/CP/TP topology dimensions and
   records all four axes in metrics and checkpoint manifests. For `CP>1,TP=1`,
   PP stages now pass local sequence shards, Qwen range forward keeps
