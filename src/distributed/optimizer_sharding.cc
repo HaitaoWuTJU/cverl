@@ -43,11 +43,13 @@ FlatParameterShard flatten_tensor_list_shard(const std::vector<torch::Tensor>& t
   torch::Tensor flat;
   if (flat_tensors.empty()) {
     flat = torch::zeros({padded_numel}, torch::TensorOptions().device(device).dtype(torch::kFloat32));
+  } else if (flat_tensors.size() == 1) {
+    flat = flat_tensors[0].contiguous();
   } else {
     flat = torch::cat(flat_tensors, 0).contiguous();
-    if (pad > 0) {
-      flat = torch::cat({flat, torch::zeros({pad}, flat.options())}, 0).contiguous();
-    }
+  }
+  if (pad > 0 && !flat_tensors.empty()) {
+    flat = torch::cat({flat, torch::zeros({pad}, flat.options())}, 0).contiguous();
   }
 
   const int64_t shard_size = padded_numel / data_parallel;

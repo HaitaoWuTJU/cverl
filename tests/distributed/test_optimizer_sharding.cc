@@ -198,6 +198,30 @@ void test_flat_parameter_shards_roundtrip() {
   require_allclose(full2, p2, "full flat p2");
 }
 
+void test_single_tensor_flat_parameter_shards() {
+  auto p = torch::arange(1, 10, torch::TensorOptions().dtype(torch::kFloat32)).contiguous();
+  std::vector<torch::Tensor> params{p};
+
+  auto rank0 = cverl::distributed::flatten_parameter_shard(params, 2, 0);
+  auto rank1 = cverl::distributed::flatten_parameter_shard(params, 2, 1);
+  require(rank0.original_numel == 9 && rank0.padded_numel == 10, "single tensor rank0 metadata");
+  require(rank1.original_numel == 9 && rank1.padded_numel == 10, "single tensor rank1 metadata");
+  require(rank0.ranges.size() == 1 && rank0.ranges[0].parameter_index == 0,
+          "single tensor rank0 range metadata");
+  require(rank1.ranges.size() == 1 && rank1.ranges[0].parameter_index == 0,
+          "single tensor rank1 range metadata");
+  require_allclose(rank0.shard, p.narrow(0, 0, 5), "single tensor rank0 shard");
+  require_allclose(rank1.shard,
+                   torch::cat({p.narrow(0, 5, 4), torch::zeros({1}, torch::kFloat32)}, 0),
+                   "single tensor rank1 padded shard");
+
+  auto target = torch::zeros_like(p);
+  std::vector<torch::Tensor> target_params{target};
+  cverl::distributed::apply_flat_parameter_shard(rank0, target_params);
+  cverl::distributed::apply_flat_parameter_shard(rank1, target_params);
+  require_allclose(target, p, "single tensor shard roundtrip");
+}
+
 void test_flat_parameter_shard_update_slice() {
   auto p0 = torch::zeros({3}, torch::TensorOptions().dtype(torch::kFloat32));
   auto p1 = torch::zeros({3}, torch::TensorOptions().dtype(torch::kFloat32));
@@ -478,6 +502,7 @@ int main() {
     test_owned_indices();
     test_validation();
     test_flat_parameter_shards_roundtrip();
+    test_single_tensor_flat_parameter_shards();
     test_flat_parameter_shard_update_slice();
     test_all_gather_apply_flat_parameter_shard();
     test_apply_full_flat_validation();
