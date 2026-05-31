@@ -272,7 +272,8 @@ CPU regression coverage includes:
   streaming and recompute ring-attention math, CP=3 ring exchange
   owner-gradient accumulation, and gather/ring-exchange KV gradient checks.
 - `test_qwen3_5_cp_forward`: synthetic Qwen3.5 full-attention layer with
-  deterministic weights, validating that CP rank-local forward shards match
-  the corresponding dense forward slices.
+  deterministic weights, plus a synthetic Qwen3.5 linear-attention layer that
+  exercises projected QKV/Z/B/A CP exchange. Both validate that CP rank-local
+  forward shards match the corresponding dense forward slices.
 - `test_cp_attention_cuda` when `CVERL_ENABLE_CUDA=ON`: fused CUDA CP
   ring-attention forward/backward against the dense reference.

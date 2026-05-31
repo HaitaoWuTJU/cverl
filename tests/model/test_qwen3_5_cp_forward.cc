@@ -131,9 +131,9 @@ std::pair<torch::Tensor, torch::Tensor> remote_full_attention_kv(
           repeat_kv(v, cfg.num_attention_heads / cfg.num_key_value_heads).contiguous()};
 }
 
-std::filesystem::path make_model_dir() {
+std::filesystem::path make_model_dir(const std::string& layer_type) {
   auto dir = std::filesystem::temp_directory_path() /
-             ("cverl_qwen_cp_forward_" + std::to_string(::getpid()));
+             ("cverl_qwen_cp_forward_" + layer_type + "_" + std::to_string(::getpid()));
   std::filesystem::create_directories(dir);
   std::ofstream config(dir / "config.json");
   config << R"({
@@ -155,7 +155,7 @@ std::filesystem::path make_model_dir() {
     "rms_norm_eps": 1e-6,
     "rope_theta": 10000.0,
     "partial_rotary_factor": 1.0,
-    "layer_types": ["full_attention"]
+    "layer_types": [")" << layer_type << R"("]
   })";
   return dir;
 }
@@ -175,6 +175,18 @@ std::unordered_map<std::string, torch::Tensor> make_weights(const cverl::Qwen35T
   w[p + "self_attn.o_proj.weight"] = small({cfg.hidden_size, cfg.num_attention_heads * cfg.head_dim});
   w[p + "self_attn.q_norm.weight"] = torch::zeros({cfg.head_dim}, torch::kFloat32);
   w[p + "self_attn.k_norm.weight"] = torch::zeros({cfg.head_dim}, torch::kFloat32);
+  const int64_t linear_key_dim = cfg.linear_num_key_heads * cfg.linear_key_head_dim;
+  const int64_t linear_value_dim = cfg.linear_num_value_heads * cfg.linear_value_head_dim;
+  const int64_t linear_conv_dim = linear_key_dim * 2 + linear_value_dim;
+  w[p + "linear_attn.in_proj_qkv.weight"] = small({linear_conv_dim, cfg.hidden_size});
+  w[p + "linear_attn.in_proj_z.weight"] = small({linear_value_dim, cfg.hidden_size});
+  w[p + "linear_attn.in_proj_b.weight"] = small({cfg.linear_num_value_heads, cfg.hidden_size});
+  w[p + "linear_attn.in_proj_a.weight"] = small({cfg.linear_num_value_heads, cfg.hidden_size});
+  w[p + "linear_attn.conv1d.weight"] = small({linear_conv_dim, 1, cfg.linear_conv_kernel_dim});
+  w[p + "linear_attn.A_log"] = torch::zeros({cfg.linear_num_value_heads}, torch::kFloat32);
+  w[p + "linear_attn.dt_bias"] = torch::zeros({cfg.linear_num_value_heads}, torch::kFloat32);
+  w[p + "linear_attn.norm.weight"] = torch::ones({cfg.linear_value_head_dim}, torch::kFloat32);
+  w[p + "linear_attn.out_proj.weight"] = small({cfg.hidden_size, linear_value_dim});
   w[p + "mlp.gate_proj.weight"] = torch::zeros({cfg.intermediate_size, cfg.hidden_size}, torch::kFloat32);
   w[p + "mlp.up_proj.weight"] = torch::zeros({cfg.intermediate_size, cfg.hidden_size}, torch::kFloat32);
   w[p + "mlp.down_proj.weight"] = torch::zeros({cfg.hidden_size, cfg.intermediate_size}, torch::kFloat32);
@@ -187,39 +199,93 @@ void install_weights(cverl::Qwen35TextModel& model, const std::unordered_map<std
   }
 }
 
+std::vector<torch::Tensor> remote_linear_attention_messages(const torch::Tensor& hidden_local,
+                                                            const std::unordered_map<std::string, torch::Tensor>& weights,
+                                                            const cverl::Qwen35TextConfig& cfg) {
+  const std::string p = "model.language_model.layers.0.";
+  auto x = rms_norm(hidden_local, weights.at(p + "input_layernorm.weight"), cfg.rms_norm_eps);
+  const int64_t b = x.size(0);
+  const int64_t s = x.size(1);
+  const int64_t vh = cfg.linear_num_value_heads;
+  const int64_t vd = cfg.linear_value_head_dim;
+  auto mixed = dense(x, weights.at(p + "linear_attn.in_proj_qkv.weight"));
+  auto z = dense(x, weights.at(p + "linear_attn.in_proj_z.weight")).reshape({b, s, vh, vd});
+  auto beta = torch::sigmoid(dense(x, weights.at(p + "linear_attn.in_proj_b.weight")));
+  auto a = dense(x, weights.at(p + "linear_attn.in_proj_a.weight"));
+  return {
+      mixed.transpose(0, 1).contiguous(),
+      z.transpose(0, 1).contiguous(),
+      beta.transpose(0, 1).contiguous(),
+      a.transpose(0, 1).contiguous(),
+  };
+}
+
+void run_full_attention_case() {
+  auto dir = make_model_dir("full_attention");
+  cverl::HfModelLoader loader(dir.string());
+  cverl::Qwen35TextModel model(std::move(loader));
+  auto weights = make_weights(model.config());
+  install_weights(model, weights);
+
+  auto hidden = torch::randn({1, 4, model.config().hidden_size}, torch::kFloat32) * 0.1;
+  auto dense = model.forward_hidden_range_context_parallel(
+      hidden, 0, 1, cverl::distributed::ParallelGroup{}, 4, false);
+  auto shard0 = cverl::distributed::context_parallel_slice_padded(hidden, 0, 2, 1, 0.0);
+  auto shard1 = cverl::distributed::context_parallel_slice_padded(hidden, 1, 2, 1, 0.0);
+  auto kv0 = remote_full_attention_kv(shard0, 0, weights, model.config());
+  auto kv1 = remote_full_attention_kv(shard1, 2, weights, model.config());
+
+  SendRecvCollectives rank0_collectives(
+      {kv1.first.transpose(0, 2).contiguous(), kv1.second.transpose(0, 2).contiguous()});
+  cverl::distributed::ParallelGroup rank0_group{0, 2, {0, 1}, &rank0_collectives};
+  auto out0 = model.forward_hidden_range_context_parallel(shard0, 0, 1, rank0_group, 4, false);
+
+  SendRecvCollectives rank1_collectives(
+      {kv0.first.transpose(0, 2).contiguous(), kv0.second.transpose(0, 2).contiguous()});
+  cverl::distributed::ParallelGroup rank1_group{1, 2, {0, 1}, &rank1_collectives};
+  auto out1 = model.forward_hidden_range_context_parallel(shard1, 0, 1, rank1_group, 4, false);
+
+  require(torch::allclose(out0, dense.narrow(1, 0, 2), 1.0e-5, 1.0e-5),
+          "Qwen CP full-attention rank0 forward shard must match dense slice");
+  require(torch::allclose(out1, dense.narrow(1, 2, 2), 1.0e-5, 1.0e-5),
+          "Qwen CP full-attention rank1 forward shard must match dense slice");
+  std::filesystem::remove_all(dir);
+}
+
+void run_linear_attention_case() {
+  auto dir = make_model_dir("linear_attention");
+  cverl::HfModelLoader loader(dir.string());
+  cverl::Qwen35TextModel model(std::move(loader));
+  auto weights = make_weights(model.config());
+  install_weights(model, weights);
+
+  auto hidden = torch::randn({1, 4, model.config().hidden_size}, torch::kFloat32) * 0.1;
+  auto dense = model.forward_hidden_range_context_parallel(
+      hidden, 0, 1, cverl::distributed::ParallelGroup{}, 4, false);
+  auto shard0 = cverl::distributed::context_parallel_slice_padded(hidden, 0, 2, 1, 0.0);
+  auto shard1 = cverl::distributed::context_parallel_slice_padded(hidden, 1, 2, 1, 0.0);
+
+  SendRecvCollectives rank0_collectives(remote_linear_attention_messages(shard1, weights, model.config()));
+  cverl::distributed::ParallelGroup rank0_group{0, 2, {0, 1}, &rank0_collectives};
+  auto out0 = model.forward_hidden_range_context_parallel(shard0, 0, 1, rank0_group, 4, false);
+
+  SendRecvCollectives rank1_collectives(remote_linear_attention_messages(shard0, weights, model.config()));
+  cverl::distributed::ParallelGroup rank1_group{1, 2, {0, 1}, &rank1_collectives};
+  auto out1 = model.forward_hidden_range_context_parallel(shard1, 0, 1, rank1_group, 4, false);
+
+  require(torch::allclose(out0, dense.narrow(1, 0, 2), 1.0e-5, 1.0e-5),
+          "Qwen CP linear-attention rank0 forward shard must match dense slice");
+  require(torch::allclose(out1, dense.narrow(1, 2, 2), 1.0e-5, 1.0e-5),
+          "Qwen CP linear-attention rank1 forward shard must match dense slice");
+  std::filesystem::remove_all(dir);
+}
+
 }  // namespace
 
 int main() {
   try {
-    auto dir = make_model_dir();
-    cverl::HfModelLoader loader(dir.string());
-    cverl::Qwen35TextModel model(std::move(loader));
-    auto weights = make_weights(model.config());
-    install_weights(model, weights);
-
-    auto hidden = torch::randn({1, 4, model.config().hidden_size}, torch::kFloat32) * 0.1;
-    auto dense = model.forward_hidden_range_context_parallel(
-        hidden, 0, 1, cverl::distributed::ParallelGroup{}, 4, false);
-    auto shard0 = cverl::distributed::context_parallel_slice_padded(hidden, 0, 2, 1, 0.0);
-    auto shard1 = cverl::distributed::context_parallel_slice_padded(hidden, 1, 2, 1, 0.0);
-    auto kv0 = remote_full_attention_kv(shard0, 0, weights, model.config());
-    auto kv1 = remote_full_attention_kv(shard1, 2, weights, model.config());
-
-    SendRecvCollectives rank0_collectives(
-        {kv1.first.transpose(0, 2).contiguous(), kv1.second.transpose(0, 2).contiguous()});
-    cverl::distributed::ParallelGroup rank0_group{0, 2, {0, 1}, &rank0_collectives};
-    auto out0 = model.forward_hidden_range_context_parallel(shard0, 0, 1, rank0_group, 4, false);
-
-    SendRecvCollectives rank1_collectives(
-        {kv0.first.transpose(0, 2).contiguous(), kv0.second.transpose(0, 2).contiguous()});
-    cverl::distributed::ParallelGroup rank1_group{1, 2, {0, 1}, &rank1_collectives};
-    auto out1 = model.forward_hidden_range_context_parallel(shard1, 0, 1, rank1_group, 4, false);
-
-    require(torch::allclose(out0, dense.narrow(1, 0, 2), 1.0e-5, 1.0e-5),
-            "Qwen CP rank0 forward shard must match dense slice");
-    require(torch::allclose(out1, dense.narrow(1, 2, 2), 1.0e-5, 1.0e-5),
-            "Qwen CP rank1 forward shard must match dense slice");
-    std::filesystem::remove_all(dir);
+    run_full_attention_case();
+    run_linear_attention_case();
   } catch (const std::exception& e) {
     std::cerr << "test_qwen3_5_cp_forward failed: " << e.what() << "\n";
     return 1;
