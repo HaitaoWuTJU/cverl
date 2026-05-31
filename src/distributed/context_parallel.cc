@@ -1,5 +1,7 @@
 #include "cverl/distributed/context_parallel.h"
 
+#include "cverl/distributed/cp_attention_cuda.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <limits>
@@ -234,10 +236,17 @@ class ContextParallelRingAttentionRecomputeFunction final
     ctx->saved_data["shard_size"] = shard_size;
     ctx->saved_data["scale"] = scale;
     ctx->save_for_backward({query_local, key_ring, value_ring, key_begin_positions});
+    const auto positions = vector_from_cpu_i64_tensor(key_begin_positions);
+    if (cp_attention_cuda_available() && query_local.is_cuda() && key_ring.is_cuda() && value_ring.is_cuda() &&
+        query_local.scalar_type() == torch::kFloat32 && key_ring.scalar_type() == torch::kFloat32 &&
+        value_ring.scalar_type() == torch::kFloat32) {
+      return cp_ring_attention_cuda_forward(
+          query_local, key_ring, value_ring, positions, query_begin, original_sequence_length, shard_size, scale);
+    }
     return streaming_attention_from_ring_blocks(query_local,
                                                 key_ring,
                                                 value_ring,
-                                                vector_from_cpu_i64_tensor(key_begin_positions),
+                                                positions,
                                                 query_begin,
                                                 original_sequence_length,
                                                 shard_size,

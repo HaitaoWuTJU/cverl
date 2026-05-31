@@ -140,6 +140,7 @@ add_library(cverl STATIC
   src/hf_downloader.cc
   src/data/hf_dataset.cc
   src/distributed/collectives.cc
+  src/distributed/cp_attention_cuda_stub.cc
   src/distributed/context_parallel.cc
   src/distributed/optimizer_sharding.cc
   src/distributed/parallel_ops.cc
@@ -206,6 +207,7 @@ if (CVERL_ENABLE_CUDA)
   find_package(CUDAToolkit REQUIRED)
   target_sources(cverl PRIVATE
     cuda/core_algos_cuda.cu
+    cuda/cp_attention_cuda.cu
     cuda/qwen_linear_attention_cuda.cu
     src/rollout/gpu_ipc_rollout_batch.cc
   )
@@ -354,6 +356,11 @@ if (CVERL_BUILD_TESTS)
     target_link_libraries(test_qwen_linear_attention_cuda PRIVATE cverl)
     target_compile_options(test_qwen_linear_attention_cuda PRIVATE ${TORCH_CXX_FLAGS})
     cverl_register_test(test_qwen_linear_attention_cuda)
+
+    add_executable(test_cp_attention_cuda tests/distributed/test_cp_attention_cuda.cc)
+    target_link_libraries(test_cp_attention_cuda PRIVATE cverl)
+    target_compile_options(test_cp_attention_cuda PRIVATE ${TORCH_CXX_FLAGS})
+    cverl_register_test(test_cp_attention_cuda)
   endif()
 
   add_executable(test_gsm8k_grpo_trainer tests/rollout/test_gsm8k_grpo_trainer.cc)
