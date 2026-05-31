@@ -149,15 +149,26 @@ int main(int argc, char** argv) {
                           .contiguous();
 
       auto opts = torch::TensorOptions().device(torch::kCUDA, static_cast<int>(device)).dtype(torch::kFloat32);
-      auto q_local = cpu_q.narrow(2, rank * local_seq, local_seq).to(opts).contiguous().set_requires_grad(true);
-      auto k_local = cpu_k.narrow(2, rank * local_seq, local_seq).to(opts).contiguous();
-      auto v_local = cpu_v.narrow(2, rank * local_seq, local_seq).to(opts).contiguous();
+      auto q_local =
+          cpu_q.narrow(2, rank * local_seq, local_seq).to(opts).contiguous().detach().set_requires_grad(true);
+      auto k_local =
+          cpu_k.narrow(2, rank * local_seq, local_seq).to(opts).contiguous().detach().set_requires_grad(true);
+      auto v_local =
+          cpu_v.narrow(2, rank * local_seq, local_seq).to(opts).contiguous().detach().set_requires_grad(true);
       auto cp_out = cverl::distributed::context_parallel_causal_attention_gather_kv(
           q_local, k_local, v_local, comm, group, rank, global_seq, scale);
       require_allclose(cp_out, expected, "NCCL CP causal attention gather-KV mismatch");
       cp_out.sum().backward();
       if (!q_local.grad().defined() || q_local.grad().abs().sum().item<float>() <= 0.0f) {
         throw std::runtime_error("NCCL CP causal attention did not produce local query gradients");
+      }
+      if (!k_local.grad().defined() || k_local.grad().sizes() != k_local.sizes() ||
+          k_local.grad().abs().sum().item<float>() <= 0.0f) {
+        throw std::runtime_error("NCCL CP causal attention did not return local key gradients");
+      }
+      if (!v_local.grad().defined() || v_local.grad().sizes() != v_local.sizes() ||
+          v_local.grad().abs().sum().item<float>() <= 0.0f) {
+        throw std::runtime_error("NCCL CP causal attention did not return local value gradients");
       }
     }
 

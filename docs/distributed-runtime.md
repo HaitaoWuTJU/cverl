@@ -222,10 +222,11 @@ Current code exposes the distributed shape directly:
   base for CP attention. It also provides a differentiable all-gather-KV
   causal-attention reference for local query shards; ring-attention kernels
   should match this math while replacing the global KV materialization.
-  The NCCL smoke test runs this path on GPU ranks. Current NCCL all-gather is
-  a forward collective only for K/V, so full CP training still needs an
-  autograd-aware KV gather/ring-attention backward that returns K/V gradients
-  to their owner ranks.
+  The NCCL smoke test runs this path on GPU ranks. The current differentiable
+  gather uses all-gather in forward and reduce-scatter in backward, so local
+  K/V owners receive gradients. Full industrial CP training still needs a
+  ring-attention/FlashAttention-style kernel that avoids materializing global
+  KV and returns K/V gradients through ring exchange.
 - `qwen3_5_pp_tp_ppo_trainer`: accepts DP/PP/CP/TP topology dimensions and
   records all four axes in metrics and checkpoint manifests. CP is wired as a
   topology/communicator axis; the Qwen forward path still needs CP-aware token

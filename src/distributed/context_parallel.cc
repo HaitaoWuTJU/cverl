@@ -1,6 +1,7 @@
 #include "cverl/distributed/context_parallel.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 
@@ -32,6 +33,63 @@ void require_attention_tensor(const torch::Tensor& tensor, const char* name) {
     throw std::invalid_argument(std::string(name) + " must be a defined 4D tensor [B,H,S,D]");
   }
 }
+
+torch::Tensor group_tensor_from_vector(const std::vector<int64_t>& group) {
+  return torch::tensor(group, torch::TensorOptions().dtype(torch::kLong).device(torch::kCPU));
+}
+
+std::vector<int64_t> group_vector_from_tensor(const torch::Tensor& tensor) {
+  auto cpu = tensor.to(torch::kCPU).contiguous();
+  std::vector<int64_t> group;
+  group.reserve(static_cast<size_t>(cpu.numel()));
+  auto accessor = cpu.accessor<int64_t, 1>();
+  for (int64_t i = 0; i < cpu.numel(); ++i) {
+    group.push_back(accessor[i]);
+  }
+  return group;
+}
+
+class ContextParallelGatherFunction final
+    : public torch::autograd::Function<ContextParallelGatherFunction> {
+ public:
+  static torch::Tensor forward(torch::autograd::AutogradContext* ctx,
+                               torch::Tensor local,
+                               torch::Tensor group_tensor,
+                               int64_t collectives_addr,
+                               int64_t sequence_dim) {
+    auto* collectives = reinterpret_cast<Collectives*>(static_cast<uintptr_t>(collectives_addr));
+    if (collectives == nullptr) {
+      throw std::invalid_argument("context_parallel_gather_autograd requires collectives");
+    }
+    const auto group = group_vector_from_tensor(group_tensor);
+    const int64_t dim = normalize_sequence_dim(local, sequence_dim);
+    ctx->saved_data["collectives_addr"] = collectives_addr;
+    ctx->saved_data["sequence_dim"] = dim;
+    ctx->save_for_backward({group_tensor});
+    return context_parallel_gather(local, *collectives, group, dim);
+  }
+
+  static torch::autograd::tensor_list backward(torch::autograd::AutogradContext* ctx,
+                                               torch::autograd::tensor_list grad_outputs) {
+    auto saved = ctx->get_saved_variables();
+    auto* collectives =
+        reinterpret_cast<Collectives*>(static_cast<uintptr_t>(ctx->saved_data["collectives_addr"].toInt()));
+    const int64_t dim = ctx->saved_data["sequence_dim"].toInt();
+    const auto group = group_vector_from_tensor(saved.at(0));
+    auto grad = grad_outputs.at(0).contiguous();
+    torch::Tensor moved;
+    if (dim == 0) {
+      moved = grad;
+    } else {
+      moved = grad.transpose(0, dim).contiguous();
+    }
+    auto local = collectives->reduce_scatter(moved, ReduceOp::Sum, group, 0).contiguous();
+    if (dim != 0) {
+      local = local.transpose(0, dim).contiguous();
+    }
+    return {local, torch::Tensor(), torch::Tensor(), torch::Tensor()};
+  }
+};
 
 }  // namespace
 
@@ -110,6 +168,19 @@ torch::Tensor context_parallel_gather(const torch::Tensor& local,
   auto moved = local.transpose(0, dim).contiguous();
   auto gathered = collectives.all_gather(moved, context_group, 0);
   return gathered.transpose(0, dim).contiguous();
+}
+
+torch::Tensor context_parallel_gather_autograd(const torch::Tensor& local,
+                                               Collectives& collectives,
+                                               const std::vector<int64_t>& context_group,
+                                               int64_t sequence_dim) {
+  if (context_group.size() <= 1) {
+    return local;
+  }
+  const int64_t dim = normalize_sequence_dim(local, sequence_dim);
+  auto group_tensor = group_tensor_from_vector(context_group);
+  const auto collectives_addr = static_cast<int64_t>(reinterpret_cast<uintptr_t>(&collectives));
+  return ContextParallelGatherFunction::apply(local, group_tensor, collectives_addr, dim);
 }
 
 torch::Tensor context_parallel_gather_padded(const torch::Tensor& local,
@@ -207,8 +278,9 @@ torch::Tensor context_parallel_causal_attention_gather_kv(const torch::Tensor& q
   if (key_local.size(2) != shard || value_local.size(2) != shard) {
     throw std::invalid_argument("query/key/value local CP shards must have matching sequence length");
   }
-  auto key_global = context_parallel_gather(key_local.contiguous(), collectives, context_group, 2).contiguous();
-  auto value_global = context_parallel_gather(value_local.contiguous(), collectives, context_group, 2).contiguous();
+  auto key_global = context_parallel_gather_autograd(key_local.contiguous(), collectives, context_group, 2).contiguous();
+  auto value_global =
+      context_parallel_gather_autograd(value_local.contiguous(), collectives, context_group, 2).contiguous();
   if (key_global.size(2) < original_sequence_length || value_global.size(2) < original_sequence_length) {
     throw std::invalid_argument("gathered CP KV is shorter than original_sequence_length");
   }

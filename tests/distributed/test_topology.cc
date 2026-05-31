@@ -84,8 +84,12 @@ class PrecomputedAllGatherCollectives final : public cverl::distributed::Collect
   torch::Tensor reduce_scatter(const torch::Tensor& input,
                                cverl::distributed::ReduceOp /*op*/,
                                const std::vector<int64_t>& /*group*/,
-                               int64_t /*dim*/) override {
-    return input;
+                               int64_t dim) override {
+    if (dim != 0 || responses_.empty()) {
+      return input;
+    }
+    const int64_t world = static_cast<int64_t>(responses_.front().size());
+    return input.narrow(0, 0, input.size(0) / world).contiguous();
   }
 
   void send(const torch::Tensor& /*input*/, int64_t /*peer*/) override {}
@@ -383,15 +387,34 @@ void test_context_parallel_causal_attention() {
   auto local = cverl::distributed::context_parallel_causal_attention(local_q, k, v, 3, scale);
   require(torch::allclose(local, dense.narrow(2, 3, 3), 1.0e-5, 1.0e-5), "CP local causal attention");
 
-  auto q0 = q.narrow(2, 0, 3).contiguous();
-  auto k0 = k.narrow(2, 0, 3).contiguous();
-  auto v0 = v.narrow(2, 0, 3).contiguous();
+  auto dense_q = q.detach().clone().set_requires_grad(true);
+  auto dense_k = k.detach().clone().set_requires_grad(true);
+  auto dense_v = v.detach().clone().set_requires_grad(true);
+  auto dense_local = cverl::distributed::context_parallel_causal_attention(dense_q.narrow(2, 0, 3).contiguous(),
+                                                                           dense_k,
+                                                                           dense_v,
+                                                                           0,
+                                                                           scale);
+  dense_local.sum().backward();
+
+  auto q0 = q.narrow(2, 0, 3).contiguous().set_requires_grad(true);
+  auto k0 = k.narrow(2, 0, 3).contiguous().set_requires_grad(true);
+  auto v0 = v.narrow(2, 0, 3).contiguous().set_requires_grad(true);
   auto k1 = k.narrow(2, 3, 3).contiguous();
   auto v1 = v.narrow(2, 3, 3).contiguous();
-  PrecomputedAllGatherCollectives collectives(std::vector<std::vector<torch::Tensor>>{{k0, k1}, {v0, v1}});
+  PrecomputedAllGatherCollectives collectives(std::vector<std::vector<torch::Tensor>>{
+      {k0.transpose(0, 2).contiguous(), k1.transpose(0, 2).contiguous()},
+      {v0.transpose(0, 2).contiguous(), v1.transpose(0, 2).contiguous()}});
   auto gathered =
       cverl::distributed::context_parallel_causal_attention_gather_kv(q0, k0, v0, collectives, {0, 1}, 0, 6, scale);
   require(torch::allclose(gathered, dense.narrow(2, 0, 3), 1.0e-5, 1.0e-5), "CP gathered KV causal attention");
+  gathered.sum().backward();
+  require(q0.grad().defined() && torch::allclose(q0.grad(), dense_q.grad().narrow(2, 0, 3), 1.0e-5, 1.0e-5),
+          "CP gathered KV query gradient matches dense local-output gradient");
+  require(k0.grad().defined() && torch::allclose(k0.grad(), dense_k.grad().narrow(2, 0, 3), 1.0e-5, 1.0e-5),
+          "CP gathered KV key gradient matches dense local-output gradient");
+  require(v0.grad().defined() && torch::allclose(v0.grad(), dense_v.grad().narrow(2, 0, 3), 1.0e-5, 1.0e-5),
+          "CP gathered KV value gradient matches dense local-output gradient");
 
   require_throws([&]() { (void)cverl::distributed::context_parallel_causal_attention(local_q, k, v, 4, scale); },
                  "CP causal attention rejects out-of-range query shard");
