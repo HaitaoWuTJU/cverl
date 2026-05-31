@@ -6,6 +6,7 @@
 #include <torch/torch.h>
 
 #include "cverl/distributed/collectives.h"
+#include "cverl/torch/fp32_master_adamw.h"
 
 namespace cverl::distributed {
 
@@ -23,6 +24,14 @@ struct FlatParameterShard {
   int64_t shard_begin = 0;
   int64_t shard_end = 0;
   std::vector<FlatParameterShardRange> ranges;
+};
+
+struct FlatAdamWStepResult {
+  FlatParameterShard gradient_shard;
+  double local_grad_norm_sq = 0.0;
+  double global_grad_norm = 0.0;
+  double grad_clip_scale = 1.0;
+  double local_grad_norm = 0.0;
 };
 
 std::vector<int64_t> greedy_parameter_owner_by_size(const std::vector<int64_t>& parameter_bytes,
@@ -54,6 +63,18 @@ void all_gather_apply_flat_parameter_shard(const FlatParameterShard& local_shard
                                            Collectives& collectives,
                                            const std::vector<int64_t>& data_group,
                                            const std::vector<torch::Tensor>& parameters);
+
+FlatAdamWStepResult flat_sharded_adamw_step(const std::vector<torch::Tensor>& parameters,
+                                            FlatParameterShard& parameter_shard,
+                                            cverl::torch_backend::FlatAdamW& optimizer,
+                                            Collectives& data_collectives,
+                                            const std::vector<int64_t>& data_group,
+                                            Collectives& norm_collectives,
+                                            const std::vector<int64_t>& norm_group,
+                                            double max_grad_norm,
+                                            bool average_gradients = true,
+                                            bool require_grad = false,
+                                            bool apply_parameters = true);
 
 void apply_flat_parameter_shard(const FlatParameterShard& shard,
                                 const std::vector<torch::Tensor>& parameters);

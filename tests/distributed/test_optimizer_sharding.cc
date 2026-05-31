@@ -332,8 +332,18 @@ void test_flat_sharded_adamw_matches_dense() {
 
   cverl::torch_backend::FlatAdamW flat_rank0(param_rank0.shard, opts);
   cverl::torch_backend::FlatAdamW flat_rank1(param_rank1.shard, opts);
-  flat_rank0.step(grad_rank0.shard);
-  flat_rank1.step(grad_rank1.shard);
+  SliceCollectives comm0(0);
+  SliceCollectives comm1(1);
+  auto step0 = cverl::distributed::flat_sharded_adamw_step(
+      sharded_params, param_rank0, flat_rank0, comm0, {0, 1}, comm0, {0, 1}, 0.0, false, true, false);
+  auto step1 = cverl::distributed::flat_sharded_adamw_step(
+      sharded_params, param_rank1, flat_rank1, comm1, {0, 1}, comm1, {0, 1}, 0.0, false, true, false);
+  require(step0.gradient_shard.shard.numel() == param_rank0.shard.numel(), "rank0 flat step grad shard");
+  require(step1.gradient_shard.shard.numel() == param_rank1.shard.numel(), "rank1 flat step grad shard");
+  require(step0.grad_clip_scale == 1.0 && step1.grad_clip_scale == 1.0, "flat step unclipped");
+  require(step0.local_grad_norm > 0.0 && step1.local_grad_norm > 0.0, "flat step grad norms");
+  require(comm0.reduce_scatter_calls == 1 && comm1.reduce_scatter_calls == 1,
+          "flat sharded AdamW step should reduce-scatter once per rank");
   auto gathered =
       torch::cat({flat_rank0.parameter_shard(), flat_rank1.parameter_shard()}, 0).contiguous();
   cverl::distributed::apply_full_flat_parameters(gathered, param_rank0.original_numel, sharded_params);

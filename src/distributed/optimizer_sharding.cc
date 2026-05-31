@@ -1,6 +1,7 @@
 #include "cverl/distributed/optimizer_sharding.h"
 
 #include <algorithm>
+#include <cmath>
 #include <stdexcept>
 
 namespace cverl::distributed {
@@ -231,6 +232,54 @@ void all_gather_apply_flat_parameter_shard(const FlatParameterShard& local_shard
                                            const std::vector<torch::Tensor>& parameters) {
   auto gathered = all_gather_flat_parameter_shards(local_shard, collectives, data_group);
   apply_full_flat_parameters(gathered, local_shard.original_numel, parameters);
+}
+
+FlatAdamWStepResult flat_sharded_adamw_step(const std::vector<torch::Tensor>& parameters,
+                                            FlatParameterShard& parameter_shard,
+                                            cverl::torch_backend::FlatAdamW& optimizer,
+                                            Collectives& data_collectives,
+                                            const std::vector<int64_t>& data_group,
+                                            Collectives& norm_collectives,
+                                            const std::vector<int64_t>& norm_group,
+                                            double max_grad_norm,
+                                            bool average_gradients,
+                                            bool require_grad,
+                                            bool apply_parameters) {
+  if (max_grad_norm < 0.0) {
+    throw std::invalid_argument("flat_sharded_adamw_step max_grad_norm must be non-negative");
+  }
+  auto grad_shard = reduce_scatter_flat_gradient_shard(
+      parameters, data_collectives, data_group, average_gradients, require_grad);
+  if (grad_shard.original_numel != parameter_shard.original_numel ||
+      grad_shard.padded_numel != parameter_shard.padded_numel ||
+      grad_shard.shard_begin != parameter_shard.shard_begin ||
+      grad_shard.shard_end != parameter_shard.shard_end ||
+      grad_shard.shard.numel() != parameter_shard.shard.numel()) {
+    throw std::runtime_error("flat_sharded_adamw_step parameter/gradient shard metadata mismatch");
+  }
+
+  FlatAdamWStepResult result;
+  result.gradient_shard = std::move(grad_shard);
+  result.local_grad_norm_sq = result.gradient_shard.shard.pow(2).sum().item<double>();
+  auto grad_sq_tensor = torch::tensor(
+      {result.local_grad_norm_sq},
+      torch::TensorOptions().device(result.gradient_shard.shard.device()).dtype(torch::kFloat32));
+  auto global_grad_sq_tensor =
+      norm_collectives.all_reduce(grad_sq_tensor.contiguous(), ReduceOp::Sum, norm_group);
+  result.global_grad_norm =
+      std::sqrt(static_cast<double>(global_grad_sq_tensor.cpu()[0].item<float>()));
+  if (max_grad_norm > 0.0 && std::isfinite(result.global_grad_norm) &&
+      result.global_grad_norm > max_grad_norm) {
+    result.grad_clip_scale = max_grad_norm / (result.global_grad_norm + 1.0e-6);
+    result.gradient_shard.shard.mul_(result.grad_clip_scale);
+  }
+  result.local_grad_norm = result.gradient_shard.shard.norm().item<double>();
+  optimizer.step(result.gradient_shard.shard);
+  parameter_shard.shard.copy_(optimizer.parameter_shard());
+  if (apply_parameters) {
+    all_gather_apply_flat_parameter_shard(parameter_shard, data_collectives, data_group, parameters);
+  }
+  return result;
 }
 
 void apply_flat_parameter_shard(const FlatParameterShard& shard,

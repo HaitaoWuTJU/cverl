@@ -1726,7 +1726,30 @@ int main(int argc, char** argv) {
       }
 
       sync_tp_replicated_gradients(param_names, params, tp_group, tp_grad_bucket_bytes);
-      if (dp_flat_shard_optimizer) {
+      bool flat_step_done = false;
+      double local_grad_norm_sq = 0.0;
+      double global_grad_norm = 0.0;
+      double grad_clip_scale = 1.0;
+      double local_grad_norm = 0.0;
+      if (dp_flat_shard_optimizer && !skip_optimizer_step) {
+        auto flat_step = cverl::distributed::flat_sharded_adamw_step(params,
+                                                                     flat_param_shard,
+                                                                     *flat_optimizer,
+                                                                     dp_comm,
+                                                                     dp_group.ranks,
+                                                                     full_comm,
+                                                                     full_ranks,
+                                                                     max_grad_norm,
+                                                                     true,
+                                                                     false,
+                                                                     true);
+        flat_gradient_shard = flat_step.gradient_shard.shard;
+        local_grad_norm_sq = flat_step.local_grad_norm_sq;
+        global_grad_norm = flat_step.global_grad_norm;
+        grad_clip_scale = flat_step.grad_clip_scale;
+        local_grad_norm = flat_step.local_grad_norm;
+        flat_step_done = true;
+      } else if (dp_flat_shard_optimizer) {
         auto flat_grad = cverl::distributed::reduce_scatter_flat_gradient_shard(
             params, dp_comm, dp_group.ranks, true, false);
         if (flat_grad.original_numel != flat_param_shard.original_numel ||
@@ -1739,41 +1762,36 @@ int main(int argc, char** argv) {
         cverl::distributed::data_parallel_sync_gradients(
             params, dp_comm, dp_group.ranks, true, dp_grad_bucket_bytes);
       }
-      const double local_grad_norm_sq =
-          dp_flat_shard_optimizer
-              ? flat_gradient_shard.pow(2).sum().item<double>()
-              : (dp_shard_optimizer ? grad_l2_norm_sq(params) : optimizer.grad_l2_norm_sq());
-      auto grad_sq_tensor =
-          torch::tensor({local_grad_norm_sq}, torch::TensorOptions().device(device).dtype(torch::kFloat32));
-      auto global_grad_sq_tensor =
-          dp_flat_shard_optimizer
-              ? full_comm.all_reduce(grad_sq_tensor.contiguous(), cverl::distributed::ReduceOp::Sum, full_ranks)
-              : model_comm.all_reduce(
-                    grad_sq_tensor.contiguous(), cverl::distributed::ReduceOp::Sum, full_group(model_parallel_size));
-      const double global_grad_norm =
-          std::sqrt(static_cast<double>(global_grad_sq_tensor.cpu()[0].item<float>()));
-      double grad_clip_scale = 1.0;
-      if (max_grad_norm > 0.0 && std::isfinite(global_grad_norm) && global_grad_norm > max_grad_norm) {
-        grad_clip_scale = max_grad_norm / (global_grad_norm + 1.0e-6);
-        if (dp_flat_shard_optimizer) {
-          flat_gradient_shard.mul_(grad_clip_scale);
-        } else if (dp_shard_optimizer) {
-          scale_model_gradients(params, grad_clip_scale);
-        } else {
-          optimizer.scale_gradients(grad_clip_scale);
+      if (!flat_step_done) {
+        local_grad_norm_sq =
+            dp_flat_shard_optimizer
+                ? flat_gradient_shard.pow(2).sum().item<double>()
+                : (dp_shard_optimizer ? grad_l2_norm_sq(params) : optimizer.grad_l2_norm_sq());
+        auto grad_sq_tensor =
+            torch::tensor({local_grad_norm_sq}, torch::TensorOptions().device(device).dtype(torch::kFloat32));
+        auto global_grad_sq_tensor =
+            dp_flat_shard_optimizer
+                ? full_comm.all_reduce(grad_sq_tensor.contiguous(), cverl::distributed::ReduceOp::Sum, full_ranks)
+                : model_comm.all_reduce(
+                      grad_sq_tensor.contiguous(), cverl::distributed::ReduceOp::Sum, full_group(model_parallel_size));
+        global_grad_norm = std::sqrt(static_cast<double>(global_grad_sq_tensor.cpu()[0].item<float>()));
+        if (max_grad_norm > 0.0 && std::isfinite(global_grad_norm) && global_grad_norm > max_grad_norm) {
+          grad_clip_scale = max_grad_norm / (global_grad_norm + 1.0e-6);
+          if (dp_flat_shard_optimizer) {
+            flat_gradient_shard.mul_(grad_clip_scale);
+          } else if (dp_shard_optimizer) {
+            scale_model_gradients(params, grad_clip_scale);
+          } else {
+            optimizer.scale_gradients(grad_clip_scale);
+          }
         }
+        local_grad_norm =
+            dp_flat_shard_optimizer
+                ? flat_gradient_shard.norm().item<double>()
+                : (dp_shard_optimizer ? grad_norm_sum(params) : optimizer.grad_norm_sum());
       }
-      const double local_grad_norm =
-          dp_flat_shard_optimizer
-              ? flat_gradient_shard.norm().item<double>()
-              : (dp_shard_optimizer ? grad_norm_sum(params) : optimizer.grad_norm_sum());
       if (!skip_optimizer_step) {
-        if (dp_flat_shard_optimizer) {
-          flat_optimizer->step(flat_gradient_shard);
-          flat_param_shard.shard.copy_(flat_optimizer->parameter_shard());
-          cverl::distributed::all_gather_apply_flat_parameter_shard(
-              flat_param_shard, dp_comm, dp_group.ranks, params);
-        } else {
+        if (!dp_flat_shard_optimizer) {
           optimizer.step();
         }
         if (dp_shard_optimizer && !dp_flat_shard_optimizer) {
