@@ -10,6 +10,10 @@
 
 namespace {
 
+torch::Tensor l2norm(const torch::Tensor& x) {
+  return x * torch::rsqrt((x * x).sum(-1, true) + 1.0e-6);
+}
+
 void require_close(const torch::Tensor& actual,
                    const torch::Tensor& expected,
                    double atol,
@@ -44,11 +48,11 @@ int main() {
   constexpr int K = 128;
   constexpr int V = 128;
 
-  auto q = torch::randn({B, H, T, K}, opts).contiguous();
-  auto k = torch::randn({B, H, T, K}, opts).contiguous();
+  auto q = (l2norm(torch::randn({B, H, T, K}, opts)) / std::sqrt(static_cast<double>(K))).contiguous();
+  auto k = l2norm(torch::randn({B, H, T, K}, opts)).contiguous();
   auto v = torch::randn({B, H, T, V}, opts).contiguous();
   auto beta = torch::sigmoid(torch::randn({B, H, T}, opts)).contiguous();
-  auto g = (torch::randn({B, H, T}, opts) * 0.02).contiguous();
+  auto g = -torch::softplus(torch::randn({B, H, T}, opts) * 0.2).contiguous();
   auto grad_out = torch::randn({B, H, T, V}, opts).contiguous();
 
   auto saved_forward = cverl::qwen_linear_attention_cuda_forward(q, k, v, beta, g, true);
