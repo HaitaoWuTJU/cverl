@@ -248,9 +248,6 @@ torch::Tensor NcclCollectives::broadcast(const torch::Tensor& input,
                            static_cast<int>(root), comm_, stream_),
              "ncclBroadcast");
   finish_nccl_op({input, out});
-  if (rank_ == root) {
-    out.copy_(input);
-  }
   return out;
 }
 
