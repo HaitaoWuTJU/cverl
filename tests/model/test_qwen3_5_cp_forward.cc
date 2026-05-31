@@ -27,10 +27,11 @@ void require(bool cond, const std::string& msg) {
 
 class SendRecvCollectives final : public cverl::distributed::Collectives {
  public:
-  explicit SendRecvCollectives(std::vector<torch::Tensor> responses) : responses_(std::move(responses)) {}
+  SendRecvCollectives(int64_t rank, int64_t world_size, std::vector<torch::Tensor> responses)
+      : responses_(std::move(responses)), rank_(rank), world_size_(world_size) {}
 
-  int64_t rank() const override { return 0; }
-  int64_t world_size() const override { return 2; }
+  int64_t rank() const override { return rank_; }
+  int64_t world_size() const override { return world_size_; }
   void barrier() override {}
   torch::Tensor broadcast(const torch::Tensor& input, int64_t, const std::vector<int64_t>&) override { return input; }
   torch::Tensor all_reduce(const torch::Tensor& input,
@@ -43,7 +44,8 @@ class SendRecvCollectives final : public cverl::distributed::Collectives {
                                cverl::distributed::ReduceOp,
                                const std::vector<int64_t>&,
                                int64_t) override {
-    return input;
+    const int64_t shard = input.size(0) / world_size_;
+    return input.narrow(0, rank_ * shard, shard).contiguous();
   }
   void send(const torch::Tensor&, int64_t) override {}
   torch::Tensor recv_like(const torch::Tensor& like, int64_t) override { return torch::empty_like(like); }
@@ -58,6 +60,8 @@ class SendRecvCollectives final : public cverl::distributed::Collectives {
 
  private:
   std::vector<torch::Tensor> responses_;
+  int64_t rank_ = 0;
+  int64_t world_size_ = 1;
   size_t next_ = 0;
 };
 
@@ -228,27 +232,47 @@ void run_full_attention_case() {
   install_weights(model, weights);
 
   auto hidden = torch::randn({1, 4, model.config().hidden_size}, torch::kFloat32) * 0.1;
-  auto dense = model.forward_hidden_range_context_parallel(
-      hidden, 0, 1, cverl::distributed::ParallelGroup{}, 4, false);
+  auto dense_hidden = hidden.detach().clone().set_requires_grad(true);
+  auto dense = model.forward_hidden_range_context_parallel(dense_hidden, 0, 1, cverl::distributed::ParallelGroup{}, 4, false);
   auto shard0 = cverl::distributed::context_parallel_slice_padded(hidden, 0, 2, 1, 0.0);
   auto shard1 = cverl::distributed::context_parallel_slice_padded(hidden, 1, 2, 1, 0.0);
   auto kv0 = remote_full_attention_kv(shard0, 0, weights, model.config());
   auto kv1 = remote_full_attention_kv(shard1, 2, weights, model.config());
 
   SendRecvCollectives rank0_collectives(
-      {kv1.first.transpose(0, 2).contiguous(), kv1.second.transpose(0, 2).contiguous()});
+      0, 2, {kv1.first.transpose(0, 2).contiguous(), kv1.second.transpose(0, 2).contiguous()});
   cverl::distributed::ParallelGroup rank0_group{0, 2, {0, 1}, &rank0_collectives};
-  auto out0 = model.forward_hidden_range_context_parallel(shard0, 0, 1, rank0_group, 4, false);
+  auto shard0_grad = shard0.detach().clone().set_requires_grad(true);
+  auto out0 = model.forward_hidden_range_context_parallel(shard0_grad, 0, 1, rank0_group, 4, false);
 
   SendRecvCollectives rank1_collectives(
-      {kv0.first.transpose(0, 2).contiguous(), kv0.second.transpose(0, 2).contiguous()});
+      1, 2, {kv0.first.transpose(0, 2).contiguous(), kv0.second.transpose(0, 2).contiguous()});
   cverl::distributed::ParallelGroup rank1_group{1, 2, {0, 1}, &rank1_collectives};
-  auto out1 = model.forward_hidden_range_context_parallel(shard1, 0, 1, rank1_group, 4, false);
+  auto shard1_grad = shard1.detach().clone().set_requires_grad(true);
+  auto out1 = model.forward_hidden_range_context_parallel(shard1_grad, 0, 1, rank1_group, 4, false);
 
   require(torch::allclose(out0, dense.narrow(1, 0, 2), 1.0e-5, 1.0e-5),
           "Qwen CP full-attention rank0 forward shard must match dense slice");
   require(torch::allclose(out1, dense.narrow(1, 2, 2), 1.0e-5, 1.0e-5),
           "Qwen CP full-attention rank1 forward shard must match dense slice");
+  auto grad0 = torch::randn_like(out0);
+  auto grad1 = torch::randn_like(out1);
+  auto dense_hidden0 = hidden.detach().clone().set_requires_grad(true);
+  auto dense0 =
+      model.forward_hidden_range_context_parallel(dense_hidden0, 0, 1, cverl::distributed::ParallelGroup{}, 4, false);
+  torch::autograd::backward({dense0.narrow(1, 0, 2)}, {grad0});
+  auto dense_hidden1 = hidden.detach().clone().set_requires_grad(true);
+  auto dense1 =
+      model.forward_hidden_range_context_parallel(dense_hidden1, 0, 1, cverl::distributed::ParallelGroup{}, 4, false);
+  torch::autograd::backward({dense1.narrow(1, 2, 2)}, {grad1});
+  torch::autograd::backward({out0}, {grad0});
+  torch::autograd::backward({out1}, {grad1});
+  require(shard0_grad.grad().defined() &&
+              torch::allclose(shard0_grad.grad(), dense_hidden0.grad().narrow(1, 0, 2), 1.0e-5, 1.0e-5),
+          "Qwen CP full-attention rank0 hidden gradient must match dense slice");
+  require(shard1_grad.grad().defined() &&
+              torch::allclose(shard1_grad.grad(), dense_hidden1.grad().narrow(1, 2, 2), 1.0e-5, 1.0e-5),
+          "Qwen CP full-attention rank1 hidden gradient must match dense slice");
   std::filesystem::remove_all(dir);
 }
 
@@ -260,23 +284,43 @@ void run_linear_attention_case() {
   install_weights(model, weights);
 
   auto hidden = torch::randn({1, 4, model.config().hidden_size}, torch::kFloat32) * 0.1;
-  auto dense = model.forward_hidden_range_context_parallel(
-      hidden, 0, 1, cverl::distributed::ParallelGroup{}, 4, false);
+  auto dense_hidden = hidden.detach().clone().set_requires_grad(true);
+  auto dense = model.forward_hidden_range_context_parallel(dense_hidden, 0, 1, cverl::distributed::ParallelGroup{}, 4, false);
   auto shard0 = cverl::distributed::context_parallel_slice_padded(hidden, 0, 2, 1, 0.0);
   auto shard1 = cverl::distributed::context_parallel_slice_padded(hidden, 1, 2, 1, 0.0);
 
-  SendRecvCollectives rank0_collectives(remote_linear_attention_messages(shard1, weights, model.config()));
+  SendRecvCollectives rank0_collectives(0, 2, remote_linear_attention_messages(shard1, weights, model.config()));
   cverl::distributed::ParallelGroup rank0_group{0, 2, {0, 1}, &rank0_collectives};
-  auto out0 = model.forward_hidden_range_context_parallel(shard0, 0, 1, rank0_group, 4, false);
+  auto shard0_grad = shard0.detach().clone().set_requires_grad(true);
+  auto out0 = model.forward_hidden_range_context_parallel(shard0_grad, 0, 1, rank0_group, 4, false);
 
-  SendRecvCollectives rank1_collectives(remote_linear_attention_messages(shard0, weights, model.config()));
+  SendRecvCollectives rank1_collectives(1, 2, remote_linear_attention_messages(shard0, weights, model.config()));
   cverl::distributed::ParallelGroup rank1_group{1, 2, {0, 1}, &rank1_collectives};
-  auto out1 = model.forward_hidden_range_context_parallel(shard1, 0, 1, rank1_group, 4, false);
+  auto shard1_grad = shard1.detach().clone().set_requires_grad(true);
+  auto out1 = model.forward_hidden_range_context_parallel(shard1_grad, 0, 1, rank1_group, 4, false);
 
   require(torch::allclose(out0, dense.narrow(1, 0, 2), 1.0e-5, 1.0e-5),
           "Qwen CP linear-attention rank0 forward shard must match dense slice");
   require(torch::allclose(out1, dense.narrow(1, 2, 2), 1.0e-5, 1.0e-5),
           "Qwen CP linear-attention rank1 forward shard must match dense slice");
+  auto grad0 = torch::randn_like(out0);
+  auto grad1 = torch::randn_like(out1);
+  auto dense_hidden0 = hidden.detach().clone().set_requires_grad(true);
+  auto dense0 =
+      model.forward_hidden_range_context_parallel(dense_hidden0, 0, 1, cverl::distributed::ParallelGroup{}, 4, false);
+  torch::autograd::backward({dense0.narrow(1, 0, 2)}, {grad0});
+  auto dense_hidden1 = hidden.detach().clone().set_requires_grad(true);
+  auto dense1 =
+      model.forward_hidden_range_context_parallel(dense_hidden1, 0, 1, cverl::distributed::ParallelGroup{}, 4, false);
+  torch::autograd::backward({dense1.narrow(1, 2, 2)}, {grad1});
+  torch::autograd::backward({out0}, {grad0});
+  torch::autograd::backward({out1}, {grad1});
+  require(shard0_grad.grad().defined() &&
+              torch::allclose(shard0_grad.grad(), dense_hidden0.grad().narrow(1, 0, 2), 1.0e-5, 1.0e-5),
+          "Qwen CP linear-attention rank0 hidden gradient must match dense slice");
+  require(shard1_grad.grad().defined() &&
+              torch::allclose(shard1_grad.grad(), dense_hidden1.grad().narrow(1, 2, 2), 1.0e-5, 1.0e-5),
+          "Qwen CP linear-attention rank1 hidden gradient must match dense slice");
   std::filesystem::remove_all(dir);
 }
 

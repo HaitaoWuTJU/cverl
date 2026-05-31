@@ -274,6 +274,8 @@ CPU regression coverage includes:
 - `test_qwen3_5_cp_forward`: synthetic Qwen3.5 full-attention layer with
   deterministic weights, plus a synthetic Qwen3.5 linear-attention layer that
   exercises projected QKV/Z/B/A CP exchange. Both validate that CP rank-local
-  forward shards match the corresponding dense forward slices.
+  forward shards and local-output hidden gradients match the corresponding
+  dense slices. Cross-rank K/V owner-gradient transport remains covered by the
+  CP ring-exchange and reduce-scatter cases in `test_distributed_topology`.
 - `test_cp_attention_cuda` when `CVERL_ENABLE_CUDA=ON`: fused CUDA CP
   ring-attention forward/backward against the dense reference.
