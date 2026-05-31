@@ -106,6 +106,48 @@ int main() {
     return 1;
   }
 
+  torch::Tensor gae_rewards = torch::tensor({{1.0f, 0.0f, 0.0f, 2.0f},
+                                             {0.5f, 1.5f, 0.0f, 0.0f}}, torch::kFloat32);
+  torch::Tensor gae_values = torch::tensor({{0.1f, 0.2f, 0.3f, 0.4f},
+                                            {0.2f, 0.1f, 0.4f, 0.0f}}, torch::kFloat32);
+  torch::Tensor gae_mask = torch::tensor({{1.0f, 1.0f, 0.0f, 1.0f},
+                                          {1.0f, 0.0f, 1.0f, 1.0f}}, torch::kFloat32);
+  torch::Tensor gae_returns;
+  auto gae_adv = cverl::torch_backend::gae_advantage_return(
+      gae_rewards, gae_values, gae_mask, 0.97, 0.91, &gae_returns);
+  std::vector<float> gae_rewards_vec{
+      1.0f, 0.0f, 0.0f, 2.0f,
+      0.5f, 1.5f, 0.0f, 0.0f,
+  };
+  std::vector<float> gae_values_vec{
+      0.1f, 0.2f, 0.3f, 0.4f,
+      0.2f, 0.1f, 0.4f, 0.0f,
+  };
+  std::vector<float> gae_mask_vec{
+      1.0f, 1.0f, 0.0f, 1.0f,
+      1.0f, 0.0f, 1.0f, 1.0f,
+  };
+  std::vector<float> gae_adv_vec(8);
+  std::vector<float> gae_ret_vec(8);
+  require_status(
+      cverl_gae_advantage_return_f32_cpu(
+          ct(gae_rewards_vec, 2, 4),
+          ct(gae_values_vec, 2, 4),
+          ct(gae_mask_vec, 2, 4),
+          0.97f,
+          0.91f,
+          mt(gae_adv_vec, 2, 4),
+          mt(gae_ret_vec, 2, 4)),
+      "c gae");
+  auto expected_gae_adv = torch::from_blob(gae_adv_vec.data(), {2, 4}, torch::kFloat32);
+  auto expected_gae_returns = torch::from_blob(gae_ret_vec.data(), {2, 4}, torch::kFloat32);
+  if (!torch::allclose(gae_adv, expected_gae_adv, 1.0e-5, 1.0e-6) ||
+      !torch::allclose(gae_returns, expected_gae_returns, 1.0e-5, 1.0e-6)) {
+    std::cerr << "torch gae mismatch\n";
+    std::cerr << "actual adv: " << gae_adv << "\nexpected adv: " << expected_gae_adv << "\n";
+    return 1;
+  }
+
   torch::Tensor rewards = torch::tensor({{1.0f, 0.0f},
                                          {3.0f, 0.0f},
                                          {5.0f, 0.0f},

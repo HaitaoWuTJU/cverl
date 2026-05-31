@@ -86,20 +86,18 @@ torch::Tensor gae_advantage_return(
   int64_t rows = token_level_rewards.size(0);
   int64_t cols = token_level_rewards.size(1);
   torch::Tensor advantages = torch::empty_like(token_level_rewards);
+  torch::Tensor next_value = torch::zeros({rows}, token_level_rewards.options());
+  torch::Tensor last_gae_lam = torch::zeros({rows}, token_level_rewards.options());
 
-  for (int64_t r = 0; r < rows; ++r) {
-    torch::Tensor next_value = torch::zeros({}, token_level_rewards.options());
-    torch::Tensor last_gae_lam = torch::zeros({}, token_level_rewards.options());
-    for (int64_t c = cols - 1; c >= 0; --c) {
-      torch::Tensor reward = token_level_rewards.index({r, c});
-      torch::Tensor value = values.index({r, c});
-      torch::Tensor mask = response_mask.index({r, c});
-      torch::Tensor delta = reward + gamma * next_value - value;
-      torch::Tensor candidate = delta + gamma * lam * last_gae_lam;
-      next_value = value * mask + (1.0 - mask) * next_value;
-      last_gae_lam = candidate * mask + (1.0 - mask) * last_gae_lam;
-      advantages.index_put_({r, c}, last_gae_lam);
-    }
+  for (int64_t c = cols - 1; c >= 0; --c) {
+    torch::Tensor reward = token_level_rewards.select(1, c);
+    torch::Tensor value = values.select(1, c);
+    torch::Tensor mask = response_mask.select(1, c);
+    torch::Tensor delta = reward + gamma * next_value - value;
+    torch::Tensor candidate = delta + gamma * lam * last_gae_lam;
+    next_value = value * mask + (1.0 - mask) * next_value;
+    last_gae_lam = candidate * mask + (1.0 - mask) * last_gae_lam;
+    advantages.select(1, c).copy_(last_gae_lam);
   }
 
   if (returns != nullptr) {
