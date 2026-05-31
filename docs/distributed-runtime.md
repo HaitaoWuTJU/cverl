@@ -61,6 +61,15 @@ Expected collectives by parallel axis:
 tests use `SingleProcessCollectives`; CUDA/NCCL builds can enable
 `NcclCollectives` with `-DCVERL_ENABLE_NCCL=ON`.
 
+`NcclCollectives` supports two completion modes. The default constructor mode
+keeps legacy smoke tests simple by synchronizing the host after every
+collective. The production PP/TP PPO trainer passes
+`--nccl-sync-after-collective false` by default: NCCL work is ordered on a
+dedicated non-blocking stream, returned tensors are made visible to the current
+CUDA stream with events, and temporary inputs are kept alive until completion.
+Explicit barriers, checkpoint boundaries, and communicator destruction still
+call `synchronize()`.
+
 ## Current TP/DP Implementation
 
 The first sharding layer is implemented in
@@ -173,5 +182,5 @@ Current code exposes the distributed shape directly:
   base for CP attention.
 
 The next efficiency step is replacing CP all-gather with a ring-attention
-kernel and replacing PP blocking send/recv with stream-aware batched
-send/recv in `NcclCollectives`.
+kernel and grouping PP send/recv plus TP/DP collectives into larger scheduled
+communication batches.

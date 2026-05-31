@@ -9,6 +9,7 @@
 #include <iterator>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 #include <unistd.h>
 
 namespace cverl::distributed {
@@ -135,8 +136,15 @@ NcclUniqueIdBytes read_nccl_unique_id_file(const std::string& path) {
   return out;
 }
 
-NcclCollectives::NcclCollectives(int64_t rank, int64_t world_size, int device_index, const NcclUniqueIdBytes& unique_id)
-    : rank_(rank), world_size_(world_size), device_index_(device_index) {
+NcclCollectives::NcclCollectives(int64_t rank,
+                                 int64_t world_size,
+                                 int device_index,
+                                 const NcclUniqueIdBytes& unique_id,
+                                 bool synchronize_after_collective)
+    : rank_(rank),
+      world_size_(world_size),
+      device_index_(device_index),
+      synchronize_after_collective_(synchronize_after_collective) {
   if (rank < 0 || rank >= world_size || world_size <= 0) {
     throw std::invalid_argument("invalid NCCL rank/world_size");
   }
@@ -147,12 +155,69 @@ NcclCollectives::NcclCollectives(int64_t rank, int64_t world_size, int device_in
 }
 
 NcclCollectives::~NcclCollectives() {
+  if (stream_ != nullptr) {
+    (void)cudaStreamSynchronize(stream_);
+  }
+  for (auto& op : pending_ops_) {
+    if (op.done != nullptr) {
+      (void)cudaEventDestroy(op.done);
+    }
+  }
+  pending_ops_.clear();
   if (comm_ != nullptr) {
     (void)ncclCommDestroy(comm_);
   }
   if (stream_ != nullptr) {
     (void)cudaStreamDestroy(stream_);
   }
+}
+
+void NcclCollectives::synchronize() {
+  if (stream_ != nullptr) {
+    check_cuda(cudaStreamSynchronize(stream_), "cudaStreamSynchronize");
+  }
+  for (auto& op : pending_ops_) {
+    if (op.done != nullptr) {
+      check_cuda(cudaEventDestroy(op.done), "cudaEventDestroy pending NCCL op");
+    }
+  }
+  pending_ops_.clear();
+}
+
+void NcclCollectives::finish_nccl_op(std::vector<torch::Tensor> keep_alive) {
+  if (synchronize_after_collective_) {
+    synchronize();
+    return;
+  }
+
+  collect_finished_pending_ops();
+  cudaEvent_t done = nullptr;
+  check_cuda(cudaEventCreateWithFlags(&done, cudaEventDisableTiming), "cudaEventCreateWithFlags pending NCCL op");
+  check_cuda(cudaEventRecord(done, stream_), "cudaEventRecord pending NCCL op");
+  pending_ops_.push_back(PendingOp{done, std::move(keep_alive)});
+
+  auto current_stream = at::cuda::getCurrentCUDAStream(device_index_).stream();
+  check_cuda(cudaStreamWaitEvent(current_stream, done, 0), "cudaStreamWaitEvent pending NCCL op");
+}
+
+void NcclCollectives::collect_finished_pending_ops() {
+  size_t write = 0;
+  for (size_t read = 0; read < pending_ops_.size(); ++read) {
+    auto& op = pending_ops_[read];
+    const auto status = cudaEventQuery(op.done);
+    if (status == cudaSuccess) {
+      check_cuda(cudaEventDestroy(op.done), "cudaEventDestroy pending NCCL op");
+      continue;
+    }
+    if (status != cudaErrorNotReady) {
+      check_cuda(status, "cudaEventQuery pending NCCL op");
+    }
+    if (write != read) {
+      pending_ops_[write] = std::move(op);
+    }
+    ++write;
+  }
+  pending_ops_.resize(write);
 }
 
 void NcclCollectives::barrier() {
@@ -163,6 +228,7 @@ void NcclCollectives::barrier() {
     group.push_back(i);
   }
   (void)all_reduce(token, ReduceOp::Sum, group);
+  synchronize();
 }
 
 torch::Tensor NcclCollectives::broadcast(const torch::Tensor& input,
@@ -181,7 +247,7 @@ torch::Tensor NcclCollectives::broadcast(const torch::Tensor& input,
   check_nccl(ncclBroadcast(send_recv, out.data_ptr(), input.numel(), nccl_dtype(input.scalar_type()),
                            static_cast<int>(root), comm_, stream_),
              "ncclBroadcast");
-  check_cuda(cudaStreamSynchronize(stream_), "cudaStreamSynchronize");
+  finish_nccl_op({input, out});
   if (rank_ == root) {
     out.copy_(input);
   }
@@ -196,7 +262,7 @@ torch::Tensor NcclCollectives::all_reduce(const torch::Tensor& input, ReduceOp o
   check_nccl(ncclAllReduce(input.data_ptr(), out.data_ptr(), input.numel(), nccl_dtype(input.scalar_type()),
                            nccl_reduce_op(op), comm_, stream_),
              "ncclAllReduce");
-  check_cuda(cudaStreamSynchronize(stream_), "cudaStreamSynchronize");
+  finish_nccl_op({input, out});
   if (op == ReduceOp::Mean) {
     out.div_(static_cast<double>(group.size()));
   }
@@ -215,7 +281,7 @@ torch::Tensor NcclCollectives::all_gather(const torch::Tensor& input, const std:
   wait_current_stream_before_nccl(stream_, device_index_);
   check_nccl(ncclAllGather(input.data_ptr(), out.data_ptr(), input.numel(), nccl_dtype(input.scalar_type()), comm_, stream_),
              "ncclAllGather");
-  check_cuda(cudaStreamSynchronize(stream_), "cudaStreamSynchronize");
+  finish_nccl_op({input, out});
   return out;
 }
 
@@ -235,7 +301,7 @@ torch::Tensor NcclCollectives::reduce_scatter(const torch::Tensor& input,
   check_nccl(ncclReduceScatter(input.data_ptr(), out.data_ptr(), out.numel(), nccl_dtype(input.scalar_type()),
                                nccl_reduce_op(op), comm_, stream_),
              "ncclReduceScatter");
-  check_cuda(cudaStreamSynchronize(stream_), "cudaStreamSynchronize");
+  finish_nccl_op({input, out});
   if (op == ReduceOp::Mean) {
     out.div_(static_cast<double>(group.size()));
   }
@@ -247,7 +313,7 @@ void NcclCollectives::send(const torch::Tensor& input, int64_t peer) {
   wait_current_stream_before_nccl(stream_, device_index_);
   check_nccl(ncclSend(input.data_ptr(), input.numel(), nccl_dtype(input.scalar_type()), static_cast<int>(peer), comm_, stream_),
              "ncclSend");
-  check_cuda(cudaStreamSynchronize(stream_), "cudaStreamSynchronize");
+  finish_nccl_op({input});
 }
 
 torch::Tensor NcclCollectives::recv_like(const torch::Tensor& like, int64_t peer) {
@@ -255,7 +321,7 @@ torch::Tensor NcclCollectives::recv_like(const torch::Tensor& like, int64_t peer
   auto out = torch::empty_like(like);
   check_nccl(ncclRecv(out.data_ptr(), out.numel(), nccl_dtype(out.scalar_type()), static_cast<int>(peer), comm_, stream_),
              "ncclRecv");
-  check_cuda(cudaStreamSynchronize(stream_), "cudaStreamSynchronize");
+  finish_nccl_op({out});
   return out;
 }
 

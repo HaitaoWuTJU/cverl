@@ -1,6 +1,7 @@
 #include "cverl/model/qwen3_5_text.h"
 #include "cverl/model/qwen_linear_attention_cuda.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -214,11 +215,26 @@ CudaLinearAttentionStateMode cuda_linear_attention_state_mode() {
   return CudaLinearAttentionStateMode::Chunk;
 }
 
-int64_t cuda_linear_attention_checkpoint_interval() {
+int64_t cuda_linear_attention_checkpoint_interval(const torch::Tensor& query, int64_t kd, int64_t vd) {
   const char* env = std::getenv("CVERL_LINEAR_ATTN_CHECKPOINT_INTERVAL");
   int64_t value = (env == nullptr || *env == '\0') ? linear_attention_chunk_size() : std::stoll(env);
   if (value <= 0) {
     throw std::invalid_argument("CVERL_LINEAR_ATTN_CHECKPOINT_INTERVAL must be positive");
+  }
+  const char* budget_env = std::getenv("CVERL_LINEAR_ATTN_CHECKPOINT_MAX_BYTES_MB");
+  if (budget_env != nullptr && *budget_env != '\0') {
+    const int64_t budget_mb = std::stoll(budget_env);
+    if (budget_mb <= 0) {
+      throw std::invalid_argument("CVERL_LINEAR_ATTN_CHECKPOINT_MAX_BYTES_MB must be positive");
+    }
+    const int64_t bytes_budget = budget_mb * 1024LL * 1024LL;
+    const int64_t bytes_per_checkpoint = query.size(0) * query.size(1) * kd * vd * query.element_size();
+    if (bytes_per_checkpoint > 0) {
+      const int64_t max_checkpoints = std::max<int64_t>(1, bytes_budget / bytes_per_checkpoint);
+      const int64_t seq = query.size(2);
+      const int64_t budget_interval = std::max<int64_t>(1, (seq + max_checkpoints - 1) / max_checkpoints);
+      value = std::max(value, budget_interval);
+    }
   }
   return value;
 }
@@ -234,7 +250,9 @@ class QwenLinearAttentionCudaFunction
                                torch::Tensor g) {
     const auto state_mode = cuda_linear_attention_state_mode();
     const int64_t checkpoint_interval =
-        state_mode == CudaLinearAttentionStateMode::Chunk ? cuda_linear_attention_checkpoint_interval() : 0;
+        state_mode == CudaLinearAttentionStateMode::Chunk
+            ? cuda_linear_attention_checkpoint_interval(query, query.size(3), value.size(3))
+            : 0;
     std::tuple<torch::Tensor, torch::Tensor> result;
     if (state_mode == CudaLinearAttentionStateMode::Chunk) {
       result = qwen_linear_attention_cuda_forward_checkpointed(

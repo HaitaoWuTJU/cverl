@@ -1405,6 +1405,7 @@ int main(int argc, char** argv) {
     const bool skip_optimizer_step = arg_bool(argc, argv, "--skip-optimizer-step", false);
     const bool measure_param_delta = arg_bool(argc, argv, "--measure-param-delta", false);
     const bool vary_tokens_by_step = arg_bool(argc, argv, "--vary-tokens-by-step", false);
+    const bool nccl_sync_after_collective = arg_bool(argc, argv, "--nccl-sync-after-collective", false);
     const std::string jsonl_input = arg_str(argc, argv, "--jsonl-input", "");
     const std::string rollout_json = arg_str(argc, argv, "--rollout-json", "");
     const std::string rollout_dir = arg_str(argc, argv, "--rollout-dir", "");
@@ -1489,13 +1490,16 @@ int main(int argc, char** argv) {
     auto tp_id = cverl::distributed::read_nccl_unique_id_file(tp_id_path);
     auto dp_id = cverl::distributed::read_nccl_unique_id_file(dp_id_path);
     auto model_id = cverl::distributed::read_nccl_unique_id_file(model_id_path);
-    cverl::distributed::NcclCollectives full_comm(global_rank, world_size, static_cast<int>(device_idx), full_id);
-    cverl::distributed::NcclCollectives tp_comm(info.tensor_rank, tp_size, static_cast<int>(device_idx), tp_id);
-    cverl::distributed::NcclCollectives dp_comm(info.data_rank, dp_size, static_cast<int>(device_idx), dp_id);
+    cverl::distributed::NcclCollectives full_comm(
+        global_rank, world_size, static_cast<int>(device_idx), full_id, nccl_sync_after_collective);
+    cverl::distributed::NcclCollectives tp_comm(
+        info.tensor_rank, tp_size, static_cast<int>(device_idx), tp_id, nccl_sync_after_collective);
+    cverl::distributed::NcclCollectives dp_comm(
+        info.data_rank, dp_size, static_cast<int>(device_idx), dp_id, nccl_sync_after_collective);
     const int64_t model_parallel_size = pp_size * tp_size;
     const int64_t model_parallel_rank = info.pipeline_rank * tp_size + info.tensor_rank;
     cverl::distributed::NcclCollectives model_comm(
-        model_parallel_rank, model_parallel_size, static_cast<int>(device_idx), model_id);
+        model_parallel_rank, model_parallel_size, static_cast<int>(device_idx), model_id, nccl_sync_after_collective);
     cverl::distributed::ParallelGroup tp_group{info.tensor_rank, tp_size, full_group(tp_size), &tp_comm};
     cverl::distributed::ParallelGroup dp_group{info.data_rank, dp_size, full_group(dp_size), &dp_comm};
     std::unique_ptr<cverl::distributed::NcclCollectives> rollout_data_comm;
@@ -1509,7 +1513,11 @@ int main(int argc, char** argv) {
       }
       auto rollout_id = cverl::distributed::read_nccl_unique_id_file(rollout_nccl_id_file);
       rollout_data_comm = std::make_unique<cverl::distributed::NcclCollectives>(
-          rollout_data_rank, rollout_nccl_world_size, static_cast<int>(device_idx), rollout_id);
+          rollout_data_rank,
+          rollout_nccl_world_size,
+          static_cast<int>(device_idx),
+          rollout_id,
+          nccl_sync_after_collective);
     }
 
     cverl::HfModelLoader loader(model_dir);
@@ -1966,6 +1974,7 @@ int main(int argc, char** argv) {
                   << " skip_optimizer_step=" << (skip_optimizer_step ? "true" : "false")
                   << " measure_param_delta=" << (measure_param_delta ? "true" : "false")
                   << " vary_tokens_by_step=" << (vary_tokens_by_step ? "true" : "false")
+                  << " nccl_sync_after_collective=" << (nccl_sync_after_collective ? "true" : "false")
                   << " jsonl_examples=" << jsonl_batches.size()
                   << " rollout_rows=" << (active_rollout != nullptr ? active_rollout->rows : 0)
                   << " kl_coef=" << kl_coef

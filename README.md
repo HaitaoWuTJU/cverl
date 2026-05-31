@@ -346,7 +346,8 @@ CVERL_LINEAR_ATTN_BACKEND=cuda      # cuda|auto|chunked|eager
 CVERL_LINEAR_ATTN_VALUE_TILE=32     # forward tile over vd; lower values reduce shared memory
 CVERL_LINEAR_ATTN_STATE_MODE=chunk  # none|recompute|full|chunk|checkpoint
 CVERL_LINEAR_ATTN_CHECKPOINT_INTERVAL=16
-CVERL_LINEAR_ATTN_SAVE_STATES=0     # default: recompute backward to reduce activation memory
+CVERL_LINEAR_ATTN_CHECKPOINT_MAX_BYTES_MB=256  # optional per-layer checkpoint budget
+CVERL_LINEAR_ATTN_SAVE_STATES=0     # default: chunk checkpoints to reduce activation memory
 CVERL_LINEAR_ATTN_SAVE_STATES=1     # debug/comparison: save every recurrent state
 ```
 

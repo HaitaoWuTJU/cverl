@@ -21,7 +21,11 @@ NcclUniqueIdBytes read_nccl_unique_id_file(const std::string& path);
 
 class NcclCollectives final : public Collectives {
  public:
-  NcclCollectives(int64_t rank, int64_t world_size, int device_index, const NcclUniqueIdBytes& unique_id);
+  NcclCollectives(int64_t rank,
+                  int64_t world_size,
+                  int device_index,
+                  const NcclUniqueIdBytes& unique_id,
+                  bool synchronize_after_collective = true);
   ~NcclCollectives() override;
 
   NcclCollectives(const NcclCollectives&) = delete;
@@ -31,6 +35,9 @@ class NcclCollectives final : public Collectives {
 
   int64_t rank() const override { return rank_; }
   int64_t world_size() const override { return world_size_; }
+  bool synchronize_after_collective() const { return synchronize_after_collective_; }
+  void set_synchronize_after_collective(bool value) { synchronize_after_collective_ = value; }
+  void synchronize();
   void barrier() override;
   torch::Tensor broadcast(const torch::Tensor& input, int64_t root, const std::vector<int64_t>& group) override;
   torch::Tensor all_reduce(const torch::Tensor& input, ReduceOp op, const std::vector<int64_t>& group) override;
@@ -40,11 +47,21 @@ class NcclCollectives final : public Collectives {
   torch::Tensor recv_like(const torch::Tensor& like, int64_t peer) override;
 
  private:
+  struct PendingOp {
+    cudaEvent_t done = nullptr;
+    std::vector<torch::Tensor> keep_alive;
+  };
+
   int64_t rank_;
   int64_t world_size_;
   int device_index_;
   ncclComm_t comm_ = nullptr;
   cudaStream_t stream_ = nullptr;
+  bool synchronize_after_collective_ = true;
+  std::vector<PendingOp> pending_ops_;
+
+  void finish_nccl_op(std::vector<torch::Tensor> keep_alive);
+  void collect_finished_pending_ops();
 };
 
 }  // namespace cverl::distributed
