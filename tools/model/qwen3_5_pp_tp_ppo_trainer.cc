@@ -344,6 +344,31 @@ std::string rollout_ipc_path_for_step(const std::string& rollout_ipc_json,
   return (std::filesystem::path(rollout_ipc_dir) / name).string();
 }
 
+std::string checkpoint_step_name(int64_t step) {
+  std::ostringstream step_name;
+  step_name << "step_" << std::setw(6) << std::setfill('0') << (step + 1);
+  return step_name.str();
+}
+
+void write_text_atomic(const std::filesystem::path& path, const std::string& text) {
+  const auto tmp = path.string() + ".tmp";
+  {
+    std::ofstream out(tmp, std::ios::trunc);
+    if (!out) {
+      throw std::runtime_error("failed to open temp file for write: " + tmp);
+    }
+    out << text;
+    if (!out) {
+      throw std::runtime_error("failed to write temp file: " + tmp);
+    }
+  }
+  std::filesystem::rename(tmp, path);
+}
+
+void write_json_atomic(const std::filesystem::path& path, const nlohmann::json& doc) {
+  write_text_atomic(path, doc.dump(2) + "\n");
+}
+
 void save_rank_checkpoint(const std::string& checkpoint_dir,
                           int64_t step,
                           int64_t global_rank,
@@ -363,9 +388,7 @@ void save_rank_checkpoint(const std::string& checkpoint_dir,
   if (param_names.size() != params.size()) {
     throw std::runtime_error("checkpoint parameter name/param size mismatch");
   }
-  std::ostringstream step_name;
-  step_name << "step_" << std::setw(6) << std::setfill('0') << (step + 1);
-  const auto step_dir = std::filesystem::path(checkpoint_dir) / step_name.str();
+  const auto step_dir = std::filesystem::path(checkpoint_dir) / checkpoint_step_name(step);
   std::filesystem::create_directories(step_dir);
 
   const bool use_master_weights = optimizer.uses_master_weights();
@@ -383,7 +406,10 @@ void save_rank_checkpoint(const std::string& checkpoint_dir,
 
   const std::string rank_file = "rank_" + std::to_string(global_rank) + ".pt";
   const std::string rank_meta_file = "rank_" + std::to_string(global_rank) + ".json";
-  archive.save_to((step_dir / rank_file).string());
+  const auto rank_path = step_dir / rank_file;
+  const auto rank_tmp_path = step_dir / (rank_file + ".tmp");
+  archive.save_to(rank_tmp_path.string());
+  std::filesystem::rename(rank_tmp_path, rank_path);
 
   nlohmann::json rank_meta;
   rank_meta["global_rank"] = global_rank;
@@ -406,43 +432,57 @@ void save_rank_checkpoint(const std::string& checkpoint_dir,
     item["optimizer_exp_avg_sq_key"] = "optim_exp_avg_sq_" + std::to_string(i);
     rank_meta["parameters"].push_back(std::move(item));
   }
-  {
-    std::ofstream out(step_dir / rank_meta_file);
-    out << rank_meta.dump(2) << "\n";
-  }
+  write_json_atomic(step_dir / rank_meta_file, rank_meta);
+}
 
-  if (global_rank == 0) {
-    nlohmann::json manifest;
-    manifest["step"] = step + 1;
-    manifest["format"] = "cverl_pp_tp_rank_local_checkpoint_v2";
-    manifest["use_master_weights"] = use_master_weights;
-    manifest["world_size"] = world_size;
-    manifest["pipeline_parallel"] = pp_size;
-    manifest["tensor_parallel"] = tp_size;
-    manifest["optimizer"] = {
-        {"type", "Fp32MasterAdamW"},
-        {"lr", optimizer.options().lr},
-        {"beta1", optimizer.options().beta1},
-        {"beta2", optimizer.options().beta2},
-        {"eps", optimizer.options().eps},
-        {"weight_decay", optimizer.options().weight_decay},
-        {"step", optimizer.step_count()},
-    };
-    manifest["rank_files"] = nlohmann::json::array();
-    for (int64_t rank = 0; rank < world_size; ++rank) {
-      const int64_t tp = rank % tp_size;
-      const int64_t pp = (rank / tp_size) % pp_size;
-      manifest["rank_files"].push_back({
-          {"global_rank", rank},
-          {"pipeline_rank", pp},
-          {"tensor_rank", tp},
-          {"param_file", "rank_" + std::to_string(rank) + ".pt"},
-          {"metadata_file", "rank_" + std::to_string(rank) + ".json"},
-      });
-    }
-    std::ofstream out(step_dir / "manifest.json");
-    out << manifest.dump(2) << "\n";
+void write_checkpoint_manifest(const std::string& checkpoint_dir,
+                               int64_t step,
+                               int64_t world_size,
+                               int64_t pp_size,
+                               int64_t tp_size,
+                               const cverl::torch_backend::Fp32MasterAdamW& optimizer) {
+  if (checkpoint_dir.empty()) {
+    return;
   }
+  const auto step_dir = std::filesystem::path(checkpoint_dir) / checkpoint_step_name(step);
+  nlohmann::json manifest;
+  manifest["step"] = step + 1;
+  manifest["format"] = "cverl_pp_tp_rank_local_checkpoint_v2";
+  manifest["complete"] = true;
+  manifest["use_master_weights"] = optimizer.uses_master_weights();
+  manifest["world_size"] = world_size;
+  manifest["pipeline_parallel"] = pp_size;
+  manifest["tensor_parallel"] = tp_size;
+  manifest["optimizer"] = {
+      {"type", "Fp32MasterAdamW"},
+      {"lr", optimizer.options().lr},
+      {"beta1", optimizer.options().beta1},
+      {"beta2", optimizer.options().beta2},
+      {"eps", optimizer.options().eps},
+      {"weight_decay", optimizer.options().weight_decay},
+      {"step", optimizer.step_count()},
+  };
+  manifest["rank_files"] = nlohmann::json::array();
+  for (int64_t rank = 0; rank < world_size; ++rank) {
+    const int64_t tp = rank % tp_size;
+    const int64_t pp = (rank / tp_size) % pp_size;
+    const std::string param_file = "rank_" + std::to_string(rank) + ".pt";
+    const std::string metadata_file = "rank_" + std::to_string(rank) + ".json";
+    if (!std::filesystem::exists(step_dir / param_file) ||
+        !std::filesystem::exists(step_dir / metadata_file)) {
+      throw std::runtime_error("checkpoint is incomplete before manifest write");
+    }
+    manifest["rank_files"].push_back({
+        {"global_rank", rank},
+        {"pipeline_rank", pp},
+        {"tensor_rank", tp},
+        {"param_file", param_file},
+        {"metadata_file", metadata_file},
+    });
+  }
+  write_json_atomic(step_dir / "manifest.json", manifest);
+  write_text_atomic(std::filesystem::path(checkpoint_dir) / "latest_checkpoint.txt",
+                    checkpoint_step_name(step) + "\n");
 }
 
 int64_t load_rank_checkpoint(const std::string& checkpoint_path,
@@ -455,7 +495,17 @@ int64_t load_rank_checkpoint(const std::string& checkpoint_path,
   if (checkpoint_path.empty()) {
     return 0;
   }
-  const auto step_dir = std::filesystem::path(checkpoint_path);
+  auto step_dir = std::filesystem::path(checkpoint_path);
+  if (!std::filesystem::exists(step_dir / ("rank_" + std::to_string(global_rank) + ".json")) &&
+      std::filesystem::exists(step_dir / "latest_checkpoint.txt")) {
+    std::ifstream latest_in(step_dir / "latest_checkpoint.txt");
+    std::string latest_step;
+    latest_in >> latest_step;
+    if (latest_step.empty()) {
+      throw std::runtime_error("resume checkpoint latest_checkpoint.txt is empty");
+    }
+    step_dir /= latest_step;
+  }
   const auto rank_meta_path = step_dir / ("rank_" + std::to_string(global_rank) + ".json");
   const auto manifest_path = step_dir / "manifest.json";
   if (!std::filesystem::exists(rank_meta_path)) {
@@ -494,6 +544,9 @@ int64_t load_rank_checkpoint(const std::string& checkpoint_path,
     in >> manifest;
     if (manifest.value("format", std::string{}) != "cverl_pp_tp_rank_local_checkpoint_v2") {
       throw std::runtime_error("unsupported resume checkpoint format");
+    }
+    if (!manifest.value("complete", false)) {
+      throw std::runtime_error("resume checkpoint manifest is not marked complete");
     }
     manifest_step = manifest.at("optimizer").at("step").get<int64_t>();
   }
@@ -1180,6 +1233,11 @@ int main(int argc, char** argv) {
                              param_names,
                              params,
                              optimizer);
+        full_comm.barrier();
+        if (global_rank == 0) {
+          write_checkpoint_manifest(checkpoint_dir, step, world_size, pp_size, tp_size, optimizer);
+        }
+        full_comm.barrier();
       }
 
       auto grad_tensor = torch::tensor({local_grad_norm}, torch::TensorOptions().device(device).dtype(torch::kFloat32));
