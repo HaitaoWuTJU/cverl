@@ -117,6 +117,36 @@ void Fp32MasterAdamW::step() {
   }
 }
 
+double Fp32MasterAdamW::grad_l2_norm_sq() const {
+  double out = 0.0;
+  for (size_t i = 0; i < model_parameters_.size(); ++i) {
+    torch::Tensor grad;
+    if (has_main_grad_[i]) {
+      grad = main_grad_[i];
+    } else if (model_parameters_[i].grad().defined()) {
+      grad = model_parameters_[i].grad().detach().to(torch::kFloat32);
+    } else {
+      continue;
+    }
+    out += grad.pow(2).sum().item<double>();
+  }
+  return out;
+}
+
+void Fp32MasterAdamW::scale_gradients(double scale) {
+  if (!std::isfinite(scale) || scale < 0.0) {
+    throw std::invalid_argument("Fp32MasterAdamW::scale_gradients: invalid scale");
+  }
+  torch::NoGradGuard no_grad;
+  for (size_t i = 0; i < model_parameters_.size(); ++i) {
+    if (has_main_grad_[i]) {
+      main_grad_[i].mul_(scale);
+    } else if (model_parameters_[i].grad().defined()) {
+      model_parameters_[i].mutable_grad().mul_(scale);
+    }
+  }
+}
+
 void Fp32MasterAdamW::load_state(const std::vector<torch::Tensor>& parameter_values,
                                  const std::vector<torch::Tensor>& exp_avg,
                                  const std::vector<torch::Tensor>& exp_avg_sq,

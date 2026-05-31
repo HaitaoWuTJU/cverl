@@ -597,6 +597,8 @@ void append_metrics_csv(const std::string& path,
                         double total_kl,
                         double total_clipfrac,
                         double total_grad_norm,
+                        double global_grad_norm,
+                        double grad_clip_scale,
                         double total_param_delta) {
   if (path.empty()) {
     return;
@@ -610,7 +612,7 @@ void append_metrics_csv(const std::string& path,
   if (write_header) {
     out << "step,pp,tp,micro_batches,layers,prompt_len,response_len,rollout_rows,"
         << "mean_reward,success_rate,adv_abs_sum,loss_sum,ppo_kl_sum,clipfrac_sum,"
-        << "grad_norm_sum,param_delta_sum\n";
+        << "grad_norm_sum,global_grad_norm,grad_clip_scale,param_delta_sum\n";
   }
   out << step << ","
       << pp_size << ","
@@ -627,6 +629,8 @@ void append_metrics_csv(const std::string& path,
       << total_kl << ","
       << total_clipfrac << ","
       << total_grad_norm << ","
+      << global_grad_norm << ","
+      << grad_clip_scale << ","
       << total_param_delta << "\n";
 }
 
@@ -962,6 +966,7 @@ int main(int argc, char** argv) {
     const int64_t steps = arg_i64(argc, argv, "--steps", 1);
     const double lr = arg_f64(argc, argv, "--lr", 1.0e-8);
     const double clip_ratio = arg_f64(argc, argv, "--clip-ratio", 0.2);
+    const double max_grad_norm = arg_f64(argc, argv, "--max-grad-norm", 1.0);
     const double advantage_scale = arg_f64(argc, argv, "--advantage-scale", 1.0);
     const bool use_master_weights = arg_bool(argc, argv, "--master-weights", false);
     const bool skip_optimizer_step = arg_bool(argc, argv, "--skip-optimizer-step", false);
@@ -988,7 +993,7 @@ int main(int argc, char** argv) {
     if (pp_size <= 0 || tp_size <= 0 || micro_batches <= 0 || steps <= 0) {
       throw std::invalid_argument("pp-size, tp-size, micro-batches, and steps must be positive");
     }
-    if (prompt_len <= 0 || response_len <= 0) {
+    if (prompt_len <= 0 || response_len <= 0 || max_grad_norm < 0.0) {
       throw std::invalid_argument("prompt-len and response-len must be positive");
     }
 
@@ -1209,6 +1214,18 @@ int main(int argc, char** argv) {
       }
 
       sync_tp_replicated_gradients(param_names, params, tp_group);
+      const double local_grad_norm_sq = optimizer.grad_l2_norm_sq();
+      auto grad_sq_tensor =
+          torch::tensor({local_grad_norm_sq}, torch::TensorOptions().device(device).dtype(torch::kFloat32));
+      auto global_grad_sq_tensor =
+          full_comm.all_reduce(grad_sq_tensor.contiguous(), cverl::distributed::ReduceOp::Sum, full_ranks);
+      const double global_grad_norm =
+          std::sqrt(static_cast<double>(global_grad_sq_tensor.cpu()[0].item<float>()));
+      double grad_clip_scale = 1.0;
+      if (max_grad_norm > 0.0 && std::isfinite(global_grad_norm) && global_grad_norm > max_grad_norm) {
+        grad_clip_scale = max_grad_norm / (global_grad_norm + 1.0e-6);
+        optimizer.scale_gradients(grad_clip_scale);
+      }
       const double local_grad_norm = optimizer.grad_norm_sum();
       if (!skip_optimizer_step) {
         optimizer.step();
@@ -1245,11 +1262,17 @@ int main(int argc, char** argv) {
       auto loss_tensor = torch::tensor({loss_sum}, torch::TensorOptions().device(device).dtype(torch::kFloat32));
       auto kl_tensor = torch::tensor({kl_sum}, torch::TensorOptions().device(device).dtype(torch::kFloat32));
       auto clip_tensor = torch::tensor({clipfrac_sum}, torch::TensorOptions().device(device).dtype(torch::kFloat32));
+      auto global_grad_tensor =
+          torch::tensor({global_grad_norm}, torch::TensorOptions().device(device).dtype(torch::kFloat32));
+      auto grad_clip_tensor =
+          torch::tensor({grad_clip_scale}, torch::TensorOptions().device(device).dtype(torch::kFloat32));
       auto grad_norms = full_comm.all_gather(grad_tensor.contiguous(), full_ranks, 0).cpu();
       auto param_deltas = full_comm.all_gather(delta_tensor.contiguous(), full_ranks, 0).cpu();
       auto loss_sums = full_comm.all_gather(loss_tensor.contiguous(), full_ranks, 0).cpu();
       auto kl_sums = full_comm.all_gather(kl_tensor.contiguous(), full_ranks, 0).cpu();
       auto clip_sums = full_comm.all_gather(clip_tensor.contiguous(), full_ranks, 0).cpu();
+      auto global_grad_norms = full_comm.all_gather(global_grad_tensor.contiguous(), full_ranks, 0).cpu();
+      auto grad_clip_scales = full_comm.all_gather(grad_clip_tensor.contiguous(), full_ranks, 0).cpu();
       full_comm.barrier();
 
       if (global_rank == 0) {
@@ -1261,6 +1284,8 @@ int main(int argc, char** argv) {
         double total_clipfrac = 0.0;
         double total_grad_norm = 0.0;
         double total_param_delta = 0.0;
+        double reported_global_grad_norm = 0.0;
+        double reported_grad_clip_scale = 1.0;
         for (int64_t i = 0; i < grad_norms.numel(); ++i) {
           const double grad_value = grad_norms[i].item<double>();
           const double delta_value = param_deltas[i].item<double>();
@@ -1272,6 +1297,10 @@ int main(int argc, char** argv) {
           total_loss += loss_sums[i].item<double>();
           total_kl += kl_sums[i].item<double>();
           total_clipfrac += clip_sums[i].item<double>();
+          if (i == 0) {
+            reported_global_grad_norm = global_grad_norms[i].item<double>();
+            reported_grad_clip_scale = grad_clip_scales[i].item<double>();
+          }
         }
         append_metrics_csv(metrics_csv,
                            step,
@@ -1289,6 +1318,8 @@ int main(int argc, char** argv) {
                            total_kl,
                            total_clipfrac,
                            total_grad_norm,
+                           reported_global_grad_norm,
+                           reported_grad_clip_scale,
                            total_param_delta);
         std::cout << "step=" << step
                   << " pp=" << pp_size
@@ -1310,6 +1341,8 @@ int main(int argc, char** argv) {
                   << " ppo_kl_sum=" << total_kl
                   << " clipfrac_sum=" << total_clipfrac
                   << " grad_norm_sum=" << total_grad_norm
+                  << " global_grad_norm=" << reported_global_grad_norm
+                  << " grad_clip_scale=" << reported_grad_clip_scale
                   << " param_delta_sum=" << total_param_delta
                   << " all_ranks_have_grad=" << (all_have_grad ? "true" : "false")
                   << " all_ranks_updated=" << (all_updated ? "true" : "false")

@@ -23,6 +23,8 @@ class Fp32MasterAdamW {
   void zero_grad();
   void accumulate_model_grads(double scale = 1.0);
   void step();
+  double grad_l2_norm_sq() const;
+  void scale_gradients(double scale);
   void load_state(const std::vector<torch::Tensor>& parameter_values,
                   const std::vector<torch::Tensor>& exp_avg,
                   const std::vector<torch::Tensor>& exp_avg_sq,

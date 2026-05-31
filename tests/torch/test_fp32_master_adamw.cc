@@ -34,6 +34,14 @@ int main() {
     auto master_before = cverl::torch_backend::clone_detached(optimizer.master_parameters());
     p.mutable_grad() = torch::full_like(p, 1.0e-3);
     optimizer.accumulate_model_grads();
+    const double expected_tiny_grad_sq =
+        optimizer.main_grad_parameters()[0].pow(2).sum().item<double>();
+    const double tiny_grad_sq = optimizer.grad_l2_norm_sq();
+    require(std::abs(tiny_grad_sq - expected_tiny_grad_sq) < 1.0e-10, "grad_l2_norm_sq before scaling");
+    optimizer.scale_gradients(0.5);
+    require(std::abs(optimizer.grad_l2_norm_sq() - expected_tiny_grad_sq * 0.25) < 1.0e-10,
+            "grad_l2_norm_sq after scaling");
+    optimizer.scale_gradients(2.0);
     require(optimizer.main_grad_parameters()[0].scalar_type() == torch::kFloat32, "main_grad must be fp32");
     require(p.grad().defined(), "accumulate_model_grads keeps grad tensor allocated");
     require(p.grad().to(torch::kFloat32).abs().sum().item<double>() == 0.0, "accumulate_model_grads clears model gradient");
