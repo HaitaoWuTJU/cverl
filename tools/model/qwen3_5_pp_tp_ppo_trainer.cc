@@ -191,6 +191,19 @@ void scale_model_gradients(const std::vector<torch::Tensor>& params, double scal
   }
 }
 
+void scale_model_gradients(const std::vector<torch::Tensor>& params, const torch::Tensor& scale) {
+  if (!scale.defined() || scale.numel() != 1) {
+    throw std::invalid_argument("scale_model_gradients requires a scalar tensor scale");
+  }
+  torch::NoGradGuard no_grad;
+  for (const auto& p : params) {
+    if (p.defined() && p.grad().defined()) {
+      auto& grad = p.mutable_grad();
+      grad.mul_(scale.to(grad.device(), grad.scalar_type()));
+    }
+  }
+}
+
 void broadcast_dp_sharded_optimizer_parameters(const std::vector<std::string>& param_names,
                                                const std::vector<torch::Tensor>& params,
                                                const std::vector<int64_t>& owner_by_param,
@@ -1831,23 +1844,34 @@ int main(int argc, char** argv) {
                 ? full_comm.all_reduce(grad_sq_tensor.contiguous(), cverl::distributed::ReduceOp::Sum, full_ranks)
                 : model_comm.all_reduce(
                       grad_sq_tensor.contiguous(), cverl::distributed::ReduceOp::Sum, model_parallel_ranks);
+        auto grad_clip_scale_tensor = torch::ones_like(global_grad_sq_tensor);
+        if (max_grad_norm > 0.0) {
+          auto global_grad_norm_tensor = global_grad_sq_tensor.sqrt();
+          auto should_clip =
+              torch::logical_and(torch::isfinite(global_grad_norm_tensor), global_grad_norm_tensor > max_grad_norm);
+          grad_clip_scale_tensor = torch::where(
+              should_clip,
+              torch::full_like(global_grad_norm_tensor, max_grad_norm) / (global_grad_norm_tensor + 1.0e-6),
+              grad_clip_scale_tensor);
+          if (dp_flat_shard_optimizer) {
+            flat_gradient_shard.mul_(grad_clip_scale_tensor);
+          } else if (dp_shard_optimizer) {
+            scale_model_gradients(params, grad_clip_scale_tensor);
+          } else {
+            optimizer.scale_gradients(grad_clip_scale_tensor);
+          }
+        }
         auto grad_metrics =
-            torch::cat({grad_sq_tensor.contiguous(), global_grad_sq_tensor.contiguous(), local_norm_tensor.contiguous()},
+            torch::cat({grad_sq_tensor.contiguous(),
+                        global_grad_sq_tensor.contiguous(),
+                        local_norm_tensor.contiguous(),
+                        grad_clip_scale_tensor.contiguous()},
                        0)
                 .to(torch::kCPU)
                 .contiguous();
         local_grad_norm_sq = static_cast<double>(grad_metrics[0].item<float>());
         global_grad_norm = std::sqrt(static_cast<double>(grad_metrics[1].item<float>()));
-        if (max_grad_norm > 0.0 && std::isfinite(global_grad_norm) && global_grad_norm > max_grad_norm) {
-          grad_clip_scale = max_grad_norm / (global_grad_norm + 1.0e-6);
-          if (dp_flat_shard_optimizer) {
-            flat_gradient_shard.mul_(grad_clip_scale);
-          } else if (dp_shard_optimizer) {
-            scale_model_gradients(params, grad_clip_scale);
-          } else {
-            optimizer.scale_gradients(grad_clip_scale);
-          }
-        }
+        grad_clip_scale = static_cast<double>(grad_metrics[3].item<float>());
         local_grad_norm = static_cast<double>(grad_metrics[2].item<float>()) * grad_clip_scale;
       }
       if (!skip_optimizer_step) {

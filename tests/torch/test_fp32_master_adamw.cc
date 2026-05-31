@@ -58,7 +58,7 @@ int main() {
     optimizer.scale_gradients(0.5);
     require(std::abs(optimizer.grad_l2_norm_sq() - expected_tiny_grad_sq * 0.25) < 1.0e-10,
             "grad_l2_norm_sq after scaling");
-    optimizer.scale_gradients(2.0);
+    optimizer.scale_gradients(torch::tensor({2.0f}, torch::kFloat32));
     require(optimizer.main_grad_parameters()[0].scalar_type() == torch::kFloat32, "main_grad must be fp32");
     require(p.grad().defined(), "accumulate_model_grads keeps grad tensor allocated");
     require(p.grad().to(torch::kFloat32).abs().sum().item<double>() == 0.0, "accumulate_model_grads clears model gradient");

@@ -191,6 +191,21 @@ void Fp32MasterAdamW::scale_gradients(double scale) {
   }
 }
 
+void Fp32MasterAdamW::scale_gradients(const torch::Tensor& scale) {
+  if (!scale.defined() || scale.numel() != 1) {
+    throw std::invalid_argument("Fp32MasterAdamW::scale_gradients: tensor scale must be a defined scalar");
+  }
+  torch::NoGradGuard no_grad;
+  for (size_t i = 0; i < model_parameters_.size(); ++i) {
+    if (has_main_grad_[i]) {
+      main_grad_[i].mul_(scale.to(main_grad_[i].device(), main_grad_[i].scalar_type()));
+    } else if (model_parameters_[i].grad().defined()) {
+      auto& grad = model_parameters_[i].mutable_grad();
+      grad.mul_(scale.to(grad.device(), grad.scalar_type()));
+    }
+  }
+}
+
 void Fp32MasterAdamW::load_state(const std::vector<torch::Tensor>& parameter_values,
                                  const std::vector<torch::Tensor>& exp_avg,
                                  const std::vector<torch::Tensor>& exp_avg_sq,
