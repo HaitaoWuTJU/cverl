@@ -79,6 +79,37 @@ std::string tensor_cache_key(int64_t seq_len, torch::Device device, torch::Scala
   return std::to_string(seq_len) + "|" + device.str() + "|" + c10::toString(dtype);
 }
 
+int64_t normalize_dim_for_tensor(const torch::Tensor& tensor, int64_t dim) {
+  if (dim < 0) {
+    dim += tensor.dim();
+  }
+  if (dim < 0 || dim >= tensor.dim()) {
+    throw std::invalid_argument("tensor dimension out of range");
+  }
+  return dim;
+}
+
+torch::Tensor ring_exchange_rank_order(const torch::Tensor& local,
+                                       const distributed::ParallelGroup& context_group,
+                                       int64_t sequence_dim) {
+  const int64_t dim = normalize_dim_for_tensor(local, sequence_dim);
+  auto ring = distributed::context_parallel_ring_exchange_autograd(
+      local.contiguous(), *context_group.collectives, context_group.ranks, context_group.rank, dim);
+  if (context_group.world_size <= 1) {
+    return ring;
+  }
+  const int64_t shard = local.size(dim);
+  const auto schedule = distributed::context_parallel_ring_schedule(
+      context_group.ranks, context_group.ranks.at(static_cast<size_t>(context_group.rank)));
+  std::vector<torch::Tensor> rank_order(static_cast<size_t>(context_group.world_size));
+  for (int64_t ring_index = 0; ring_index < static_cast<int64_t>(schedule.size()); ++ring_index) {
+    const int64_t rank_index =
+        distributed::context_parallel_group_index(context_group.ranks, schedule[static_cast<size_t>(ring_index)].kv_rank);
+    rank_order[static_cast<size_t>(rank_index)] = ring.narrow(dim, ring_index * shard, shard);
+  }
+  return torch::cat(rank_order, dim).contiguous();
+}
+
 torch::Tensor repeat_kv(const torch::Tensor& x, int64_t n_rep) {
   if (n_rep == 1) {
     return x;
@@ -750,15 +781,57 @@ torch::Tensor Qwen35TextModel::linear_attention_context_parallel(const torch::Te
   if (context_group.collectives == nullptr) {
     throw std::invalid_argument("Qwen3.5 CP linear attention requires collectives");
   }
-  auto gathered =
-      distributed::context_parallel_gather_autograd(x.contiguous(), *context_group.collectives, context_group.ranks, 1);
-  if (gathered.size(1) < original_sequence_length) {
-    throw std::invalid_argument("Qwen3.5 CP gathered linear-attention hidden is shorter than original sequence");
+  std::string p = layer_prefix(layer_idx) + "linear_attn.";
+  int64_t bsz = x.size(0);
+  int64_t seq_local = x.size(1);
+  int64_t kh = config_.linear_num_key_heads;
+  int64_t vh = config_.linear_num_value_heads;
+  int64_t kd = config_.linear_key_head_dim;
+  int64_t vd = config_.linear_value_head_dim;
+  int64_t key_dim = kh * kd;
+  int64_t value_dim = vh * vd;
+  int64_t conv_dim = key_dim * 2 + value_dim;
+
+  auto mixed_local = dense(x, weight(p + "in_proj_qkv.weight"));
+  auto mixed_global = ring_exchange_rank_order(mixed_local, context_group, 1).narrow(1, 0, original_sequence_length);
+  auto mixed = mixed_global.transpose(1, 2);
+  auto conv_opts = torch::nn::functional::Conv1dFuncOptions().padding(config_.linear_conv_kernel_dim - 1).groups(conv_dim);
+  mixed = torch::nn::functional::conv1d(mixed, weight(p + "conv1d.weight"), conv_opts);
+  mixed = torch::silu(mixed.index({Slice(), Slice(), Slice(0, original_sequence_length)})).transpose(1, 2);
+
+  auto qkv = mixed.split({key_dim, key_dim, value_dim}, -1);
+  auto query = qkv[0].reshape({bsz, original_sequence_length, kh, kd});
+  auto key = qkv[1].reshape({bsz, original_sequence_length, kh, kd});
+  auto value = qkv[2].reshape({bsz, original_sequence_length, vh, vd});
+  auto z_local = dense(x, weight(p + "in_proj_z.weight")).reshape({bsz, seq_local, vh, vd});
+  auto z = ring_exchange_rank_order(z_local, context_group, 1).narrow(1, 0, original_sequence_length);
+  auto beta_local = torch::sigmoid(dense(x, weight(p + "in_proj_b.weight")));
+  auto beta = ring_exchange_rank_order(beta_local, context_group, 1).narrow(1, 0, original_sequence_length);
+  auto a_local = dense(x, weight(p + "in_proj_a.weight"));
+  auto a = ring_exchange_rank_order(a_local, context_group, 1).narrow(1, 0, original_sequence_length);
+  auto g = -torch::exp(weight(p + "A_log")) * torch::softplus(a + weight(p + "dt_bias"));
+
+  if (vh / kh > 1) {
+    query = query.repeat_interleave(vh / kh, 2);
+    key = key.repeat_interleave(vh / kh, 2);
   }
-  auto global = gathered.narrow(1, 0, original_sequence_length).contiguous();
-  auto global_out = linear_attention(global, layer_idx);
-  return distributed::context_parallel_slice_padded(
-      global_out, context_group.rank, context_group.world_size, 1, 0.0);
+
+  query = l2norm(query).transpose(1, 2).contiguous().to(torch::kFloat32) * (1.0 / std::sqrt(static_cast<double>(kd)));
+  key = l2norm(key).transpose(1, 2).contiguous().to(torch::kFloat32);
+  value = value.transpose(1, 2).contiguous().to(torch::kFloat32);
+  beta = beta.transpose(1, 2).contiguous().to(torch::kFloat32);
+  g = g.transpose(1, 2).contiguous().to(torch::kFloat32);
+
+  auto core_global = linear_attention_recurrent(query, key, value, beta, g, kd, vd)
+                         .transpose(1, 2)
+                         .contiguous()
+                         .reshape({bsz, original_sequence_length, value_dim});
+  auto core = distributed::context_parallel_slice_padded(core_global, context_group.rank, context_group.world_size, 1, 0.0)
+                  .reshape({bsz * seq_local * vh, vd});
+  auto zg = distributed::context_parallel_slice_padded(z, context_group.rank, context_group.world_size, 1, 0.0)
+                .reshape({bsz * seq_local * vh, vd});
+  core = rms_norm_gated(core, zg, weight(p + "norm.weight")).reshape({bsz, seq_local, value_dim});
+  return dense(core, weight(p + "out_proj.weight"));
 }
 
 torch::Tensor Qwen35TextModel::linear_attention_tensor_parallel(const torch::Tensor& x,

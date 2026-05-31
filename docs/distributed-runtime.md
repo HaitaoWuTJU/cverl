@@ -234,14 +234,16 @@ Current code exposes the distributed shape directly:
   records all four axes in metrics and checkpoint manifests. For `CP>1,TP=1`,
   PP stages now pass local sequence shards, Qwen range forward keeps
   RMSNorm/MLP/projections local, full attention runs local-Q plus differentiable
-  CP ring-exchanged K/V blocks, and the final PPO logprob slice gathers hidden
-  with autograd so gradients reduce-scatter back to owner shards. `TP>1` with
-  `CP>1` is intentionally rejected until TP-sharded CP attention and MLP are
-  fused into one Megatron-style execution path.
+  CP ring-exchanged K/V blocks, linear attention exchanges projected QKV/Z/B/A
+  activations in rank order instead of gathering hidden states, and the final
+  PPO logprob slice gathers hidden with autograd so gradients reduce-scatter
+  back to owner shards. `TP>1` with `CP>1` is intentionally rejected until
+  TP-sharded CP attention and MLP are fused into one Megatron-style execution
+  path.
 
-The next efficiency step is replacing CP all-gather with a ring-attention
-kernel, replacing the temporary Qwen linear-attention hidden-gather fallback
-with recurrent-state/ring exchange, and grouping PP send/recv plus TP/DP/CP
+The next efficiency step is replacing the eager CP exchange paths with fused
+ring-attention and recurrent-state/ring CUDA kernels, using a lower-latency
+backward reduce-scatter schedule, and grouping PP send/recv plus TP/DP/CP
 collectives into larger scheduled communication batches.
 
 Run the CP/NCCL smoke on a multi-GPU node with:
