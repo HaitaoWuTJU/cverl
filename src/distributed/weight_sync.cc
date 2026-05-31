@@ -32,6 +32,33 @@ struct ParameterBucketEntry {
   int64_t numel = 0;
 };
 
+void flush_broadcast_bucket(std::vector<ParameterBucketEntry>* bucket,
+                            Collectives& collectives,
+                            int64_t root,
+                            const std::vector<int64_t>& group) {
+  if (bucket->empty()) {
+    return;
+  }
+  std::vector<torch::Tensor> flat;
+  flat.reserve(bucket->size());
+  for (const auto& entry : *bucket) {
+    flat.push_back(entry.parameter->tensor.contiguous().view({entry.numel}));
+  }
+  auto payload = torch::cat(flat, 0).contiguous();
+  auto synced = collectives.broadcast(payload, root, group).contiguous();
+  if (synced.numel() != payload.numel() || synced.scalar_type() != payload.scalar_type()) {
+    throw std::runtime_error("broadcast returned incompatible parameter bucket");
+  }
+  int64_t offset = 0;
+  for (const auto& entry : *bucket) {
+    auto& tensor = entry.parameter->tensor;
+    auto shard = synced.narrow(0, offset, entry.numel).view(tensor.sizes());
+    tensor.copy_(shard);
+    offset += entry.numel;
+  }
+  bucket->clear();
+}
+
 #ifdef CVERL_ENABLE_NCCL
 void flush_send_bucket(std::vector<ParameterBucketEntry>* bucket,
                        NcclCollectives& collectives,
@@ -80,19 +107,41 @@ void flush_recv_bucket(std::vector<ParameterBucketEntry>* bucket,
 void broadcast_parameters_from_root(const std::vector<ParameterView>& parameters,
                                     Collectives& collectives,
                                     int64_t root,
-                                    const std::vector<int64_t>& group) {
+                                    const std::vector<int64_t>& group,
+                                    int64_t bucket_bytes) {
   if (parameters.empty()) {
     return;
   }
+  if (bucket_bytes <= 0) {
+    throw std::invalid_argument("broadcast_parameters_from_root bucket_bytes must be positive");
+  }
   torch::NoGradGuard no_grad;
+  std::vector<ParameterBucketEntry> bucket;
+  bucket.reserve(parameters.size());
+  int64_t current_bytes = 0;
+  torch::ScalarType current_dtype = torch::kFloat32;
+  torch::Device current_device(torch::kCPU);
+  bool have_bucket = false;
   for (const auto& p : parameters) {
     require_parameter(p);
-    auto synced = collectives.broadcast(p.tensor, root, group);
-    if (synced.sizes() != p.tensor.sizes() || synced.scalar_type() != p.tensor.scalar_type()) {
-      throw std::runtime_error("broadcast returned incompatible tensor for parameter: " + p.name);
+    const int64_t param_bytes = tensor_bytes(p.tensor);
+    const bool incompatible =
+        have_bucket && (p.tensor.scalar_type() != current_dtype || p.tensor.device() != current_device);
+    const bool would_overflow = have_bucket && current_bytes + param_bytes > bucket_bytes;
+    if (incompatible || would_overflow) {
+      flush_broadcast_bucket(&bucket, collectives, root, group);
+      current_bytes = 0;
+      have_bucket = false;
     }
-    p.tensor.copy_(synced);
+    if (!have_bucket) {
+      current_dtype = p.tensor.scalar_type();
+      current_device = p.tensor.device();
+      have_bucket = true;
+    }
+    bucket.push_back(ParameterBucketEntry{&p, p.tensor.numel()});
+    current_bytes += param_bytes;
   }
+  flush_broadcast_bucket(&bucket, collectives, root, group);
   collectives.barrier();
 }
 
