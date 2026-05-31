@@ -51,6 +51,30 @@ class Fp32MasterAdamW {
   int64_t step_ = 0;
 };
 
+class FlatAdamW {
+ public:
+  FlatAdamW(torch::Tensor parameter_shard, Fp32MasterAdamWOptions options);
+
+  void step(const torch::Tensor& gradient_shard);
+  void load_state(const torch::Tensor& parameter_value,
+                  const torch::Tensor& exp_avg,
+                  const torch::Tensor& exp_avg_sq,
+                  int64_t step);
+
+  const torch::Tensor& parameter_shard() const { return parameter_shard_; }
+  const torch::Tensor& exp_avg() const { return exp_avg_; }
+  const torch::Tensor& exp_avg_sq() const { return exp_avg_sq_; }
+  int64_t step_count() const { return step_; }
+  const Fp32MasterAdamWOptions& options() const { return options_; }
+
+ private:
+  torch::Tensor parameter_shard_;
+  torch::Tensor exp_avg_;
+  torch::Tensor exp_avg_sq_;
+  Fp32MasterAdamWOptions options_;
+  int64_t step_ = 0;
+};
+
 std::vector<torch::Tensor> clone_detached(const std::vector<torch::Tensor>& parameters);
 
 double parameter_delta_sum(const std::vector<torch::Tensor>& before, const std::vector<torch::Tensor>& after);

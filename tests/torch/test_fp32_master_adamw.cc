@@ -15,6 +15,17 @@ void require(bool cond, const char* msg) {
   }
 }
 
+void require_allclose(const torch::Tensor& actual,
+                      const torch::Tensor& expected,
+                      const char* msg,
+                      double rtol = 1.0e-5,
+                      double atol = 1.0e-6) {
+  if (!torch::allclose(actual, expected, rtol, atol)) {
+    std::cerr << msg << "\nactual=" << actual << "\nexpected=" << expected << "\n";
+    throw std::runtime_error(msg);
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -102,6 +113,39 @@ int main() {
         no_master_optimizer.step_count());
     require(restored_no_master.master_parameters().empty(), "restored no-master mode keeps master weights disabled");
     require(torch::allclose(restored_q.to(torch::kFloat32), q.to(torch::kFloat32)), "restored no-master parameter");
+
+    cverl::torch_backend::Fp32MasterAdamWOptions flat_opts;
+    flat_opts.lr = 3.0e-4;
+    flat_opts.beta1 = 0.9;
+    flat_opts.beta2 = 0.95;
+    flat_opts.eps = 1.0e-8;
+    flat_opts.weight_decay = 0.01;
+    flat_opts.use_master_weights = true;
+    auto dense_p = torch::linspace(-1.0, 1.0, 8, torch::TensorOptions().dtype(torch::kBFloat16));
+    dense_p.set_requires_grad(true);
+    auto flat_initial = dense_p.detach().to(torch::kFloat32).view({-1}).contiguous();
+    auto flat_grad = torch::linspace(0.01, 0.08, 8, torch::TensorOptions().dtype(torch::kFloat32));
+    cverl::torch_backend::Fp32MasterAdamW dense_optimizer({dense_p}, flat_opts);
+    cverl::torch_backend::FlatAdamW flat_optimizer(flat_initial, flat_opts);
+    dense_p.mutable_grad() = flat_grad.view_as(dense_p).to(dense_p.scalar_type());
+    dense_optimizer.accumulate_model_grads();
+    dense_optimizer.step();
+    flat_optimizer.step(flat_grad);
+    require_allclose(flat_optimizer.parameter_shard(), dense_optimizer.master_parameters()[0].view({-1}),
+                     "flat AdamW must match dense master AdamW", 1.0e-5, 2.0e-5);
+    require(flat_optimizer.exp_avg().scalar_type() == torch::kFloat32, "flat exp_avg must be fp32");
+    require(flat_optimizer.exp_avg_sq().scalar_type() == torch::kFloat32, "flat exp_avg_sq must be fp32");
+    require(flat_optimizer.step_count() == dense_optimizer.step_count(), "flat step count");
+
+    cverl::torch_backend::FlatAdamW restored_flat(torch::zeros_like(flat_initial), flat_opts);
+    restored_flat.load_state(flat_optimizer.parameter_shard(),
+                             flat_optimizer.exp_avg(),
+                             flat_optimizer.exp_avg_sq(),
+                             flat_optimizer.step_count());
+    require(restored_flat.step_count() == flat_optimizer.step_count(), "restored flat step count");
+    require_allclose(restored_flat.parameter_shard(), flat_optimizer.parameter_shard(), "restored flat parameter");
+    require_allclose(restored_flat.exp_avg(), flat_optimizer.exp_avg(), "restored flat exp_avg");
+    require_allclose(restored_flat.exp_avg_sq(), flat_optimizer.exp_avg_sq(), "restored flat exp_avg_sq");
 
     std::cout << "fp32 master AdamW test passed"
               << " master_delta=" << master_delta

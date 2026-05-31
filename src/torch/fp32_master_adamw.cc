@@ -4,6 +4,17 @@
 #include <stdexcept>
 
 namespace cverl::torch_backend {
+namespace {
+
+void validate_adamw_options(const Fp32MasterAdamWOptions& options, const char* name) {
+  if (options.lr < 0.0 || options.beta1 < 0.0 || options.beta1 >= 1.0 ||
+      options.beta2 < 0.0 || options.beta2 >= 1.0 || options.eps <= 0.0 ||
+      options.weight_decay < 0.0) {
+    throw std::invalid_argument(std::string(name) + ": invalid optimizer options");
+  }
+}
+
+}  // namespace
 
 std::vector<torch::Tensor> clone_detached(const std::vector<torch::Tensor>& parameters) {
   std::vector<torch::Tensor> out;
@@ -28,11 +39,7 @@ double parameter_delta_sum(const std::vector<torch::Tensor>& before, const std::
 Fp32MasterAdamW::Fp32MasterAdamW(std::vector<torch::Tensor> model_parameters,
                                  Fp32MasterAdamWOptions options)
     : model_parameters_(std::move(model_parameters)), options_(options) {
-  if (options_.lr < 0.0 || options_.beta1 < 0.0 || options_.beta1 >= 1.0 ||
-      options_.beta2 < 0.0 || options_.beta2 >= 1.0 || options_.eps <= 0.0 ||
-      options_.weight_decay < 0.0) {
-    throw std::invalid_argument("Fp32MasterAdamW: invalid optimizer options");
-  }
+  validate_adamw_options(options_, "Fp32MasterAdamW");
   master_parameters_.reserve(model_parameters_.size());
   main_grad_.reserve(model_parameters_.size());
   exp_avg_.reserve(model_parameters_.size());
@@ -198,6 +205,59 @@ double Fp32MasterAdamW::grad_norm_sum() const {
     }
   }
   return out;
+}
+
+FlatAdamW::FlatAdamW(torch::Tensor parameter_shard, Fp32MasterAdamWOptions options)
+    : options_(options) {
+  validate_adamw_options(options_, "FlatAdamW");
+  if (!parameter_shard.defined() || !parameter_shard.is_contiguous()) {
+    throw std::invalid_argument("FlatAdamW: parameter shard must be contiguous");
+  }
+  torch::NoGradGuard no_grad;
+  parameter_shard_ = parameter_shard.detach().to(torch::kFloat32).contiguous();
+  exp_avg_ = torch::zeros_like(parameter_shard_);
+  exp_avg_sq_ = torch::zeros_like(parameter_shard_);
+}
+
+void FlatAdamW::step(const torch::Tensor& gradient_shard) {
+  if (!gradient_shard.defined() || gradient_shard.numel() != parameter_shard_.numel()) {
+    throw std::invalid_argument("FlatAdamW::step: gradient shard shape mismatch");
+  }
+  torch::NoGradGuard no_grad;
+  ++step_;
+  auto grad = gradient_shard.detach().to(parameter_shard_.device(), torch::kFloat32).view(parameter_shard_.sizes());
+  const double beta1 = options_.beta1;
+  const double beta2 = options_.beta2;
+  const double bias_correction1 = 1.0 - std::pow(beta1, static_cast<double>(step_));
+  const double bias_correction2 = 1.0 - std::pow(beta2, static_cast<double>(step_));
+  const double step_size = options_.lr / bias_correction1;
+
+  exp_avg_.mul_(beta1).add_(grad, 1.0 - beta1);
+  exp_avg_sq_.mul_(beta2).addcmul_(grad, grad, 1.0 - beta2);
+  if (options_.weight_decay != 0.0) {
+    parameter_shard_.add_(parameter_shard_, -options_.lr * options_.weight_decay);
+  }
+  auto denom = (exp_avg_sq_ / bias_correction2).sqrt_().add_(options_.eps);
+  parameter_shard_.addcdiv_(exp_avg_, denom, -step_size);
+}
+
+void FlatAdamW::load_state(const torch::Tensor& parameter_value,
+                           const torch::Tensor& exp_avg,
+                           const torch::Tensor& exp_avg_sq,
+                           int64_t step) {
+  if (step < 0) {
+    throw std::invalid_argument("FlatAdamW::load_state: negative step");
+  }
+  if (!parameter_value.defined() || parameter_value.numel() != parameter_shard_.numel() ||
+      !exp_avg.defined() || exp_avg.numel() != parameter_shard_.numel() ||
+      !exp_avg_sq.defined() || exp_avg_sq.numel() != parameter_shard_.numel()) {
+    throw std::invalid_argument("FlatAdamW::load_state: state shape mismatch");
+  }
+  torch::NoGradGuard no_grad;
+  parameter_shard_.copy_(parameter_value.detach().to(parameter_shard_.device(), torch::kFloat32).view(parameter_shard_.sizes()));
+  exp_avg_.copy_(exp_avg.detach().to(exp_avg_.device(), torch::kFloat32).view(exp_avg_.sizes()));
+  exp_avg_sq_.copy_(exp_avg_sq.detach().to(exp_avg_sq_.device(), torch::kFloat32).view(exp_avg_sq_.sizes()));
+  step_ = step;
 }
 
 }  // namespace cverl::torch_backend
