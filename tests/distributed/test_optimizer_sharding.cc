@@ -95,6 +95,16 @@ void test_flat_parameter_shards_roundtrip() {
   require_allclose(target0, p0, "roundtrip p0");
   require_allclose(target1, p1, "roundtrip p1");
   require_allclose(target2, p2, "roundtrip p2");
+
+  auto gathered = torch::cat({rank0.shard, rank1.shard}, 0).contiguous();
+  auto full0 = torch::zeros_like(p0);
+  auto full1 = torch::zeros_like(p1);
+  auto full2 = torch::zeros_like(p2);
+  std::vector<torch::Tensor> full_target{full0, full1, full2};
+  cverl::distributed::apply_full_flat_parameters(gathered, rank0.original_numel, full_target);
+  require_allclose(full0, p0, "full flat p0");
+  require_allclose(full1, p1, "full flat p1");
+  require_allclose(full2, p2, "full flat p2");
 }
 
 void test_flat_parameter_shard_update_slice() {
@@ -108,6 +118,16 @@ void test_flat_parameter_shard_update_slice() {
   require_allclose(p1, torch::full_like(p1, 5.0), "rank1 should update p1");
 }
 
+void test_apply_full_flat_validation() {
+  auto p = torch::zeros({3}, torch::TensorOptions().dtype(torch::kFloat32));
+  require_throws([&]() {
+    cverl::distributed::apply_full_flat_parameters(torch::zeros({4}, torch::kFloat32), 4, {p});
+  }, "mismatched original numel rejected");
+  require_throws([&]() {
+    cverl::distributed::apply_full_flat_parameters(torch::zeros({4}, torch::kFloat32), 5, {p});
+  }, "original numel beyond flat rejected");
+}
+
 }  // namespace
 
 int main() {
@@ -117,6 +137,7 @@ int main() {
     test_validation();
     test_flat_parameter_shards_roundtrip();
     test_flat_parameter_shard_update_slice();
+    test_apply_full_flat_validation();
     std::cout << "optimizer sharding tests passed\n";
     return 0;
   } catch (const std::exception& e) {

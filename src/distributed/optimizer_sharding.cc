@@ -140,4 +140,35 @@ void apply_flat_parameter_shard(const FlatParameterShard& shard,
   }
 }
 
+void apply_full_flat_parameters(const torch::Tensor& flat_parameters,
+                                int64_t original_numel,
+                                const std::vector<torch::Tensor>& parameters) {
+  if (!flat_parameters.defined() || flat_parameters.dim() != 1 || !flat_parameters.is_contiguous()) {
+    throw std::invalid_argument("apply_full_flat_parameters requires a contiguous 1D tensor");
+  }
+  if (original_numel < 0 || original_numel > flat_parameters.numel()) {
+    throw std::invalid_argument("apply_full_flat_parameters original_numel out of range");
+  }
+  int64_t expected_numel = 0;
+  for (const auto& parameter : parameters) {
+    if (!parameter.defined() || !parameter.is_contiguous()) {
+      throw std::invalid_argument("apply_full_flat_parameters requires contiguous defined parameters");
+    }
+    expected_numel += parameter.numel();
+  }
+  if (expected_numel != original_numel) {
+    throw std::invalid_argument("apply_full_flat_parameters original_numel does not match parameters");
+  }
+
+  torch::NoGradGuard no_grad;
+  int64_t offset = 0;
+  for (const auto& parameter : parameters) {
+    const int64_t numel = parameter.numel();
+    auto source = flat_parameters.narrow(0, offset, numel)
+                      .to(parameter.device(), parameter.scalar_type());
+    parameter.view({numel}).copy_(source);
+    offset += numel;
+  }
+}
+
 }  // namespace cverl::distributed

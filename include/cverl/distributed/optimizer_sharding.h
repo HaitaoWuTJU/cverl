@@ -36,4 +36,8 @@ FlatParameterShard flatten_parameter_shard(const std::vector<torch::Tensor>& par
 void apply_flat_parameter_shard(const FlatParameterShard& shard,
                                 const std::vector<torch::Tensor>& parameters);
 
+void apply_full_flat_parameters(const torch::Tensor& flat_parameters,
+                                int64_t original_numel,
+                                const std::vector<torch::Tensor>& parameters);
+
 }  // namespace cverl::distributed
