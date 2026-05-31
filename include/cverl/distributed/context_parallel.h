@@ -53,4 +53,19 @@ int64_t context_parallel_group_index(const std::vector<int64_t>& context_group, 
 std::vector<ContextParallelRingStep> context_parallel_ring_schedule(const std::vector<int64_t>& context_group,
                                                                     int64_t rank);
 
+torch::Tensor context_parallel_causal_attention(const torch::Tensor& query_local,
+                                                const torch::Tensor& key_global,
+                                                const torch::Tensor& value_global,
+                                                int64_t query_begin,
+                                                double scale);
+
+torch::Tensor context_parallel_causal_attention_gather_kv(const torch::Tensor& query_local,
+                                                          const torch::Tensor& key_local,
+                                                          const torch::Tensor& value_local,
+                                                          Collectives& collectives,
+                                                          const std::vector<int64_t>& context_group,
+                                                          int64_t context_rank,
+                                                          int64_t original_sequence_length,
+                                                          double scale);
+
 }  // namespace cverl::distributed

@@ -3,7 +3,9 @@
 #include "cverl/distributed/pipeline.h"
 #include "cverl/distributed/topology.h"
 
+#include <algorithm>
 #include <cstdlib>
+#include <cmath>
 #include <iostream>
 #include <stdexcept>
 #include <vector>
@@ -46,10 +48,17 @@ void require_throws(Fn&& fn, const char* msg) {
 
 class PrecomputedAllGatherCollectives final : public cverl::distributed::Collectives {
  public:
-  explicit PrecomputedAllGatherCollectives(std::vector<torch::Tensor> parts) : parts_(std::move(parts)) {}
+  explicit PrecomputedAllGatherCollectives(std::vector<torch::Tensor> parts) {
+    responses_.push_back(std::move(parts));
+  }
+
+  explicit PrecomputedAllGatherCollectives(std::vector<std::vector<torch::Tensor>> responses)
+      : responses_(std::move(responses)) {}
 
   int64_t rank() const override { return 0; }
-  int64_t world_size() const override { return static_cast<int64_t>(parts_.size()); }
+  int64_t world_size() const override {
+    return responses_.empty() ? 0 : static_cast<int64_t>(responses_.front().size());
+  }
   void barrier() override {}
 
   torch::Tensor broadcast(const torch::Tensor& input,
@@ -67,7 +76,9 @@ class PrecomputedAllGatherCollectives final : public cverl::distributed::Collect
   torch::Tensor all_gather(const torch::Tensor& /*input*/,
                            const std::vector<int64_t>& /*group*/,
                            int64_t dim) override {
-    return torch::cat(parts_, dim);
+    const size_t index = std::min(call_count_, responses_.size() - 1);
+    ++call_count_;
+    return torch::cat(responses_.at(index), dim);
   }
 
   torch::Tensor reduce_scatter(const torch::Tensor& input,
@@ -81,7 +92,8 @@ class PrecomputedAllGatherCollectives final : public cverl::distributed::Collect
   torch::Tensor recv_like(const torch::Tensor& like, int64_t /*peer*/) override { return torch::empty_like(like); }
 
  private:
-  std::vector<torch::Tensor> parts_;
+  std::vector<std::vector<torch::Tensor>> responses_;
+  size_t call_count_ = 0;
 };
 
 cverl::distributed::ClusterSpec make_spec() {
@@ -354,6 +366,37 @@ void test_context_parallel_ring_schedule() {
                  "context ring rejects non-member rank");
 }
 
+void test_context_parallel_causal_attention() {
+  torch::manual_seed(11);
+  auto opts = torch::TensorOptions().dtype(torch::kFloat32);
+  auto q = torch::randn({1, 2, 6, 4}, opts);
+  auto k = torch::randn({1, 2, 6, 4}, opts);
+  auto v = torch::randn({1, 2, 6, 3}, opts);
+  const double scale = 1.0 / std::sqrt(4.0);
+
+  auto dense_scores = torch::matmul(q, k.transpose(2, 3)) * scale;
+  auto mask = torch::ones({6, 6}, torch::TensorOptions().dtype(torch::kBool)).triu(1);
+  dense_scores = dense_scores.masked_fill(mask.unsqueeze(0).unsqueeze(0), -1.0e9);
+  auto dense = torch::matmul(torch::softmax(dense_scores, -1), v);
+
+  auto local_q = q.narrow(2, 3, 3).contiguous();
+  auto local = cverl::distributed::context_parallel_causal_attention(local_q, k, v, 3, scale);
+  require(torch::allclose(local, dense.narrow(2, 3, 3), 1.0e-5, 1.0e-5), "CP local causal attention");
+
+  auto q0 = q.narrow(2, 0, 3).contiguous();
+  auto k0 = k.narrow(2, 0, 3).contiguous();
+  auto v0 = v.narrow(2, 0, 3).contiguous();
+  auto k1 = k.narrow(2, 3, 3).contiguous();
+  auto v1 = v.narrow(2, 3, 3).contiguous();
+  PrecomputedAllGatherCollectives collectives(std::vector<std::vector<torch::Tensor>>{{k0, k1}, {v0, v1}});
+  auto gathered =
+      cverl::distributed::context_parallel_causal_attention_gather_kv(q0, k0, v0, collectives, {0, 1}, 0, 6, scale);
+  require(torch::allclose(gathered, dense.narrow(2, 0, 3), 1.0e-5, 1.0e-5), "CP gathered KV causal attention");
+
+  require_throws([&]() { (void)cverl::distributed::context_parallel_causal_attention(local_q, k, v, 4, scale); },
+                 "CP causal attention rejects out-of-range query shard");
+}
+
 void test_dtype_names() {
   require(cverl::distributed::dtype_policy_name(cverl::distributed::DTypePolicy::Float32) == "float32", "float32 name");
   require(cverl::distributed::dtype_policy_name(cverl::distributed::DTypePolicy::Float16) == "float16", "float16 name");
@@ -375,6 +418,7 @@ int main() {
     test_context_parallel_slice();
     test_context_parallel_padded_slice_and_gather();
     test_context_parallel_ring_schedule();
+    test_context_parallel_causal_attention();
     test_dtype_names();
   } catch (const std::exception& e) {
     std::cerr << "test_topology failed: " << e.what() << "\n";

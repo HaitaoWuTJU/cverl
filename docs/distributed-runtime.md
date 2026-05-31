@@ -219,7 +219,9 @@ Current code exposes the distributed shape directly:
 - `pipeline`: PP peer selection plus forward/backward activation send/recv
   wrappers on the `Collectives` interface.
 - `context_parallel`: sequence-dimension shard/gather helpers used as the
-  base for CP attention.
+  base for CP attention. It also provides a differentiable all-gather-KV
+  causal-attention reference for local query shards; ring-attention kernels
+  should match this math while replacing the global KV materialization.
 - `qwen3_5_pp_tp_ppo_trainer`: accepts DP/PP/CP/TP topology dimensions and
   records all four axes in metrics and checkpoint manifests. CP is wired as a
   topology/communicator axis; the Qwen forward path still needs CP-aware token

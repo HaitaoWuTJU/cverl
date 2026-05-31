@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <stdexcept>
+#include <string>
 
 namespace cverl::distributed {
 namespace {
@@ -24,6 +25,12 @@ int64_t normalize_sequence_dim(const torch::Tensor& input, int64_t sequence_dim)
     throw std::invalid_argument("sequence_dim out of range");
   }
   return dim;
+}
+
+void require_attention_tensor(const torch::Tensor& tensor, const char* name) {
+  if (!tensor.defined() || tensor.dim() != 4) {
+    throw std::invalid_argument(std::string(name) + " must be a defined 4D tensor [B,H,S,D]");
+  }
 }
 
 }  // namespace
@@ -146,6 +153,69 @@ std::vector<ContextParallelRingStep> context_parallel_ring_schedule(const std::v
     schedule.push_back(ContextParallelRingStep{step, context_group[static_cast<size_t>(kv_index)], send_rank, recv_rank});
   }
   return schedule;
+}
+
+torch::Tensor context_parallel_causal_attention(const torch::Tensor& query_local,
+                                                const torch::Tensor& key_global,
+                                                const torch::Tensor& value_global,
+                                                int64_t query_begin,
+                                                double scale) {
+  require_attention_tensor(query_local, "query_local");
+  require_attention_tensor(key_global, "key_global");
+  require_attention_tensor(value_global, "value_global");
+  if (query_begin < 0) {
+    throw std::invalid_argument("query_begin must be non-negative");
+  }
+  if (query_local.size(0) != key_global.size(0) || query_local.size(0) != value_global.size(0) ||
+      query_local.size(1) != key_global.size(1) || query_local.size(1) != value_global.size(1) ||
+      key_global.size(2) != value_global.size(2) || query_local.size(3) != key_global.size(3)) {
+    throw std::invalid_argument("context causal attention shape mismatch");
+  }
+  const int64_t local_seq = query_local.size(2);
+  const int64_t global_seq = key_global.size(2);
+  if (query_begin + local_seq > global_seq) {
+    throw std::invalid_argument("query shard range exceeds global KV sequence length");
+  }
+
+  auto scores = torch::matmul(query_local.to(torch::kFloat32), key_global.to(torch::kFloat32).transpose(2, 3)) * scale;
+  auto q_pos = torch::arange(query_begin,
+                             query_begin + local_seq,
+                             torch::TensorOptions().dtype(torch::kLong).device(query_local.device()))
+                   .view({local_seq, 1});
+  auto k_pos =
+      torch::arange(0, global_seq, torch::TensorOptions().dtype(torch::kLong).device(query_local.device()))
+          .view({1, global_seq});
+  auto mask = k_pos > q_pos;
+  scores = scores.masked_fill(mask.unsqueeze(0).unsqueeze(0), -1.0e9);
+  auto probs = torch::softmax(scores, -1);
+  return torch::matmul(probs, value_global.to(torch::kFloat32)).to(query_local.scalar_type());
+}
+
+torch::Tensor context_parallel_causal_attention_gather_kv(const torch::Tensor& query_local,
+                                                          const torch::Tensor& key_local,
+                                                          const torch::Tensor& value_local,
+                                                          Collectives& collectives,
+                                                          const std::vector<int64_t>& context_group,
+                                                          int64_t context_rank,
+                                                          int64_t original_sequence_length,
+                                                          double scale) {
+  require_attention_tensor(query_local, "query_local");
+  require_attention_tensor(key_local, "key_local");
+  require_attention_tensor(value_local, "value_local");
+  validate_context_rank(context_rank, static_cast<int64_t>(context_group.size()));
+  const int64_t shard = query_local.size(2);
+  if (key_local.size(2) != shard || value_local.size(2) != shard) {
+    throw std::invalid_argument("query/key/value local CP shards must have matching sequence length");
+  }
+  auto key_global = collectives.all_gather(key_local.contiguous(), context_group, 2).contiguous();
+  auto value_global = collectives.all_gather(value_local.contiguous(), context_group, 2).contiguous();
+  if (key_global.size(2) < original_sequence_length || value_global.size(2) < original_sequence_length) {
+    throw std::invalid_argument("gathered CP KV is shorter than original_sequence_length");
+  }
+  key_global = key_global.narrow(2, 0, original_sequence_length).contiguous();
+  value_global = value_global.narrow(2, 0, original_sequence_length).contiguous();
+  const int64_t query_begin = context_rank * shard;
+  return context_parallel_causal_attention(query_local, key_global, value_global, query_begin, scale);
 }
 
 }  // namespace cverl::distributed
