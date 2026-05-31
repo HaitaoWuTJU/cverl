@@ -18,6 +18,8 @@ CLIP_RATIO="${CLIP_RATIO:-0.2}"
 MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
 DP_GRAD_BUCKET_MB="${DP_GRAD_BUCKET_MB:-25}"
 TP_GRAD_BUCKET_MB="${TP_GRAD_BUCKET_MB:-${DP_GRAD_BUCKET_MB}}"
+DP_GRAD_COMM_DTYPE="${DP_GRAD_COMM_DTYPE:-model}"
+TP_GRAD_COMM_DTYPE="${TP_GRAD_COMM_DTYPE:-${DP_GRAD_COMM_DTYPE}}"
 ADVANTAGE_SCALE="${ADVANTAGE_SCALE:-1.0}"
 MASTER_WEIGHTS="${MASTER_WEIGHTS:-false}"
 DP_SHARD_OPTIMIZER="${DP_SHARD_OPTIMIZER:-false}"
@@ -77,6 +79,8 @@ for ((rank = 0; rank < WORLD_SIZE; ++rank)); do
       --max-grad-norm "${MAX_GRAD_NORM}" \
       --dp-grad-bucket-mb "${DP_GRAD_BUCKET_MB}" \
       --tp-grad-bucket-mb "${TP_GRAD_BUCKET_MB}" \
+      --dp-grad-comm-dtype "${DP_GRAD_COMM_DTYPE}" \
+      --tp-grad-comm-dtype "${TP_GRAD_COMM_DTYPE}" \
       --advantage-scale "${ADVANTAGE_SCALE}" \
       --master-weights "${MASTER_WEIGHTS}" \
       --dp-shard-optimizer "${DP_SHARD_OPTIMIZER}" \

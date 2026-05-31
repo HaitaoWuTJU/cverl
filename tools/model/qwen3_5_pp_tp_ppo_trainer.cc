@@ -1124,6 +1124,14 @@ void append_metrics_csv(const std::string& path,
                         int64_t prompt_len,
                         int64_t response_len,
                         int64_t rollout_rows,
+                        const std::string& dtype_name,
+                        const std::string& dp_grad_comm_dtype,
+                        const std::string& tp_grad_comm_dtype,
+                        bool use_master_weights,
+                        bool dp_shard_optimizer,
+                        bool dp_flat_shard_optimizer,
+                        int64_t dp_grad_bucket_mb,
+                        int64_t tp_grad_bucket_mb,
                         double mean_reward,
                         double success_rate,
                         double adv_abs_sum,
@@ -1146,6 +1154,8 @@ void append_metrics_csv(const std::string& path,
   std::ofstream out(path, std::ios::app);
   if (write_header) {
     out << "step,dp,pp,tp,micro_batches,layers,prompt_len,response_len,rollout_rows,"
+        << "dtype,dp_grad_comm_dtype,tp_grad_comm_dtype,master_weights,dp_shard_optimizer,"
+        << "dp_flat_shard_optimizer,dp_grad_bucket_mb,tp_grad_bucket_mb,"
         << "mean_reward,success_rate,adv_abs_sum,loss_sum,kl_loss_sum,ppo_kl_sum,clipfrac_sum,"
         << "grad_norm_sum,global_grad_norm,grad_clip_scale,param_delta_sum\n";
   }
@@ -1158,6 +1168,14 @@ void append_metrics_csv(const std::string& path,
       << prompt_len << ","
       << response_len << ","
       << rollout_rows << ","
+      << dtype_name << ","
+      << dp_grad_comm_dtype << ","
+      << tp_grad_comm_dtype << ","
+      << (use_master_weights ? "true" : "false") << ","
+      << (dp_shard_optimizer ? "true" : "false") << ","
+      << (dp_flat_shard_optimizer ? "true" : "false") << ","
+      << dp_grad_bucket_mb << ","
+      << tp_grad_bucket_mb << ","
       << mean_reward << ","
       << success_rate << ","
       << adv_abs_sum << ","
@@ -1525,7 +1543,8 @@ int main(int argc, char** argv) {
         arg_bool(argc, argv, "--flat-checkpoint-save-model-params", false);
     const std::string resume_checkpoint = arg_str(argc, argv, "--resume-checkpoint", "");
     const std::string metrics_csv = arg_str(argc, argv, "--metrics-csv", "");
-    const auto dtype = parse_dtype(arg_str(argc, argv, "--dtype", "bfloat16"));
+    const std::string dtype_arg = arg_str(argc, argv, "--dtype", "bfloat16");
+    const auto dtype = parse_dtype(dtype_arg);
     const auto dp_grad_comm_dtype = parse_optional_dtype(dp_grad_comm_dtype_arg);
     const auto tp_grad_comm_dtype = parse_optional_dtype(tp_grad_comm_dtype_arg);
     const std::string id_prefix = arg_str(argc, argv, "--id-prefix", "/tmp/cverl_qwen_pp_tp_ppo");
@@ -2101,6 +2120,14 @@ int main(int argc, char** argv) {
                            prompt_len,
                            response_len,
                            active_rollout != nullptr ? active_rollout->rows : 0,
+                           dtype_arg,
+                           dp_grad_comm_dtype_arg,
+                           tp_grad_comm_dtype_arg,
+                           use_master_weights,
+                           dp_shard_optimizer,
+                           dp_flat_shard_optimizer,
+                           dp_grad_bucket_mb,
+                           tp_grad_bucket_mb,
                            mean_reward,
                            success_rate,
                            adv_abs_sum,
