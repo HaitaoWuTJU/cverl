@@ -249,6 +249,22 @@ std::vector<torch::Tensor> remote_linear_attention_messages(const torch::Tensor&
   };
 }
 
+std::vector<torch::Tensor> remote_linear_attention_ring_responses(
+    const torch::Tensor& previous_hidden,
+    const torch::Tensor& next_hidden,
+    const std::unordered_map<std::string, torch::Tensor>& weights,
+    const cverl::Qwen35TextConfig& cfg) {
+  auto previous = remote_linear_attention_messages(previous_hidden, weights, cfg);
+  auto next = remote_linear_attention_messages(next_hidden, weights, cfg);
+  std::vector<torch::Tensor> out;
+  out.reserve(previous.size() * 2);
+  for (size_t i = 0; i < previous.size(); ++i) {
+    out.push_back(previous.at(i));
+    out.push_back(next.at(i));
+  }
+  return out;
+}
+
 torch::Tensor linear_attention_prefix_state(const torch::Tensor& hidden,
                                             int64_t prefix_len,
                                             const std::unordered_map<std::string, torch::Tensor>& weights,
@@ -413,12 +429,59 @@ void run_linear_attention_case() {
   std::filesystem::remove_all(dir);
 }
 
+void run_linear_attention_cp3_middle_rank_case() {
+  auto dir = make_model_dir("linear_attention");
+  cverl::HfModelLoader loader(dir.string());
+  cverl::Qwen35TextModel model(std::move(loader));
+  auto weights = make_weights(model.config());
+  install_weights(model, weights);
+
+  auto hidden = torch::randn({1, 6, model.config().hidden_size}, torch::kFloat32) * 0.1;
+  auto dense_hidden = hidden.detach().clone().set_requires_grad(true);
+  auto dense = model.forward_hidden_range_context_parallel(dense_hidden, 0, 1, cverl::distributed::ParallelGroup{}, 6, false);
+  auto shard0 = cverl::distributed::context_parallel_slice_padded(hidden, 0, 3, 1, 0.0);
+  auto shard1 = cverl::distributed::context_parallel_slice_padded(hidden, 1, 3, 1, 0.0);
+  auto shard2 = cverl::distributed::context_parallel_slice_padded(hidden, 2, 3, 1, 0.0);
+
+  auto initial_state = linear_attention_prefix_state(hidden, 2, weights, model.config());
+  auto final_state_grad = torch::zeros_like(linear_attention_prefix_state(hidden, 4, weights, model.config()));
+  SendRecvCollectives rank1_collectives(
+      1,
+      3,
+      remote_linear_attention_ring_responses(shard0, shard2, weights, model.config()),
+      {initial_state, final_state_grad});
+  cverl::distributed::ParallelGroup rank1_group{9, 3, {8, 9, 10}, &rank1_collectives};
+  auto shard1_grad = shard1.detach().clone().set_requires_grad(true);
+  auto out1 = model.forward_hidden_range_context_parallel(shard1_grad, 0, 1, rank1_group, 6, false);
+
+  require(torch::allclose(out1, dense.narrow(1, 2, 2), 1.0e-5, 1.0e-5),
+          "Qwen CP3 linear-attention middle rank forward shard must match dense slice");
+  require(rank1_collectives.send_recv_calls() == 8,
+          "Qwen CP3 linear-attention middle rank should ring-exchange all projected tensors");
+  require(rank1_collectives.recv_calls() == 1 && rank1_collectives.send_calls() == 1,
+          "Qwen CP3 linear-attention middle rank should receive initial state and send final state");
+
+  auto grad1 = torch::randn_like(out1);
+  auto dense_hidden1 = hidden.detach().clone().set_requires_grad(true);
+  auto dense1 =
+      model.forward_hidden_range_context_parallel(dense_hidden1, 0, 1, cverl::distributed::ParallelGroup{}, 6, false);
+  torch::autograd::backward({dense1.narrow(1, 2, 2)}, {grad1});
+  torch::autograd::backward({out1}, {grad1});
+  require(shard1_grad.grad().defined() &&
+              torch::allclose(shard1_grad.grad(), dense_hidden1.grad().narrow(1, 2, 2), 1.0e-5, 1.0e-5),
+          "Qwen CP3 linear-attention middle rank hidden gradient must match dense slice");
+  require(rank1_collectives.recv_calls() == 2 && rank1_collectives.send_calls() == 2,
+          "Qwen CP3 linear-attention middle rank should carry state gradients backward");
+  std::filesystem::remove_all(dir);
+}
+
 }  // namespace
 
 int main() {
   try {
     run_full_attention_case();
     run_linear_attention_case();
+    run_linear_attention_cp3_middle_rank_case();
   } catch (const std::exception& e) {
     std::cerr << "test_qwen3_5_cp_forward failed: " << e.what() << "\n";
     return 1;

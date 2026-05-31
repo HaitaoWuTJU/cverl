@@ -287,8 +287,9 @@ CPU regression coverage includes:
   forward shards and local-output hidden gradients match the corresponding
   dense slices while using nonzero global CP ranks. The linear-attention case
   also checks forward recurrent state carry from rank 0 to rank 1 and the
-  backward state-gradient carry in the reverse direction. Cross-rank K/V
-  owner-gradient transport remains covered by the CP ring-exchange and
-  reduce-scatter cases in `test_distributed_topology`.
+  backward state-gradient carry in the reverse direction, plus a CP=3 middle
+  rank that both receives upstream state and sends downstream state.
+  Cross-rank K/V owner-gradient transport remains covered by the CP
+  ring-exchange and reduce-scatter cases in `test_distributed_topology`.
 - `test_cp_attention_cuda` when `CVERL_ENABLE_CUDA=ON`: fused CUDA CP
   ring-attention forward/backward against the dense reference.
