@@ -187,8 +187,10 @@ void broadcast_dp_sharded_optimizer_parameters(const std::vector<std::string>& p
         owned.push_back(cverl::distributed::ParameterView{param_names[i], params[i]});
       }
     }
-    cverl::distributed::broadcast_parameters_from_root(owned, dp_comm, owner, dp_ranks, bucket_bytes);
+    cverl::distributed::broadcast_parameters_from_root(
+        owned, dp_comm, owner, dp_ranks, bucket_bytes, false);
   }
+  dp_comm.barrier();
 }
 
 bool layer_index_from_weight_name(const std::string& name, int64_t* layer_index) {

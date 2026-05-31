@@ -106,6 +106,12 @@ int main() {
     require(counting.broadcast_calls > 1, "small broadcast bucket should split calls");
     require(counting.barrier_calls == 1, "split broadcast should keep one final barrier");
 
+    counting.broadcast_calls = 0;
+    counting.barrier_calls = 0;
+    cverl::distributed::broadcast_parameters_from_root(params, counting, 0, {0}, 16, false);
+    require(counting.broadcast_calls > 1, "barrier-free split broadcast still sends buckets");
+    require(counting.barrier_calls == 0, "barrier-free broadcast should not call barrier");
+
     bool rejected = false;
     try {
       cverl::distributed::broadcast_parameters_from_root(params, comm, 1, {0});

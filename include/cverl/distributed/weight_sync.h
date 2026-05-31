@@ -26,7 +26,8 @@ void broadcast_parameters_from_root(const std::vector<ParameterView>& parameters
                                     Collectives& collectives,
                                     int64_t root,
                                     const std::vector<int64_t>& group,
-                                    int64_t bucket_bytes = 25 * 1024 * 1024);
+                                    int64_t bucket_bytes = 25 * 1024 * 1024,
+                                    bool final_barrier = true);
 
 std::vector<ParameterView> module_parameter_views(torch::nn::Module& module, bool recurse = true);
 

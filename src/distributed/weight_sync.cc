@@ -108,7 +108,8 @@ void broadcast_parameters_from_root(const std::vector<ParameterView>& parameters
                                     Collectives& collectives,
                                     int64_t root,
                                     const std::vector<int64_t>& group,
-                                    int64_t bucket_bytes) {
+                                    int64_t bucket_bytes,
+                                    bool final_barrier) {
   if (parameters.empty()) {
     return;
   }
@@ -142,7 +143,9 @@ void broadcast_parameters_from_root(const std::vector<ParameterView>& parameters
     current_bytes += param_bytes;
   }
   flush_broadcast_bucket(&bucket, collectives, root, group);
-  collectives.barrier();
+  if (final_barrier) {
+    collectives.barrier();
+  }
 }
 
 std::vector<ParameterView> module_parameter_views(torch::nn::Module& module, bool recurse) {
