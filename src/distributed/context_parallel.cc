@@ -287,7 +287,17 @@ torch::Tensor context_parallel_causal_attention_gather_kv(const torch::Tensor& q
   key_global = key_global.narrow(2, 0, original_sequence_length).contiguous();
   value_global = value_global.narrow(2, 0, original_sequence_length).contiguous();
   const int64_t query_begin = context_rank * shard;
-  return context_parallel_causal_attention(query_local, key_global, value_global, query_begin, scale);
+  const int64_t valid_query = std::max<int64_t>(0, std::min<int64_t>(shard, original_sequence_length - query_begin));
+  if (valid_query == shard) {
+    return context_parallel_causal_attention(query_local, key_global, value_global, query_begin, scale);
+  }
+  auto out = torch::zeros({query_local.size(0), query_local.size(1), shard, value_global.size(3)}, query_local.options());
+  if (valid_query > 0) {
+    auto valid = context_parallel_causal_attention(
+        query_local.narrow(2, 0, valid_query).contiguous(), key_global, value_global, query_begin, scale);
+    out.narrow(2, 0, valid_query).copy_(valid);
+  }
+  return out;
 }
 
 }  // namespace cverl::distributed

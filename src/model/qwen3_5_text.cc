@@ -471,24 +471,35 @@ std::pair<torch::Tensor, torch::Tensor> Qwen35TextModel::rotary_embeddings(int64
                                                                            int64_t seq_len,
                                                                            torch::Device device,
                                                                            torch::ScalarType dtype) const {
+  return rotary_embeddings_range(batch_size, 0, seq_len, device, dtype);
+}
+
+std::pair<torch::Tensor, torch::Tensor> Qwen35TextModel::rotary_embeddings_range(int64_t batch_size,
+                                                                                 int64_t position_begin,
+                                                                                 int64_t seq_len,
+                                                                                 torch::Device device,
+                                                                                 torch::ScalarType dtype) const {
+  if (position_begin < 0 || seq_len < 0) {
+    throw std::invalid_argument("rotary embedding range must be non-negative");
+  }
   int64_t rotary_dim = static_cast<int64_t>(config_.head_dim * config_.partial_rotary_factor);
-  const std::string key = tensor_cache_key(seq_len, device, dtype) + "|" + std::to_string(rotary_dim);
+  const std::string key = tensor_cache_key(position_begin + seq_len, device, dtype) + "|" + std::to_string(rotary_dim);
   auto it = rotary_cache_.find(key);
   if (it != rotary_cache_.end()) {
-    return {it->second.first.expand({batch_size, seq_len, rotary_dim}),
-            it->second.second.expand({batch_size, seq_len, rotary_dim})};
+    return {it->second.first.narrow(1, position_begin, seq_len).expand({batch_size, seq_len, rotary_dim}),
+            it->second.second.narrow(1, position_begin, seq_len).expand({batch_size, seq_len, rotary_dim})};
   }
   auto arange_opts = torch::TensorOptions().dtype(torch::kFloat32).device(device);
   auto inv_idx = torch::arange(0, rotary_dim, 2, arange_opts);
   auto inv_freq = torch::pow(config_.rope_theta, -(inv_idx / static_cast<double>(rotary_dim)));
-  auto pos = torch::arange(0, seq_len, arange_opts);
+  auto pos = torch::arange(0, position_begin + seq_len, arange_opts);
   auto freqs = torch::ger(pos, inv_freq);
   auto emb = torch::cat({freqs, freqs}, -1).unsqueeze(0);
   auto cos = torch::cos(emb).to(dtype).contiguous();
   auto sin = torch::sin(emb).to(dtype).contiguous();
   auto inserted = rotary_cache_.emplace(key, std::make_pair(cos, sin));
-  return {inserted.first->second.first.expand({batch_size, seq_len, rotary_dim}),
-          inserted.first->second.second.expand({batch_size, seq_len, rotary_dim})};
+  return {inserted.first->second.first.narrow(1, position_begin, seq_len).expand({batch_size, seq_len, rotary_dim}),
+          inserted.first->second.second.narrow(1, position_begin, seq_len).expand({batch_size, seq_len, rotary_dim})};
 }
 
 torch::Tensor Qwen35TextModel::mlp(const torch::Tensor& x, int64_t layer_idx) {
@@ -556,6 +567,61 @@ torch::Tensor Qwen35TextModel::full_attention(const torch::Tensor& x, int64_t la
   attn = attn.masked_fill(mask.unsqueeze(0).unsqueeze(0), -1.0e9);
   attn = torch::softmax(attn.to(torch::kFloat32), -1);
   auto out = torch::matmul(attn, v.to(torch::kFloat32)).transpose(1, 2).contiguous().reshape({b, s, h * d});
+  out = (out * torch::sigmoid(gate.to(torch::kFloat32))).to(x.scalar_type());
+  return dense(out, weight(p + "o_proj.weight"));
+}
+
+torch::Tensor Qwen35TextModel::full_attention_context_parallel(const torch::Tensor& x,
+                                                               int64_t layer_idx,
+                                                               const distributed::ParallelGroup& context_group,
+                                                               int64_t original_sequence_length) {
+  if (context_group.world_size <= 0 || context_group.rank < 0 || context_group.rank >= context_group.world_size) {
+    throw std::invalid_argument("Qwen3.5 CP full attention requires valid context rank/world_size");
+  }
+  if (context_group.world_size == 1) {
+    return full_attention(x, layer_idx);
+  }
+  if (context_group.world_size > 1 && context_group.collectives == nullptr) {
+    throw std::invalid_argument("Qwen3.5 CP full attention requires collectives");
+  }
+  std::string p = layer_prefix(layer_idx) + "self_attn.";
+  int64_t b = x.size(0);
+  int64_t s_local = x.size(1);
+  int64_t h = config_.num_attention_heads;
+  int64_t kvh = config_.num_key_value_heads;
+  int64_t d = config_.head_dim;
+  const int64_t query_begin = context_group.rank * s_local;
+
+  auto qg = dense(x, weight(p + "q_proj.weight")).view({b, s_local, h, d * 2});
+  auto chunks = qg.chunk(2, -1);
+  auto q = rms_norm(chunks[0], weight(p + "q_norm.weight")).transpose(1, 2);
+  auto gate = chunks[1].reshape({b, s_local, h * d});
+  auto k = rms_norm(dense(x, weight(p + "k_proj.weight")).view({b, s_local, kvh, d}), weight(p + "k_norm.weight"))
+               .transpose(1, 2);
+  auto v = dense(x, weight(p + "v_proj.weight")).view({b, s_local, kvh, d}).transpose(1, 2);
+
+  auto rope = rotary_embeddings_range(b, query_begin, s_local, x.device(), x.scalar_type());
+  auto cos = rope.first.unsqueeze(1);
+  auto sin = rope.second.unsqueeze(1);
+  int64_t rotary_dim = cos.size(-1);
+  auto q_rot = q.index({Slice(), Slice(), Slice(), Slice(0, rotary_dim)});
+  auto q_pass = q.index({Slice(), Slice(), Slice(), Slice(rotary_dim, None)});
+  auto k_rot = k.index({Slice(), Slice(), Slice(), Slice(0, rotary_dim)});
+  auto k_pass = k.index({Slice(), Slice(), Slice(), Slice(rotary_dim, None)});
+  q = torch::cat(std::vector<torch::Tensor>{q_rot * cos + rotate_half(q_rot) * sin, q_pass}, -1);
+  k = torch::cat(std::vector<torch::Tensor>{k_rot * cos + rotate_half(k_rot) * sin, k_pass}, -1);
+
+  k = repeat_kv(k, h / kvh).contiguous();
+  v = repeat_kv(v, h / kvh).contiguous();
+  auto context_out = distributed::context_parallel_causal_attention_gather_kv(q.contiguous(),
+                                                                              k,
+                                                                              v,
+                                                                              *context_group.collectives,
+                                                                              context_group.ranks,
+                                                                              context_group.rank,
+                                                                              original_sequence_length,
+                                                                              1.0 / std::sqrt(static_cast<double>(d)));
+  auto out = context_out.transpose(1, 2).contiguous().reshape({b, s_local, h * d});
   out = (out * torch::sigmoid(gate.to(torch::kFloat32))).to(x.scalar_type());
   return dense(out, weight(p + "o_proj.weight"));
 }
@@ -668,6 +734,30 @@ torch::Tensor Qwen35TextModel::linear_attention(const torch::Tensor& x, int64_t 
   auto zg = z.reshape({bsz * seq * vh, vd});
   core = rms_norm_gated(core, zg, weight(p + "norm.weight")).reshape({bsz, seq, value_dim});
   return dense(core, weight(p + "out_proj.weight"));
+}
+
+torch::Tensor Qwen35TextModel::linear_attention_context_parallel(const torch::Tensor& x,
+                                                                 int64_t layer_idx,
+                                                                 const distributed::ParallelGroup& context_group,
+                                                                 int64_t original_sequence_length) {
+  if (context_group.world_size <= 0 || context_group.rank < 0 || context_group.rank >= context_group.world_size) {
+    throw std::invalid_argument("Qwen3.5 CP linear attention requires valid context rank/world_size");
+  }
+  if (context_group.world_size == 1) {
+    return linear_attention(x, layer_idx);
+  }
+  if (context_group.collectives == nullptr) {
+    throw std::invalid_argument("Qwen3.5 CP linear attention requires collectives");
+  }
+  auto gathered =
+      distributed::context_parallel_gather_autograd(x.contiguous(), *context_group.collectives, context_group.ranks, 1);
+  if (gathered.size(1) < original_sequence_length) {
+    throw std::invalid_argument("Qwen3.5 CP gathered linear-attention hidden is shorter than original sequence");
+  }
+  auto global = gathered.narrow(1, 0, original_sequence_length).contiguous();
+  auto global_out = linear_attention(global, layer_idx);
+  return distributed::context_parallel_slice_padded(
+      global_out, context_group.rank, context_group.world_size, 1, 0.0);
 }
 
 torch::Tensor Qwen35TextModel::linear_attention_tensor_parallel(const torch::Tensor& x,
@@ -786,6 +876,80 @@ torch::Tensor Qwen35TextModel::forward_hidden(const torch::Tensor& input_ids, in
     hidden = residual + mlp(hidden, i);
   }
   return rms_norm(hidden, weight("model.language_model.norm.weight"));
+}
+
+torch::Tensor Qwen35TextModel::forward_hidden_context_parallel(const torch::Tensor& input_ids,
+                                                               const distributed::ParallelGroup& context_group,
+                                                               int64_t max_layers) {
+  if (context_group.world_size <= 0 || context_group.rank < 0 || context_group.rank >= context_group.world_size) {
+    throw std::invalid_argument("Qwen3.5 CP forward requires valid context rank/world_size");
+  }
+  if (context_group.world_size == 1) {
+    return forward_hidden(input_ids, max_layers);
+  }
+  auto hidden = distributed::context_parallel_slice_padded(
+      embed(input_ids), context_group.rank, context_group.world_size, 1, 0.0);
+  int64_t layers = max_layers < 0 ? config_.num_hidden_layers : std::min(max_layers, config_.num_hidden_layers);
+  return forward_hidden_range_context_parallel(hidden,
+                                               0,
+                                               layers,
+                                               context_group,
+                                               input_ids.size(1),
+                                               true);
+}
+
+torch::Tensor Qwen35TextModel::forward_hidden_range_context_parallel(const torch::Tensor& hidden_local,
+                                                                     int64_t layer_begin,
+                                                                     int64_t layer_end,
+                                                                     const distributed::ParallelGroup& context_group,
+                                                                     int64_t original_sequence_length,
+                                                                     bool apply_final_norm) {
+  if (layer_begin < 0 || layer_end < layer_begin || layer_end > config_.num_hidden_layers) {
+    throw std::invalid_argument("invalid Qwen3.5 CP layer range");
+  }
+  if (context_group.world_size <= 0 || context_group.rank < 0 || context_group.rank >= context_group.world_size) {
+    throw std::invalid_argument("Qwen3.5 CP layer range requires valid context rank/world_size");
+  }
+  if (context_group.world_size == 1) {
+    auto out = hidden_local;
+    for (int64_t i = layer_begin; i < layer_end; ++i) {
+      std::string p = layer_prefix(i);
+      auto residual = out;
+      out = rms_norm(out, weight(p + "input_layernorm.weight"));
+      if (config_.layer_types.at(static_cast<size_t>(i)) == "full_attention") {
+        out = full_attention(out, i);
+      } else {
+        out = linear_attention(out, i);
+      }
+      out = residual + out;
+      residual = out;
+      out = rms_norm(out, weight(p + "post_attention_layernorm.weight"));
+      out = residual + mlp(out, i);
+    }
+    return apply_final_norm ? rms_norm(out, weight("model.language_model.norm.weight")) : out;
+  }
+  if (context_group.collectives == nullptr) {
+    throw std::invalid_argument("Qwen3.5 CP layer range requires collectives");
+  }
+  auto out = hidden_local;
+  for (int64_t i = layer_begin; i < layer_end; ++i) {
+    std::string p = layer_prefix(i);
+    auto residual = out;
+    out = rms_norm(out, weight(p + "input_layernorm.weight"));
+    if (config_.layer_types.at(static_cast<size_t>(i)) == "full_attention") {
+      out = full_attention_context_parallel(out, i, context_group, original_sequence_length);
+    } else {
+      out = linear_attention_context_parallel(out, i, context_group, original_sequence_length);
+    }
+    out = residual + out;
+    residual = out;
+    out = rms_norm(out, weight(p + "post_attention_layernorm.weight"));
+    out = residual + mlp(out, i);
+  }
+  if (apply_final_norm) {
+    out = rms_norm(out, weight("model.language_model.norm.weight"));
+  }
+  return out;
 }
 
 torch::Tensor Qwen35TextModel::token_embeddings(const torch::Tensor& input_ids) {

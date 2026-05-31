@@ -416,6 +416,18 @@ void test_context_parallel_causal_attention() {
   require(v0.grad().defined() && torch::allclose(v0.grad(), dense_v.grad().narrow(2, 0, 3), 1.0e-5, 1.0e-5),
           "CP gathered KV value gradient matches dense local-output gradient");
 
+  auto q1 = q.narrow(2, 3, 3).contiguous();
+  PrecomputedAllGatherCollectives padded_collectives(std::vector<std::vector<torch::Tensor>>{
+      {k0.detach().transpose(0, 2).contiguous(), k1.transpose(0, 2).contiguous()},
+      {v0.detach().transpose(0, 2).contiguous(), v1.transpose(0, 2).contiguous()}});
+  auto padded =
+      cverl::distributed::context_parallel_causal_attention_gather_kv(q1, k1, v1, padded_collectives, {0, 1}, 1, 5, scale);
+  auto dense5 = cverl::distributed::context_parallel_causal_attention(
+      q.narrow(2, 3, 2).contiguous(), k.narrow(2, 0, 5).contiguous(), v.narrow(2, 0, 5).contiguous(), 3, scale);
+  require(torch::allclose(padded.narrow(2, 0, 2), dense5, 1.0e-5, 1.0e-5),
+          "CP padded tail valid queries match dense attention");
+  require(padded.narrow(2, 2, 1).abs().sum().item<float>() == 0.0f, "CP padded tail query output is zero");
+
   require_throws([&]() { (void)cverl::distributed::context_parallel_causal_attention(local_q, k, v, 4, scale); },
                  "CP causal attention rejects out-of-range query shard");
 }

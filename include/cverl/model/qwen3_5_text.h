@@ -8,6 +8,7 @@
 
 #include <torch/torch.h>
 
+#include "cverl/distributed/context_parallel.h"
 #include "cverl/distributed/parallel_ops.h"
 #include "cverl/model/hf_model_loader.h"
 
@@ -48,6 +49,15 @@ class Qwen35TextModel {
                                                    const distributed::ParallelGroup& tensor_group);
   torch::Tensor forward_hidden(const torch::Tensor& input_ids, int64_t max_layers = -1);
   torch::Tensor forward_logits(const torch::Tensor& input_ids, int64_t max_layers = -1);
+  torch::Tensor forward_hidden_context_parallel(const torch::Tensor& input_ids,
+                                                const distributed::ParallelGroup& context_group,
+                                                int64_t max_layers = -1);
+  torch::Tensor forward_hidden_range_context_parallel(const torch::Tensor& hidden_local,
+                                                      int64_t layer_begin,
+                                                      int64_t layer_end,
+                                                      const distributed::ParallelGroup& context_group,
+                                                      int64_t original_sequence_length,
+                                                      bool apply_final_norm);
   torch::Tensor forward_hidden_tensor_parallel(const torch::Tensor& input_ids,
                                                const distributed::ParallelGroup& tensor_group,
                                                int64_t max_layers = -1);
@@ -86,12 +96,25 @@ class Qwen35TextModel {
   torch::Tensor rms_norm_gated(const torch::Tensor& x, const torch::Tensor& gate, const torch::Tensor& weight) const;
   torch::Tensor mlp(const torch::Tensor& x, int64_t layer_idx);
   torch::Tensor full_attention(const torch::Tensor& x, int64_t layer_idx);
+  torch::Tensor full_attention_context_parallel(const torch::Tensor& x,
+                                                int64_t layer_idx,
+                                                const distributed::ParallelGroup& context_group,
+                                                int64_t original_sequence_length);
   torch::Tensor linear_attention(const torch::Tensor& x, int64_t layer_idx);
+  torch::Tensor linear_attention_context_parallel(const torch::Tensor& x,
+                                                  int64_t layer_idx,
+                                                  const distributed::ParallelGroup& context_group,
+                                                  int64_t original_sequence_length);
   torch::Tensor causal_mask(int64_t seq_len, torch::Device device) const;
   std::pair<torch::Tensor, torch::Tensor> rotary_embeddings(int64_t batch_size,
                                                             int64_t seq_len,
                                                             torch::Device device,
                                                             torch::ScalarType dtype) const;
+  std::pair<torch::Tensor, torch::Tensor> rotary_embeddings_range(int64_t batch_size,
+                                                                  int64_t position_begin,
+                                                                  int64_t seq_len,
+                                                                  torch::Device device,
+                                                                  torch::ScalarType dtype) const;
 
   HfModelLoader loader_;
   Qwen35TextConfig config_;

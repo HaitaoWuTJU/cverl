@@ -228,14 +228,18 @@ Current code exposes the distributed shape directly:
   ring-attention/FlashAttention-style kernel that avoids materializing global
   KV and returns K/V gradients through ring exchange.
 - `qwen3_5_pp_tp_ppo_trainer`: accepts DP/PP/CP/TP topology dimensions and
-  records all four axes in metrics and checkpoint manifests. CP is wired as a
-  topology/communicator axis; the Qwen forward path still needs CP-aware token
-  sharding and ring-attention kernels before `CP>1` is a true memory-saving
-  training mode.
+  records all four axes in metrics and checkpoint manifests. For `CP>1,TP=1`,
+  PP stages now pass local sequence shards, Qwen range forward keeps
+  RMSNorm/MLP/projections local, full attention runs local-Q plus
+  differentiable CP K/V gather, and the final PPO logprob slice gathers hidden
+  with autograd so gradients reduce-scatter back to owner shards. `TP>1` with
+  `CP>1` is intentionally rejected until TP-sharded CP attention and MLP are
+  fused into one Megatron-style execution path.
 
 The next efficiency step is replacing CP all-gather with a ring-attention
-kernel and grouping PP send/recv plus TP/DP collectives into larger scheduled
-communication batches.
+kernel, replacing the temporary Qwen linear-attention hidden-gather fallback
+with recurrent-state/ring exchange, and grouping PP send/recv plus TP/DP/CP
+collectives into larger scheduled communication batches.
 
 Run the CP/NCCL smoke on a multi-GPU node with:
 

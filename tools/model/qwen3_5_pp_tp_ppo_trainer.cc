@@ -1622,6 +1622,9 @@ int main(int argc, char** argv) {
     if (dp_size <= 0 || pp_size <= 0 || cp_size <= 0 || tp_size <= 0 || micro_batches <= 0 || steps <= 0) {
       throw std::invalid_argument("dp-size, pp-size, cp-size, tp-size, micro-batches, and steps must be positive");
     }
+    if (cp_size > 1 && tp_size > 1) {
+      throw std::invalid_argument("Qwen3.5 PP trainer currently supports CP>1 only with TP=1");
+    }
     if (prompt_len <= 0 || response_len <= 0 || max_grad_norm < 0.0) {
       throw std::invalid_argument("prompt-len and response-len must be positive");
     }
@@ -1686,6 +1689,9 @@ int main(int argc, char** argv) {
     const std::string tp_id_path = id_prefix + "_tp_dp" + std::to_string(info.data_rank) +
                                    "_pp" + std::to_string(info.pipeline_rank) + "_cp" +
                                    std::to_string(info.context_rank) + ".bin";
+    const std::string cp_id_path = id_prefix + "_cp_dp" + std::to_string(info.data_rank) +
+                                   "_pp" + std::to_string(info.pipeline_rank) + "_tp" +
+                                   std::to_string(info.tensor_rank) + ".bin";
     const std::string dp_id_path = id_prefix + "_dp_pp" + std::to_string(info.pipeline_rank) +
                                    "_cp" + std::to_string(info.context_rank) + "_tp" +
                                    std::to_string(info.tensor_rank) + ".bin";
@@ -1696,6 +1702,9 @@ int main(int argc, char** argv) {
     if (info.tensor_rank == 0) {
       cverl::distributed::write_nccl_unique_id_file(tp_id_path, cverl::distributed::create_nccl_unique_id());
     }
+    if (info.context_rank == 0) {
+      cverl::distributed::write_nccl_unique_id_file(cp_id_path, cverl::distributed::create_nccl_unique_id());
+    }
     if (info.data_rank == 0) {
       cverl::distributed::write_nccl_unique_id_file(dp_id_path, cverl::distributed::create_nccl_unique_id());
     }
@@ -1705,12 +1714,15 @@ int main(int argc, char** argv) {
 
     auto full_id = cverl::distributed::read_nccl_unique_id_file(full_id_path);
     auto tp_id = cverl::distributed::read_nccl_unique_id_file(tp_id_path);
+    auto cp_id = cverl::distributed::read_nccl_unique_id_file(cp_id_path);
     auto dp_id = cverl::distributed::read_nccl_unique_id_file(dp_id_path);
     auto model_id = cverl::distributed::read_nccl_unique_id_file(model_id_path);
     cverl::distributed::NcclCollectives full_comm(
         global_rank, world_size, static_cast<int>(device_idx), full_id, nccl_sync_after_collective);
     cverl::distributed::NcclCollectives tp_comm(
         info.tensor_rank, tp_size, static_cast<int>(device_idx), tp_id, nccl_sync_after_collective);
+    cverl::distributed::NcclCollectives cp_comm(
+        info.context_rank, cp_size, static_cast<int>(device_idx), cp_id, nccl_sync_after_collective);
     cverl::distributed::NcclCollectives dp_comm(
         info.data_rank, dp_size, static_cast<int>(device_idx), dp_id, nccl_sync_after_collective);
     const int64_t model_parallel_size = pp_size * cp_size * tp_size;
@@ -1720,6 +1732,7 @@ int main(int argc, char** argv) {
         model_parallel_rank, model_parallel_size, static_cast<int>(device_idx), model_id, nccl_sync_after_collective);
     const auto model_parallel_ranks = full_group(model_parallel_size);
     cverl::distributed::ParallelGroup tp_group{info.tensor_rank, tp_size, full_group(tp_size), &tp_comm};
+    cverl::distributed::ParallelGroup cp_group{info.context_rank, cp_size, full_group(cp_size), &cp_comm};
     cverl::distributed::ParallelGroup dp_group{info.data_rank, dp_size, full_group(dp_size), &dp_comm};
     std::unique_ptr<cverl::distributed::NcclCollectives> rollout_data_comm;
     if (!rollout_nccl_id_file.empty()) {
@@ -1822,7 +1835,9 @@ int main(int argc, char** argv) {
       }
     }
 
-    const std::vector<int64_t> hidden_shape{1, seq_len, model.config().hidden_size};
+    const int64_t local_seq_len =
+        cp_size == 1 ? seq_len : cverl::distributed::context_parallel_padded_length(seq_len, cp_size) / cp_size;
+    const std::vector<int64_t> hidden_shape{1, local_seq_len, model.config().hidden_size};
     const auto full_ranks = full_group(world_size);
     const auto metric_options = torch::TensorOptions().device(device).dtype(torch::kFloat32);
     std::vector<torch::Tensor> stage_inputs(static_cast<size_t>(micro_batches));
@@ -1901,14 +1916,22 @@ int main(int argc, char** argv) {
                 jsonl_batches,
                 model.config(),
                 device);
-            input = model.token_embeddings_tensor_parallel(ids, tp_group);
+            if (cp_size > 1) {
+              input = cverl::distributed::context_parallel_slice_padded(
+                  model.token_embeddings(ids), info.context_rank, cp_size, 1, 0.0);
+            } else {
+              input = model.token_embeddings_tensor_parallel(ids, tp_group);
+            }
           } else {
             auto like = torch::empty(hidden_shape, torch::TensorOptions().device(device).dtype(dtype));
             input = full_comm.recv_like(like, peers.previous_rank).detach().set_requires_grad(true);
             stage_inputs[static_cast<size_t>(action.micro_batch)] = input;
           }
-          auto output = model.forward_hidden_range_tensor_parallel(
-              input, range.begin, range.end, tp_group, peers.is_last_stage);
+          auto output = cp_size > 1
+                            ? model.forward_hidden_range_context_parallel(
+                                  input, range.begin, range.end, cp_group, seq_len, peers.is_last_stage)
+                            : model.forward_hidden_range_tensor_parallel(
+                                  input, range.begin, range.end, tp_group, peers.is_last_stage);
           stage_outputs[static_cast<size_t>(action.micro_batch)] = output;
           if (!peers.is_last_stage) {
             full_comm.send(output.contiguous(), peers.next_rank);
@@ -1937,7 +1960,13 @@ int main(int argc, char** argv) {
                   device);
               response_ids = ids.slice(1, prompt_len, prompt_len + response_len);
             }
-            auto response_hidden = stage_output.slice(1, prompt_len - 1, prompt_len + response_len - 1);
+            auto scoring_hidden = stage_output;
+            if (cp_size > 1) {
+              scoring_hidden = cverl::distributed::context_parallel_gather_autograd(
+                  stage_output.contiguous(), cp_comm, cp_group.ranks, 1);
+              scoring_hidden = scoring_hidden.narrow(1, 0, seq_len).contiguous();
+            }
+            auto response_hidden = scoring_hidden.slice(1, prompt_len - 1, prompt_len + response_len - 1);
             auto log_probs = model.response_log_probs_tensor_parallel(response_hidden, response_ids, tp_group);
             torch::Tensor old_log_probs = log_probs.detach();
             torch::Tensor advantages;
@@ -1976,11 +2005,12 @@ int main(int argc, char** argv) {
               total_loss = total_loss + kl_coef * kl_loss;
             }
             auto scaled_loss = total_loss / static_cast<double>(micro_batches);
+            auto backward_loss = cp_size > 1 ? scaled_loss / static_cast<double>(cp_size) : scaled_loss;
             loss_sum_tensor.add_(scaled_loss.detach().to(torch::kFloat32));
             kl_loss_sum_tensor.add_(kl_loss.detach().to(torch::kFloat32));
             kl_sum_tensor.add_(loss.ppo_kl.detach().to(torch::kFloat32));
             clipfrac_sum_tensor.add_(loss.pg_clipfrac.detach().to(torch::kFloat32));
-            scaled_loss.backward();
+            backward_loss.backward();
           } else {
             auto grad = full_comm.recv_like(stage_output.contiguous(), peers.next_rank);
             stage_output.backward(grad);
@@ -1998,6 +2028,10 @@ int main(int argc, char** argv) {
         }
       }
 
+      if (cp_size > 1) {
+        cverl::distributed::data_parallel_sync_gradients(
+            params, cp_comm, cp_group.ranks, false, dp_grad_bucket_bytes, dp_grad_comm_dtype);
+      }
       sync_tp_replicated_gradients(tp_replicated_params, tp_group, tp_grad_bucket_bytes, tp_grad_comm_dtype);
       bool flat_step_done = false;
       double local_grad_norm_sq = 0.0;
@@ -2296,6 +2330,8 @@ int main(int argc, char** argv) {
             std::filesystem::remove(id_prefix + "_tp_dp" + std::to_string(d) + "_pp" +
                                     std::to_string(pp) + "_cp" + std::to_string(cp) + ".bin");
             for (int64_t tp = 0; tp < tp_size; ++tp) {
+              std::filesystem::remove(id_prefix + "_cp_dp" + std::to_string(d) + "_pp" +
+                                      std::to_string(pp) + "_tp" + std::to_string(tp) + ".bin");
               std::filesystem::remove(id_prefix + "_dp_pp" + std::to_string(pp) + "_cp" +
                                       std::to_string(cp) + "_tp" + std::to_string(tp) + ".bin");
             }
