@@ -141,25 +141,39 @@ void zero_model_gradients(const std::vector<torch::Tensor>& params) {
 }
 
 double grad_l2_norm_sq(const std::vector<torch::Tensor>& params) {
-  double out = 0.0;
+  torch::Tensor total;
   for (const auto& p : params) {
     if (!p.defined() || !p.grad().defined()) {
       continue;
     }
-    out += p.grad().detach().to(torch::kFloat32).pow(2).sum().item<double>();
+    auto term = p.grad().detach().to(torch::kFloat32).pow(2).sum();
+    if (!total.defined()) {
+      total = term;
+    } else if (total.device() == term.device()) {
+      total = total + term;
+    } else {
+      total = total + term.to(total.device());
+    }
   }
-  return out;
+  return total.defined() ? total.item<double>() : 0.0;
 }
 
 double grad_norm_sum(const std::vector<torch::Tensor>& params) {
-  double out = 0.0;
+  torch::Tensor total;
   for (const auto& p : params) {
     if (!p.defined() || !p.grad().defined()) {
       continue;
     }
-    out += p.grad().detach().to(torch::kFloat32).norm().item<double>();
+    auto term = p.grad().detach().to(torch::kFloat32).norm();
+    if (!total.defined()) {
+      total = term;
+    } else if (total.device() == term.device()) {
+      total = total + term;
+    } else {
+      total = total + term.to(total.device());
+    }
   }
-  return out;
+  return total.defined() ? total.item<double>() : 0.0;
 }
 
 void scale_model_gradients(const std::vector<torch::Tensor>& params, double scale) {

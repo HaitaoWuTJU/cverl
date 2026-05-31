@@ -14,6 +14,27 @@ void validate_adamw_options(const Fp32MasterAdamWOptions& options, const char* n
   }
 }
 
+void add_scalar_term(torch::Tensor* total, const torch::Tensor& term) {
+  if (!term.defined()) {
+    return;
+  }
+  auto scalar = term.detach().to(torch::kFloat32);
+  if (!total->defined()) {
+    *total = scalar;
+  } else if (total->device() == scalar.device()) {
+    *total = *total + scalar;
+  } else {
+    *total = *total + scalar.to(total->device());
+  }
+}
+
+double scalar_total_to_double(const torch::Tensor& total) {
+  if (!total.defined()) {
+    return 0.0;
+  }
+  return total.item<double>();
+}
+
 }  // namespace
 
 std::vector<torch::Tensor> clone_detached(const std::vector<torch::Tensor>& parameters) {
@@ -29,11 +50,12 @@ double parameter_delta_sum(const std::vector<torch::Tensor>& before, const std::
   if (before.size() != after.size()) {
     throw std::invalid_argument("parameter_delta_sum: size mismatch");
   }
-  double out = 0.0;
+  torch::Tensor total;
   for (size_t i = 0; i < before.size(); ++i) {
-    out += (after[i].detach().to(torch::kFloat32) - before[i].to(torch::kFloat32)).abs().sum().item<double>();
+    auto delta = (after[i].detach().to(torch::kFloat32) - before[i].to(torch::kFloat32)).abs().sum();
+    add_scalar_term(&total, delta);
   }
-  return out;
+  return scalar_total_to_double(total);
 }
 
 Fp32MasterAdamW::Fp32MasterAdamW(std::vector<torch::Tensor> model_parameters,
@@ -125,7 +147,7 @@ void Fp32MasterAdamW::step() {
 }
 
 double Fp32MasterAdamW::grad_l2_norm_sq() const {
-  double out = 0.0;
+  torch::Tensor total;
   for (size_t i = 0; i < model_parameters_.size(); ++i) {
     torch::Tensor grad;
     if (has_main_grad_[i]) {
@@ -135,9 +157,9 @@ double Fp32MasterAdamW::grad_l2_norm_sq() const {
     } else {
       continue;
     }
-    out += grad.pow(2).sum().item<double>();
+    add_scalar_term(&total, grad.pow(2).sum());
   }
-  return out;
+  return scalar_total_to_double(total);
 }
 
 void Fp32MasterAdamW::scale_gradients(double scale) {
@@ -196,15 +218,15 @@ void Fp32MasterAdamW::load_state(const std::vector<torch::Tensor>& parameter_val
 }
 
 double Fp32MasterAdamW::grad_norm_sum() const {
-  double out = 0.0;
+  torch::Tensor total;
   for (size_t i = 0; i < model_parameters_.size(); ++i) {
     if (has_main_grad_[i]) {
-      out += main_grad_[i].detach().norm().item<double>();
+      add_scalar_term(&total, main_grad_[i].detach().norm());
     } else if (model_parameters_[i].grad().defined()) {
-      out += model_parameters_[i].grad().detach().to(torch::kFloat32).norm().item<double>();
+      add_scalar_term(&total, model_parameters_[i].grad().detach().to(torch::kFloat32).norm());
     }
   }
-  return out;
+  return scalar_total_to_double(total);
 }
 
 FlatAdamW::FlatAdamW(torch::Tensor parameter_shard, Fp32MasterAdamWOptions options)
