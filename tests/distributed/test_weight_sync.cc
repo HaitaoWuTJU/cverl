@@ -12,6 +12,7 @@ class CountingCollectives final : public cverl::distributed::Collectives {
  public:
   int64_t broadcast_calls = 0;
   int64_t barrier_calls = 0;
+  int64_t last_broadcast_numel = 0;
 
   int64_t rank() const override { return 0; }
   int64_t world_size() const override { return 2; }
@@ -22,6 +23,7 @@ class CountingCollectives final : public cverl::distributed::Collectives {
                           const std::vector<int64_t>& group) override {
     require_single_root(root, group);
     ++broadcast_calls;
+    last_broadcast_numel = input.numel();
     return input.clone();
   }
 
@@ -114,6 +116,8 @@ int main() {
     counting.barrier_calls = 0;
     cverl::distributed::broadcast_parameters_from_root(params, counting, 0, {0, 1}, 16);
     require(counting.broadcast_calls > 1, "small broadcast bucket should split calls");
+    require(counting.last_broadcast_numel == module.b.numel(),
+            "single-parameter broadcast bucket should preserve payload numel");
     require(counting.barrier_calls == 1, "split broadcast should keep one final barrier");
 
     counting.broadcast_calls = 0;

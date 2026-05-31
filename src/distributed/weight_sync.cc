@@ -53,6 +53,22 @@ struct ParameterBucketEntry {
   int64_t numel = 0;
 };
 
+torch::Tensor flatten_parameter_bucket(const std::vector<ParameterBucketEntry>& bucket) {
+  if (bucket.empty()) {
+    throw std::invalid_argument("flatten_parameter_bucket requires a non-empty bucket");
+  }
+  if (bucket.size() == 1) {
+    const auto& entry = bucket.front();
+    return entry.parameter->tensor.contiguous().view({entry.numel});
+  }
+  std::vector<torch::Tensor> flat;
+  flat.reserve(bucket.size());
+  for (const auto& entry : bucket) {
+    flat.push_back(entry.parameter->tensor.contiguous().view({entry.numel}));
+  }
+  return torch::cat(flat, 0).contiguous();
+}
+
 void flush_broadcast_bucket(std::vector<ParameterBucketEntry>* bucket,
                             Collectives& collectives,
                             int64_t root,
@@ -60,12 +76,7 @@ void flush_broadcast_bucket(std::vector<ParameterBucketEntry>* bucket,
   if (bucket->empty()) {
     return;
   }
-  std::vector<torch::Tensor> flat;
-  flat.reserve(bucket->size());
-  for (const auto& entry : *bucket) {
-    flat.push_back(entry.parameter->tensor.contiguous().view({entry.numel}));
-  }
-  auto payload = torch::cat(flat, 0).contiguous();
+  auto payload = flatten_parameter_bucket(*bucket);
   auto synced = collectives.broadcast(payload, root, group).contiguous();
   if (synced.numel() != payload.numel() || synced.scalar_type() != payload.scalar_type()) {
     throw std::runtime_error("broadcast returned incompatible parameter bucket");
@@ -87,12 +98,7 @@ void flush_send_bucket(std::vector<ParameterBucketEntry>* bucket,
   if (bucket->empty()) {
     return;
   }
-  std::vector<torch::Tensor> flat;
-  flat.reserve(bucket->size());
-  for (const auto& entry : *bucket) {
-    flat.push_back(entry.parameter->tensor.contiguous().view({entry.numel}));
-  }
-  collectives.send(torch::cat(flat, 0).contiguous(), peer);
+  collectives.send(flatten_parameter_bucket(*bucket), peer);
   bucket->clear();
 }
 
