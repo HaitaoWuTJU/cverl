@@ -101,6 +101,11 @@ The runtime config separates memory decisions from model code:
 - BF16 parameters and activations by default.
 - FP32 reductions where needed for numerical stability.
 - Activation checkpointing enabled by default.
+- Qwen linear-attention CUDA training defaults to chunk checkpointing rather
+  than full-state saving or pure recompute. Full-state mode is only for golden
+  tests/debugging; pure recompute is available by env override but routes
+  through the same tiled checkpointed backward kernel with a zero initial
+  checkpoint.
 - Sharded optimizer and sharded gradients enabled by default.
 - CPU offload is available as a policy switch, not a default. It saves memory
   but usually costs throughput.

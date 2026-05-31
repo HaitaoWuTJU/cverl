@@ -208,8 +208,10 @@ CudaLinearAttentionStateMode cuda_linear_attention_state_mode() {
   }
 
   const char* save_env = std::getenv("CVERL_LINEAR_ATTN_SAVE_STATES");
-  return (save_env != nullptr && std::string(save_env) == "1") ? CudaLinearAttentionStateMode::Full
-                                                               : CudaLinearAttentionStateMode::None;
+  if (save_env != nullptr && std::string(save_env) == "1") {
+    return CudaLinearAttentionStateMode::Full;
+  }
+  return CudaLinearAttentionStateMode::Chunk;
 }
 
 int64_t cuda_linear_attention_checkpoint_interval() {

@@ -1165,25 +1165,13 @@ std::vector<torch::Tensor> qwen_linear_attention_cuda_backward_recompute(
   int T = static_cast<int>(query.size(2));
   int K = static_cast<int>(query.size(3));
   int V = static_cast<int>(value.size(3));
-  auto dq = torch::empty_like(query);
-  auto dk = torch::empty_like(key);
-  auto dv = torch::empty_like(value);
-  auto dbeta = torch::zeros_like(beta);
-  auto dg = torch::zeros_like(g);
-  size_t shared = static_cast<size_t>(K) * static_cast<size_t>(V) * 3 * sizeof(float);
-  if (shared > 192 * 1024) {
-    throw std::runtime_error("Qwen linear attention CUDA recompute backward shared memory limit exceeded");
+  if (T <= 0) {
+    return {torch::empty_like(query), torch::empty_like(key), torch::empty_like(value),
+            torch::empty_like(beta), torch::empty_like(g)};
   }
-  check_cuda(cudaFuncSetAttribute(qwen_linear_attn_backward_recompute_kernel,
-                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                  static_cast<int>(shared)),
-             "cudaFuncSetAttribute recompute backward");
-  qwen_linear_attn_backward_recompute_kernel<<<B * H, 256, shared>>>(
-      grad_out.data_ptr<float>(), query.data_ptr<float>(), key.data_ptr<float>(), value.data_ptr<float>(),
-      beta.data_ptr<float>(), g.data_ptr<float>(), dq.data_ptr<float>(), dk.data_ptr<float>(),
-      dv.data_ptr<float>(), dbeta.data_ptr<float>(), dg.data_ptr<float>(), B, H, T, K, V);
-  check_cuda(cudaGetLastError(), "qwen_linear_attn_backward_recompute_kernel");
-  return {dq, dk, dv, dbeta, dg};
+  auto zero_checkpoint = torch::zeros({B, H, 1, K, V}, query.options());
+  return qwen_linear_attention_cuda_backward_checkpointed(
+      grad_out, query, key, value, beta, g, zero_checkpoint, T);
 }
 
 std::vector<torch::Tensor> qwen_linear_attention_cuda_backward_checkpointed(
