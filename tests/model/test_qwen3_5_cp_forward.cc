@@ -243,13 +243,13 @@ void run_full_attention_case() {
 
   SendRecvCollectives rank0_collectives(
       0, 2, {torch::cat({kv1.first, kv1.second}, -1).transpose(0, 2).contiguous()});
-  cverl::distributed::ParallelGroup rank0_group{0, 2, {0, 1}, &rank0_collectives};
+  cverl::distributed::ParallelGroup rank0_group{8, 2, {8, 9}, &rank0_collectives};
   auto shard0_grad = shard0.detach().clone().set_requires_grad(true);
   auto out0 = model.forward_hidden_range_context_parallel(shard0_grad, 0, 1, rank0_group, 4, false);
 
   SendRecvCollectives rank1_collectives(
       1, 2, {torch::cat({kv0.first, kv0.second}, -1).transpose(0, 2).contiguous()});
-  cverl::distributed::ParallelGroup rank1_group{1, 2, {0, 1}, &rank1_collectives};
+  cverl::distributed::ParallelGroup rank1_group{9, 2, {8, 9}, &rank1_collectives};
   auto shard1_grad = shard1.detach().clone().set_requires_grad(true);
   auto out1 = model.forward_hidden_range_context_parallel(shard1_grad, 0, 1, rank1_group, 4, false);
 
@@ -294,12 +294,12 @@ void run_linear_attention_case() {
   auto shard1 = cverl::distributed::context_parallel_slice_padded(hidden, 1, 2, 1, 0.0);
 
   SendRecvCollectives rank0_collectives(0, 2, remote_linear_attention_messages(shard1, weights, model.config()));
-  cverl::distributed::ParallelGroup rank0_group{0, 2, {0, 1}, &rank0_collectives};
+  cverl::distributed::ParallelGroup rank0_group{8, 2, {8, 9}, &rank0_collectives};
   auto shard0_grad = shard0.detach().clone().set_requires_grad(true);
   auto out0 = model.forward_hidden_range_context_parallel(shard0_grad, 0, 1, rank0_group, 4, false);
 
   SendRecvCollectives rank1_collectives(1, 2, remote_linear_attention_messages(shard0, weights, model.config()));
-  cverl::distributed::ParallelGroup rank1_group{1, 2, {0, 1}, &rank1_collectives};
+  cverl::distributed::ParallelGroup rank1_group{9, 2, {8, 9}, &rank1_collectives};
   auto shard1_grad = shard1.detach().clone().set_requires_grad(true);
   auto out1 = model.forward_hidden_range_context_parallel(shard1_grad, 0, 1, rank1_group, 4, false);
 

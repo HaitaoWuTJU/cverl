@@ -249,7 +249,9 @@ Current code exposes the distributed shape directly:
   CP ring-exchanged K/V blocks, linear attention exchanges projected QKV/Z/B/A
   activations in rank order instead of gathering hidden states, and the final
   PPO logprob slice gathers hidden with autograd so gradients reduce-scatter
-  back to owner shards. `TP>1` with `CP>1` is intentionally rejected until
+  back to owner shards. Qwen CP accepts either group-local rank ids or real
+  global ranks in the CP group and resolves shard/RoPE/ring scheduling through
+  the group-local index. `TP>1` with `CP>1` is intentionally rejected until
   TP-sharded CP attention and MLP are fused into one Megatron-style execution
   path.
 
@@ -277,7 +279,8 @@ CPU regression coverage includes:
   deterministic weights, plus a synthetic Qwen3.5 linear-attention layer that
   exercises projected QKV/Z/B/A CP exchange. Both validate that CP rank-local
   forward shards and local-output hidden gradients match the corresponding
-  dense slices. Cross-rank K/V owner-gradient transport remains covered by the
-  CP ring-exchange and reduce-scatter cases in `test_distributed_topology`.
+  dense slices while using nonzero global CP ranks. Cross-rank K/V
+  owner-gradient transport remains covered by the CP ring-exchange and
+  reduce-scatter cases in `test_distributed_topology`.
 - `test_cp_attention_cuda` when `CVERL_ENABLE_CUDA=ON`: fused CUDA CP
   ring-attention forward/backward against the dense reference.

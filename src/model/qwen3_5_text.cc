@@ -89,18 +89,37 @@ int64_t normalize_dim_for_tensor(const torch::Tensor& tensor, int64_t dim) {
   return dim;
 }
 
+int64_t group_local_rank(const distributed::ParallelGroup& group, const char* name) {
+  if (group.world_size <= 0) {
+    throw std::invalid_argument(std::string(name) + " requires positive world_size");
+  }
+  if (static_cast<int64_t>(group.ranks.size()) != group.world_size) {
+    throw std::invalid_argument(std::string(name) + " ranks must match world_size");
+  }
+  for (int64_t i = 0; i < group.world_size; ++i) {
+    if (group.ranks.at(static_cast<size_t>(i)) == group.rank) {
+      return i;
+    }
+  }
+  if (group.rank >= 0 && group.rank < group.world_size) {
+    return group.rank;
+  }
+  throw std::invalid_argument(std::string(name) + " rank must be a group-local rank or a member of ranks");
+}
+
 torch::Tensor ring_exchange_rank_order(const torch::Tensor& local,
                                        const distributed::ParallelGroup& context_group,
                                        int64_t sequence_dim) {
   const int64_t dim = normalize_dim_for_tensor(local, sequence_dim);
+  const int64_t context_rank = group_local_rank(context_group, "Qwen3.5 CP ring exchange");
   auto ring = distributed::context_parallel_ring_exchange_autograd(
-      local.contiguous(), *context_group.collectives, context_group.ranks, context_group.rank, dim);
+      local.contiguous(), *context_group.collectives, context_group.ranks, context_rank, dim);
   if (context_group.world_size <= 1) {
     return ring;
   }
   const int64_t shard = local.size(dim);
   const auto schedule = distributed::context_parallel_ring_schedule(
-      context_group.ranks, context_group.ranks.at(static_cast<size_t>(context_group.rank)));
+      context_group.ranks, context_group.ranks.at(static_cast<size_t>(context_rank)));
   std::vector<torch::Tensor> rank_order(static_cast<size_t>(context_group.world_size));
   for (int64_t ring_index = 0; ring_index < static_cast<int64_t>(schedule.size()); ++ring_index) {
     const int64_t rank_index =
@@ -606,9 +625,7 @@ torch::Tensor Qwen35TextModel::full_attention_context_parallel(const torch::Tens
                                                                int64_t layer_idx,
                                                                const distributed::ParallelGroup& context_group,
                                                                int64_t original_sequence_length) {
-  if (context_group.world_size <= 0 || context_group.rank < 0 || context_group.rank >= context_group.world_size) {
-    throw std::invalid_argument("Qwen3.5 CP full attention requires valid context rank/world_size");
-  }
+  const int64_t context_rank = group_local_rank(context_group, "Qwen3.5 CP full attention");
   if (context_group.world_size == 1) {
     return full_attention(x, layer_idx);
   }
@@ -621,7 +638,7 @@ torch::Tensor Qwen35TextModel::full_attention_context_parallel(const torch::Tens
   int64_t h = config_.num_attention_heads;
   int64_t kvh = config_.num_key_value_heads;
   int64_t d = config_.head_dim;
-  const int64_t query_begin = context_group.rank * s_local;
+  const int64_t query_begin = context_rank * s_local;
 
   auto qg = dense(x, weight(p + "q_proj.weight")).view({b, s_local, h, d * 2});
   auto chunks = qg.chunk(2, -1);
@@ -650,7 +667,7 @@ torch::Tensor Qwen35TextModel::full_attention_context_parallel(const torch::Tens
       v,
       *context_group.collectives,
       context_group.ranks,
-      context_group.rank,
+      context_rank,
       original_sequence_length,
       1.0 / std::sqrt(static_cast<double>(d)));
   auto out = context_out.transpose(1, 2).contiguous().reshape({b, s_local, h * d});
@@ -772,9 +789,7 @@ torch::Tensor Qwen35TextModel::linear_attention_context_parallel(const torch::Te
                                                                  int64_t layer_idx,
                                                                  const distributed::ParallelGroup& context_group,
                                                                  int64_t original_sequence_length) {
-  if (context_group.world_size <= 0 || context_group.rank < 0 || context_group.rank >= context_group.world_size) {
-    throw std::invalid_argument("Qwen3.5 CP linear attention requires valid context rank/world_size");
-  }
+  const int64_t context_rank = group_local_rank(context_group, "Qwen3.5 CP linear attention");
   if (context_group.world_size == 1) {
     return linear_attention(x, layer_idx);
   }
@@ -826,9 +841,9 @@ torch::Tensor Qwen35TextModel::linear_attention_context_parallel(const torch::Te
                          .transpose(1, 2)
                          .contiguous()
                          .reshape({bsz, original_sequence_length, value_dim});
-  auto core = distributed::context_parallel_slice_padded(core_global, context_group.rank, context_group.world_size, 1, 0.0)
+  auto core = distributed::context_parallel_slice_padded(core_global, context_rank, context_group.world_size, 1, 0.0)
                   .reshape({bsz * seq_local * vh, vd});
-  auto zg = distributed::context_parallel_slice_padded(z, context_group.rank, context_group.world_size, 1, 0.0)
+  auto zg = distributed::context_parallel_slice_padded(z, context_rank, context_group.world_size, 1, 0.0)
                 .reshape({bsz * seq_local * vh, vd});
   core = rms_norm_gated(core, zg, weight(p + "norm.weight")).reshape({bsz, seq_local, value_dim});
   return dense(core, weight(p + "out_proj.weight"));
@@ -955,14 +970,12 @@ torch::Tensor Qwen35TextModel::forward_hidden(const torch::Tensor& input_ids, in
 torch::Tensor Qwen35TextModel::forward_hidden_context_parallel(const torch::Tensor& input_ids,
                                                                const distributed::ParallelGroup& context_group,
                                                                int64_t max_layers) {
-  if (context_group.world_size <= 0 || context_group.rank < 0 || context_group.rank >= context_group.world_size) {
-    throw std::invalid_argument("Qwen3.5 CP forward requires valid context rank/world_size");
-  }
+  const int64_t context_rank = group_local_rank(context_group, "Qwen3.5 CP forward");
   if (context_group.world_size == 1) {
     return forward_hidden(input_ids, max_layers);
   }
   auto hidden = distributed::context_parallel_slice_padded(
-      embed(input_ids), context_group.rank, context_group.world_size, 1, 0.0);
+      embed(input_ids), context_rank, context_group.world_size, 1, 0.0);
   int64_t layers = max_layers < 0 ? config_.num_hidden_layers : std::min(max_layers, config_.num_hidden_layers);
   return forward_hidden_range_context_parallel(hidden,
                                                0,
@@ -981,9 +994,7 @@ torch::Tensor Qwen35TextModel::forward_hidden_range_context_parallel(const torch
   if (layer_begin < 0 || layer_end < layer_begin || layer_end > config_.num_hidden_layers) {
     throw std::invalid_argument("invalid Qwen3.5 CP layer range");
   }
-  if (context_group.world_size <= 0 || context_group.rank < 0 || context_group.rank >= context_group.world_size) {
-    throw std::invalid_argument("Qwen3.5 CP layer range requires valid context rank/world_size");
-  }
+  (void)group_local_rank(context_group, "Qwen3.5 CP layer range");
   if (context_group.world_size == 1) {
     auto out = hidden_local;
     for (int64_t i = layer_begin; i < layer_end; ++i) {
