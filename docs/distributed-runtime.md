@@ -237,10 +237,12 @@ Current code exposes the distributed shape directly:
   streaming attention and returns gradients to the ring-exchange owner-gradient
   path. CUDA builds also expose fused forward and backward kernels for
   ring-ordered CP causal attention that compute causal softmax over ring KV
-  blocks without materializing a `[Q,K]` matrix. The first CUDA backward is a
-  correctness-oriented recompute kernel; full industrial CP training still
-  needs tile/shared-memory optimization, while the NCCL backend now caches
-  subgroup communicators with `ncclCommSplit` so CP groups can use the
+  blocks without materializing a `[Q,K]` matrix. The CUDA forward computes row
+  max/sum once per query row and reuses that softmax metadata across value
+  columns; the first CUDA backward is still a correctness-oriented recompute
+  kernel. Full industrial CP training still needs tile/shared-memory
+  optimization, while the NCCL backend now caches subgroup communicators with
+  `ncclCommSplit` so CP groups can use the
   reduce-scatter path directly when the installed NCCL version supports it.
 - `qwen3_5_pp_tp_ppo_trainer`: accepts DP/PP/CP/TP topology dimensions and
   records all four axes in metrics and checkpoint manifests. For `CP>1,TP=1`,

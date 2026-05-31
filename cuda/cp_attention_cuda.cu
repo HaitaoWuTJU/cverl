@@ -83,36 +83,55 @@ __global__ void cp_ring_attention_forward_kernel(const float* __restrict__ q,
   const int kv_bh_base_k = ((b * H + h) * Tk) * D;
   const int kv_bh_base_v = ((b * H + h) * Tk) * V;
 
-  for (int j = threadIdx.x; j < V; j += blockDim.x) {
-    if (!valid_query) {
-      out[out_base + j] = 0.0f;
-      continue;
-    }
-
+  __shared__ float shared_row_max;
+  __shared__ float shared_row_sum;
+  if (threadIdx.x == 0) {
     float row_max = -CUDART_INF_F;
-    for (int block = 0; block < num_blocks; ++block) {
-      const int key_begin = static_cast<int>(key_begin_positions[block]);
-      for (int local = 0; local < shard_size; ++local) {
-        const int k_pos = key_begin + local;
-        if (k_pos > q_pos || k_pos >= original_sequence_length) {
-          continue;
+    if (valid_query) {
+      for (int block = 0; block < num_blocks; ++block) {
+        const int key_begin = static_cast<int>(key_begin_positions[block]);
+        for (int local = 0; local < shard_size; ++local) {
+          const int k_pos = key_begin + local;
+          if (k_pos > q_pos || k_pos >= original_sequence_length) {
+            continue;
+          }
+          const int kt = block * shard_size + local;
+          float score = 0.0f;
+          for (int d = 0; d < D; ++d) {
+            score += q[q_base + d] * k[kv_bh_base_k + kt * D + d];
+          }
+          row_max = fmaxf(row_max, score * scale);
         }
-        const int kt = block * shard_size + local;
-        float score = 0.0f;
-        for (int d = 0; d < D; ++d) {
-          score += q[q_base + d] * k[kv_bh_base_k + kt * D + d];
-        }
-        score *= scale;
-        row_max = fmaxf(row_max, score);
       }
     }
+    float row_sum = 0.0f;
+    if (isfinite(row_max)) {
+      for (int block = 0; block < num_blocks; ++block) {
+        const int key_begin = static_cast<int>(key_begin_positions[block]);
+        for (int local = 0; local < shard_size; ++local) {
+          const int k_pos = key_begin + local;
+          if (k_pos > q_pos || k_pos >= original_sequence_length) {
+            continue;
+          }
+          const int kt = block * shard_size + local;
+          float score = 0.0f;
+          for (int d = 0; d < D; ++d) {
+            score += q[q_base + d] * k[kv_bh_base_k + kt * D + d];
+          }
+          row_sum += expf(score * scale - row_max);
+        }
+      }
+    }
+    shared_row_max = row_max;
+    shared_row_sum = row_sum;
+  }
+  __syncthreads();
 
-    if (!isfinite(row_max)) {
+  for (int j = threadIdx.x; j < V; j += blockDim.x) {
+    if (!valid_query || !isfinite(shared_row_max)) {
       out[out_base + j] = 0.0f;
       continue;
     }
-
-    float row_sum = 0.0f;
     float acc = 0.0f;
     for (int block = 0; block < num_blocks; ++block) {
       const int key_begin = static_cast<int>(key_begin_positions[block]);
@@ -126,12 +145,11 @@ __global__ void cp_ring_attention_forward_kernel(const float* __restrict__ q,
         for (int d = 0; d < D; ++d) {
           score += q[q_base + d] * k[kv_bh_base_k + kt * D + d];
         }
-        const float prob_num = expf(score * scale - row_max);
-        row_sum += prob_num;
+        const float prob_num = expf(score * scale - shared_row_max);
         acc += prob_num * v[kv_bh_base_v + kt * V + j];
       }
     }
-    out[out_base + j] = acc / fmaxf(row_sum, 1.0e-20f);
+    out[out_base + j] = acc / fmaxf(shared_row_sum, 1.0e-20f);
   }
 }
 
