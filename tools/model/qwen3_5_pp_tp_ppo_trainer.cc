@@ -273,6 +273,7 @@ struct PpPpoBatch {
   std::vector<torch::Tensor> advantages;
   std::vector<torch::Tensor> response_masks;
   std::vector<torch::Tensor> old_log_probs;
+  std::vector<torch::Tensor> ref_log_probs;
   int64_t rows = 0;
   double mean_reward = 0.0;
   double success_rate = 0.0;
@@ -290,6 +291,22 @@ torch::ScalarType parse_dtype(const std::string& dtype) {
     return torch::kFloat16;
   }
   throw std::invalid_argument("unsupported dtype");
+}
+
+cverl_kl_penalty_t parse_kl_penalty_mode(const std::string& mode) {
+  if (mode == "k1") {
+    return CVERL_KL_K1;
+  }
+  if (mode == "abs") {
+    return CVERL_KL_ABS;
+  }
+  if (mode == "k2") {
+    return CVERL_KL_K2;
+  }
+  if (mode == "k3") {
+    return CVERL_KL_K3;
+  }
+  throw std::invalid_argument("--kl-penalty must be k1|abs|k2|k3");
 }
 
 std::vector<std::string> json_string_vector(const nlohmann::json& obj, const char* key) {
@@ -603,6 +620,7 @@ void append_metrics_csv(const std::string& path,
                         double success_rate,
                         double adv_abs_sum,
                         double total_loss,
+                        double total_kl_loss,
                         double total_kl,
                         double total_clipfrac,
                         double total_grad_norm,
@@ -620,7 +638,7 @@ void append_metrics_csv(const std::string& path,
   std::ofstream out(path, std::ios::app);
   if (write_header) {
     out << "step,dp,pp,tp,micro_batches,layers,prompt_len,response_len,rollout_rows,"
-        << "mean_reward,success_rate,adv_abs_sum,loss_sum,ppo_kl_sum,clipfrac_sum,"
+        << "mean_reward,success_rate,adv_abs_sum,loss_sum,kl_loss_sum,ppo_kl_sum,clipfrac_sum,"
         << "grad_norm_sum,global_grad_norm,grad_clip_scale,param_delta_sum\n";
   }
   out << step << ","
@@ -636,6 +654,7 @@ void append_metrics_csv(const std::string& path,
       << success_rate << ","
       << adv_abs_sum << ","
       << total_loss << ","
+      << total_kl_loss << ","
       << total_kl << ","
       << total_clipfrac << ","
       << total_grad_norm << ","
@@ -725,6 +744,7 @@ cverl::rollout::GpuRolloutTensorKind parse_ipc_kind(const std::string& kind) {
   if (kind == "response_ids") return cverl::rollout::GpuRolloutTensorKind::ResponseIds;
   if (kind == "response_mask") return cverl::rollout::GpuRolloutTensorKind::ResponseMask;
   if (kind == "old_log_probs") return cverl::rollout::GpuRolloutTensorKind::OldLogProbs;
+  if (kind == "ref_log_probs") return cverl::rollout::GpuRolloutTensorKind::RefLogProbs;
   if (kind == "rewards") return cverl::rollout::GpuRolloutTensorKind::Rewards;
   if (kind == "advantages") return cverl::rollout::GpuRolloutTensorKind::Advantages;
   if (kind == "group_ids") return cverl::rollout::GpuRolloutTensorKind::GroupIds;
@@ -818,6 +838,11 @@ PpPpoBatch load_rollout_ipc_batch(const std::string& path,
   if (old_it != tensors.end()) {
     old_log_probs = old_it->second.to(torch::kFloat32);
   }
+  torch::Tensor ref_log_probs;
+  auto ref_it = tensors.find("ref_log_probs");
+  if (ref_it != tensors.end()) {
+    ref_log_probs = ref_it->second.to(torch::kFloat32);
+  }
 
   PpPpoBatch out;
   out.rows = batch;
@@ -828,12 +853,16 @@ PpPpoBatch load_rollout_ipc_batch(const std::string& path,
   out.advantages.reserve(static_cast<size_t>(batch));
   out.response_masks.reserve(static_cast<size_t>(batch));
   out.old_log_probs.reserve(static_cast<size_t>(batch));
+  out.ref_log_probs.reserve(static_cast<size_t>(batch));
   for (int64_t i = 0; i < batch; ++i) {
     out.token_ids.push_back(torch::cat({prompt_ids.index({i}), response_ids.index({i})}, 0).view({1, prompt_len + response_len}));
     out.advantages.push_back(advantages.index({i}).view({1, response_len}));
     out.response_masks.push_back(response_mask.index({i}).view({1, response_len}));
     if (old_log_probs.defined()) {
       out.old_log_probs.push_back(old_log_probs.index({i}).view({1, response_len}));
+    }
+    if (ref_log_probs.defined()) {
+      out.ref_log_probs.push_back(ref_log_probs.index({i}).view({1, response_len}));
     }
   }
   return out;
@@ -865,9 +894,11 @@ PpPpoBatch convert_gpu_rollout_batch(const cverl::rollout::GpuRolloutBatch& gpu_
   out.advantages.reserve(static_cast<size_t>(batch));
   out.response_masks.reserve(static_cast<size_t>(batch));
   out.old_log_probs.reserve(static_cast<size_t>(batch));
+  out.ref_log_probs.reserve(static_cast<size_t>(batch));
   auto response_mask = gpu_batch.response_mask.to(torch::kFloat32);
   auto advantages = gpu_batch.advantages.to(torch::kFloat32);
   torch::Tensor old_log_probs = gpu_batch.old_log_probs.defined() ? gpu_batch.old_log_probs.to(torch::kFloat32) : torch::Tensor();
+  torch::Tensor ref_log_probs = gpu_batch.ref_log_probs.defined() ? gpu_batch.ref_log_probs.to(torch::kFloat32) : torch::Tensor();
   for (int64_t i = 0; i < batch; ++i) {
     out.token_ids.push_back(torch::cat({gpu_batch.prompt_ids.index({i}), gpu_batch.response_ids.index({i})}, 0)
                                 .view({1, prompt_len + response_len})
@@ -876,6 +907,9 @@ PpPpoBatch convert_gpu_rollout_batch(const cverl::rollout::GpuRolloutBatch& gpu_
     out.response_masks.push_back(response_mask.index({i}).view({1, response_len}).contiguous());
     if (old_log_probs.defined()) {
       out.old_log_probs.push_back(old_log_probs.index({i}).view({1, response_len}).contiguous());
+    }
+    if (ref_log_probs.defined()) {
+      out.ref_log_probs.push_back(ref_log_probs.index({i}).view({1, response_len}).contiguous());
     }
   }
   return out;
@@ -977,6 +1011,8 @@ int main(int argc, char** argv) {
     const int64_t steps = arg_i64(argc, argv, "--steps", 1);
     const double lr = arg_f64(argc, argv, "--lr", 1.0e-8);
     const double clip_ratio = arg_f64(argc, argv, "--clip-ratio", 0.2);
+    const double kl_coef = arg_f64(argc, argv, "--kl-coef", 0.0);
+    const auto kl_penalty_mode = parse_kl_penalty_mode(arg_str(argc, argv, "--kl-penalty", "k1"));
     const double max_grad_norm = arg_f64(argc, argv, "--max-grad-norm", 1.0);
     const double advantage_scale = arg_f64(argc, argv, "--advantage-scale", 1.0);
     const bool use_master_weights = arg_bool(argc, argv, "--master-weights", false);
@@ -1006,6 +1042,9 @@ int main(int argc, char** argv) {
     }
     if (prompt_len <= 0 || response_len <= 0 || max_grad_norm < 0.0) {
       throw std::invalid_argument("prompt-len and response-len must be positive");
+    }
+    if (kl_coef < 0.0) {
+      throw std::invalid_argument("--kl-coef must be non-negative");
     }
 
     const int64_t seq_len = prompt_len + response_len;
@@ -1130,6 +1169,7 @@ int main(int argc, char** argv) {
       std::unordered_map<int64_t, torch::Tensor> stage_inputs;
       std::unordered_map<int64_t, torch::Tensor> stage_outputs;
       double loss_sum = 0.0;
+      double kl_loss_sum = 0.0;
       double kl_sum = 0.0;
       double clipfrac_sum = 0.0;
       double mean_reward = 0.0;
@@ -1221,8 +1261,21 @@ int main(int argc, char** argv) {
                 -1.0,
                 3.0,
                 CVERL_LOSS_AGG_TOKEN_MEAN);
-            auto scaled_loss = loss.pg_loss / static_cast<double>(micro_batches);
+            torch::Tensor total_loss = loss.pg_loss;
+            torch::Tensor kl_loss = torch::zeros({}, total_loss.options());
+            if (kl_coef > 0.0) {
+              if (active_rollout == nullptr || active_rollout->ref_log_probs.empty()) {
+                throw std::runtime_error("--kl-coef > 0 requires ref_log_probs in rollout batch");
+              }
+              const int64_t idx = action.micro_batch % active_rollout->rows;
+              auto ref_log_probs = active_rollout->ref_log_probs[static_cast<size_t>(idx)];
+              auto kl_token = cverl::torch_backend::kl_penalty(log_probs, ref_log_probs, kl_penalty_mode);
+              kl_loss = cverl::torch_backend::masked_mean(kl_token, response_mask);
+              total_loss = total_loss + kl_coef * kl_loss;
+            }
+            auto scaled_loss = total_loss / static_cast<double>(micro_batches);
             loss_sum += scaled_loss.item<double>();
+            kl_loss_sum += kl_loss.item<double>();
             kl_sum += loss.ppo_kl.item<double>();
             clipfrac_sum += loss.pg_clipfrac.item<double>();
             scaled_loss.backward();
@@ -1293,6 +1346,7 @@ int main(int argc, char** argv) {
       auto grad_tensor = torch::tensor({local_grad_norm}, torch::TensorOptions().device(device).dtype(torch::kFloat32));
       auto delta_tensor = torch::tensor({local_param_delta}, torch::TensorOptions().device(device).dtype(torch::kFloat32));
       auto loss_tensor = torch::tensor({loss_sum}, torch::TensorOptions().device(device).dtype(torch::kFloat32));
+      auto kl_loss_tensor = torch::tensor({kl_loss_sum}, torch::TensorOptions().device(device).dtype(torch::kFloat32));
       auto kl_tensor = torch::tensor({kl_sum}, torch::TensorOptions().device(device).dtype(torch::kFloat32));
       auto clip_tensor = torch::tensor({clipfrac_sum}, torch::TensorOptions().device(device).dtype(torch::kFloat32));
       auto global_grad_tensor =
@@ -1302,6 +1356,7 @@ int main(int argc, char** argv) {
       auto grad_norms = full_comm.all_gather(grad_tensor.contiguous(), full_ranks, 0).cpu();
       auto param_deltas = full_comm.all_gather(delta_tensor.contiguous(), full_ranks, 0).cpu();
       auto loss_sums = full_comm.all_gather(loss_tensor.contiguous(), full_ranks, 0).cpu();
+      auto kl_loss_sums = full_comm.all_gather(kl_loss_tensor.contiguous(), full_ranks, 0).cpu();
       auto kl_sums = full_comm.all_gather(kl_tensor.contiguous(), full_ranks, 0).cpu();
       auto clip_sums = full_comm.all_gather(clip_tensor.contiguous(), full_ranks, 0).cpu();
       auto global_grad_norms = full_comm.all_gather(global_grad_tensor.contiguous(), full_ranks, 0).cpu();
@@ -1313,6 +1368,7 @@ int main(int argc, char** argv) {
         bool all_updated = true;
         bool any_updated = false;
         double total_loss = 0.0;
+        double total_kl_loss = 0.0;
         double total_kl = 0.0;
         double total_clipfrac = 0.0;
         double total_grad_norm = 0.0;
@@ -1328,6 +1384,7 @@ int main(int argc, char** argv) {
           total_grad_norm += grad_value;
           total_param_delta += delta_value;
           total_loss += loss_sums[i].item<double>();
+          total_kl_loss += kl_loss_sums[i].item<double>();
           total_kl += kl_sums[i].item<double>();
           total_clipfrac += clip_sums[i].item<double>();
           if (i == 0) {
@@ -1349,6 +1406,7 @@ int main(int argc, char** argv) {
                            success_rate,
                            adv_abs_sum,
                            total_loss,
+                           total_kl_loss,
                            total_kl,
                            total_clipfrac,
                            total_grad_norm,
@@ -1369,10 +1427,12 @@ int main(int argc, char** argv) {
                   << " vary_tokens_by_step=" << (vary_tokens_by_step ? "true" : "false")
                   << " jsonl_examples=" << jsonl_batches.size()
                   << " rollout_rows=" << (active_rollout != nullptr ? active_rollout->rows : 0)
+                  << " kl_coef=" << kl_coef
                   << " mean_reward=" << mean_reward
                   << " success_rate=" << success_rate
                   << " adv_abs_sum=" << adv_abs_sum
                   << " loss_sum=" << total_loss
+                  << " kl_loss_sum=" << total_kl_loss
                   << " ppo_kl_sum=" << total_kl
                   << " clipfrac_sum=" << total_clipfrac
                   << " grad_norm_sum=" << total_grad_norm

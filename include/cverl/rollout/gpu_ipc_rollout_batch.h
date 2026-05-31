@@ -25,6 +25,7 @@ enum class GpuRolloutTensorKind : int32_t {
   Rewards = 4,
   Advantages = 5,
   GroupIds = 6,
+  RefLogProbs = 7,
 };
 
 struct GpuIpcTensorHandle {

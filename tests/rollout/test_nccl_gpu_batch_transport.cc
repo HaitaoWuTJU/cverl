@@ -77,6 +77,7 @@ int main(int argc, char** argv) {
       batch.response_mask = torch::ones({3, 2}, torch::TensorOptions().device(dev).dtype(torch::kFloat32));
       batch.advantages = torch::tensor({1.0f, -1.0f, 0.5f, -0.5f, 2.0f, -2.0f}, torch::TensorOptions().device(dev)).view({3, 2}).contiguous();
       batch.old_log_probs = torch::full({3, 2}, -3.0f, torch::TensorOptions().device(dev).dtype(torch::kFloat32));
+      batch.ref_log_probs = torch::full({3, 2}, -3.5f, torch::TensorOptions().device(dev).dtype(torch::kFloat32));
       batch.rewards = torch::tensor({1.0f, 0.0f, 1.0f}, torch::TensorOptions().device(dev));
       batch.group_ids = torch::tensor({0, 0, 1}, torch::TensorOptions().device(dev).dtype(torch::kInt64));
       cverl::rollout::NCCLGpuBatchSender sender(comm);
@@ -98,6 +99,12 @@ int main(int argc, char** argv) {
       require_allclose(batch.advantages,
                        torch::tensor({1.0f, -1.0f, 0.5f, -0.5f, 2.0f, -2.0f}, torch::TensorOptions().device(dev)).view({3, 2}),
                        "advantages mismatch");
+      require_allclose(batch.old_log_probs,
+                       torch::full({3, 2}, -3.0f, torch::TensorOptions().device(dev).dtype(torch::kFloat32)),
+                       "old log probs mismatch");
+      require_allclose(batch.ref_log_probs,
+                       torch::full({3, 2}, -3.5f, torch::TensorOptions().device(dev).dtype(torch::kFloat32)),
+                       "ref log probs mismatch");
       cverl::rollout::TrainerIngressQueue queue(1);
       require(queue.push(std::move(batch)), "queue push failed");
       require(!queue.push(cverl::rollout::GpuRolloutBatch{}), "queue capacity failed");

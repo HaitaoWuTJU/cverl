@@ -8,7 +8,7 @@ namespace {
 
 constexpr int64_t kMagic = 0x4356524c42415443LL;  // CVRLBATC
 constexpr int64_t kVersion = 1;
-constexpr int64_t kMaxTensors = 7;
+constexpr int64_t kMaxTensors = 8;
 constexpr int64_t kWordsPerTensor = 8;  // kind,dtype,ndim,shape[0..3],reserved
 constexpr int64_t kHeaderWords = 8 + kMaxTensors * kWordsPerTensor;
 
@@ -50,6 +50,8 @@ torch::Tensor tensor_for_kind(const GpuRolloutBatch& batch, GpuRolloutTensorKind
       return batch.response_mask;
     case GpuRolloutTensorKind::OldLogProbs:
       return batch.old_log_probs;
+    case GpuRolloutTensorKind::RefLogProbs:
+      return batch.ref_log_probs;
     case GpuRolloutTensorKind::Rewards:
       return batch.rewards;
     case GpuRolloutTensorKind::Advantages:
@@ -73,6 +75,9 @@ void set_tensor_for_kind(GpuRolloutBatch* batch, GpuRolloutTensorKind kind, torc
       return;
     case GpuRolloutTensorKind::OldLogProbs:
       batch->old_log_probs = std::move(tensor);
+      return;
+    case GpuRolloutTensorKind::RefLogProbs:
+      batch->ref_log_probs = std::move(tensor);
       return;
     case GpuRolloutTensorKind::Rewards:
       batch->rewards = std::move(tensor);
@@ -178,6 +183,7 @@ GpuRolloutBatchDescriptor describe_gpu_rollout_batch(const GpuRolloutBatch& batc
   add_desc(&desc.tensors, GpuRolloutTensorKind::ResponseIds, batch.response_ids);
   add_desc(&desc.tensors, GpuRolloutTensorKind::ResponseMask, batch.response_mask);
   add_desc(&desc.tensors, GpuRolloutTensorKind::OldLogProbs, batch.old_log_probs);
+  add_desc(&desc.tensors, GpuRolloutTensorKind::RefLogProbs, batch.ref_log_probs);
   add_desc(&desc.tensors, GpuRolloutTensorKind::Rewards, batch.rewards);
   add_desc(&desc.tensors, GpuRolloutTensorKind::Advantages, batch.advantages);
   add_desc(&desc.tensors, GpuRolloutTensorKind::GroupIds, batch.group_ids);

@@ -35,6 +35,7 @@ struct GpuRolloutBatch {
   torch::Tensor response_mask;
   torch::Tensor advantages;
   torch::Tensor old_log_probs;
+  torch::Tensor ref_log_probs;
   torch::Tensor rewards;
   torch::Tensor group_ids;
 };
