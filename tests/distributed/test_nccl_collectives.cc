@@ -1,8 +1,10 @@
+#include "cverl/distributed/context_parallel.h"
 #include "cverl/distributed/nccl_collectives.h"
 #include "cverl/distributed/parallel_ops.h"
 #include "cverl/distributed/weight_sync.h"
 
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
@@ -124,6 +126,40 @@ int main(int argc, char** argv) {
     require_allclose(gathered, expected_gather, "NCCL all_gather mismatch");
     require_throws([&]() { (void)comm.all_gather(gathered.contiguous(), group, 1); },
                    "NCCL all_gather should reject dim != 0");
+
+    {
+      torch::manual_seed(321);
+      constexpr int64_t batch = 1;
+      constexpr int64_t heads = 2;
+      constexpr int64_t local_seq = 3;
+      constexpr int64_t head_dim = 4;
+      constexpr int64_t value_dim = 5;
+      const int64_t global_seq = world * local_seq;
+      auto cpu_q = torch::randn({batch, heads, global_seq, head_dim}, torch::kFloat32);
+      auto cpu_k = torch::randn({batch, heads, global_seq, head_dim}, torch::kFloat32);
+      auto cpu_v = torch::randn({batch, heads, global_seq, value_dim}, torch::kFloat32);
+      const double scale = 1.0 / std::sqrt(static_cast<double>(head_dim));
+      auto dense_scores = torch::matmul(cpu_q, cpu_k.transpose(2, 3)) * scale;
+      auto causal =
+          torch::ones({global_seq, global_seq}, torch::TensorOptions().dtype(torch::kBool)).triu(1);
+      dense_scores = dense_scores.masked_fill(causal.unsqueeze(0).unsqueeze(0), -1.0e9);
+      auto expected = torch::matmul(torch::softmax(dense_scores, -1), cpu_v)
+                          .narrow(2, rank * local_seq, local_seq)
+                          .to(torch::Device(torch::kCUDA, static_cast<int>(device)))
+                          .contiguous();
+
+      auto opts = torch::TensorOptions().device(torch::kCUDA, static_cast<int>(device)).dtype(torch::kFloat32);
+      auto q_local = cpu_q.narrow(2, rank * local_seq, local_seq).to(opts).contiguous().set_requires_grad(true);
+      auto k_local = cpu_k.narrow(2, rank * local_seq, local_seq).to(opts).contiguous();
+      auto v_local = cpu_v.narrow(2, rank * local_seq, local_seq).to(opts).contiguous();
+      auto cp_out = cverl::distributed::context_parallel_causal_attention_gather_kv(
+          q_local, k_local, v_local, comm, group, rank, global_seq, scale);
+      require_allclose(cp_out, expected, "NCCL CP causal attention gather-KV mismatch");
+      cp_out.sum().backward();
+      if (!q_local.grad().defined() || q_local.grad().abs().sum().item<float>() <= 0.0f) {
+        throw std::runtime_error("NCCL CP causal attention did not produce local query gradients");
+      }
+    }
 
     auto scatter_in = torch::full({world, 2}, static_cast<float>(rank + 1),
                                   torch::TensorOptions().device(torch::kCUDA, static_cast<int>(device)).dtype(torch::kFloat32));

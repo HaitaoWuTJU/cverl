@@ -207,8 +207,8 @@ torch::Tensor context_parallel_causal_attention_gather_kv(const torch::Tensor& q
   if (key_local.size(2) != shard || value_local.size(2) != shard) {
     throw std::invalid_argument("query/key/value local CP shards must have matching sequence length");
   }
-  auto key_global = collectives.all_gather(key_local.contiguous(), context_group, 2).contiguous();
-  auto value_global = collectives.all_gather(value_local.contiguous(), context_group, 2).contiguous();
+  auto key_global = context_parallel_gather(key_local.contiguous(), collectives, context_group, 2).contiguous();
+  auto value_global = context_parallel_gather(value_local.contiguous(), collectives, context_group, 2).contiguous();
   if (key_global.size(2) < original_sequence_length || value_global.size(2) < original_sequence_length) {
     throw std::invalid_argument("gathered CP KV is shorter than original_sequence_length");
   }
