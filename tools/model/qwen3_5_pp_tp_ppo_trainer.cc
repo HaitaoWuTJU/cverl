@@ -1929,9 +1929,10 @@ int main(int argc, char** argv) {
         double total_param_delta = 0.0;
         double reported_global_grad_norm = 0.0;
         double reported_grad_clip_scale = 1.0;
+        auto metrics = gathered_metrics.accessor<float, 2>();
         for (int64_t i = 0; i < world_size; ++i) {
-          const double grad_value = gathered_metrics[i][0].item<double>();
-          const double delta_value = gathered_metrics[i][1].item<double>();
+          const double grad_value = static_cast<double>(metrics[i][0]);
+          const double delta_value = static_cast<double>(metrics[i][1]);
           all_have_grad = all_have_grad && std::isfinite(grad_value) && grad_value > 0.0;
           if (measure_param_delta) {
             all_updated = all_updated && std::isfinite(delta_value) && delta_value > 0.0;
@@ -1939,13 +1940,13 @@ int main(int argc, char** argv) {
           }
           total_grad_norm += grad_value;
           total_param_delta += delta_value;
-          total_loss += gathered_metrics[i][2].item<double>();
-          total_kl_loss += gathered_metrics[i][3].item<double>();
-          total_kl += gathered_metrics[i][4].item<double>();
-          total_clipfrac += gathered_metrics[i][5].item<double>();
+          total_loss += static_cast<double>(metrics[i][2]);
+          total_kl_loss += static_cast<double>(metrics[i][3]);
+          total_kl += static_cast<double>(metrics[i][4]);
+          total_clipfrac += static_cast<double>(metrics[i][5]);
           if (i == 0) {
-            reported_global_grad_norm = gathered_metrics[i][6].item<double>();
-            reported_grad_clip_scale = gathered_metrics[i][7].item<double>();
+            reported_global_grad_norm = static_cast<double>(metrics[i][6]);
+            reported_grad_clip_scale = static_cast<double>(metrics[i][7]);
           }
         }
         if (!measure_param_delta) {

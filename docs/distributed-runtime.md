@@ -73,6 +73,8 @@ call `synchronize()`.
 The PP/TP trainer also keeps per-micro-batch loss metrics on device and only
 gathers one compact metric tensor per step. Do not call `Tensor::item()` inside
 the 1F1B micro-batch loop; it serializes the CUDA stream and destroys overlap.
+Rank-0 step metric aggregation uses direct CPU tensor accessors after the
+single all-gather transfer; avoid reintroducing per-field `item()` dispatch.
 Gradient buckets avoid `torch::cat` for single-tensor flushes; preserve this
 fast path for small replicated TP parameters and bucket-boundary tail tensors.
 Single-rank DP gradient sync and reduce-scatter return local gradients without
