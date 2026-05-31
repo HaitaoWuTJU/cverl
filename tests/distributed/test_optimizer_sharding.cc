@@ -133,6 +133,19 @@ void test_greedy_owners_cover_every_parameter() {
   require(sums[0] == 100 && sums[1] == 110 && sums[2] == 90, "unexpected greedy byte balance");
 }
 
+void test_greedy_owners_sort_by_size_before_assignment() {
+  const std::vector<int64_t> bytes{1, 1, 100, 1, 1, 100};
+  auto owners = cverl::distributed::greedy_parameter_owner_by_size(bytes, 2);
+  require(owners.size() == bytes.size(), "unordered owner size mismatch");
+  require(owners[2] != owners[5], "largest parameters should split across ranks");
+  std::vector<int64_t> sums(2, 0);
+  for (size_t i = 0; i < bytes.size(); ++i) {
+    require(owners[i] >= 0 && owners[i] < 2, "unordered owner out of range");
+    sums[static_cast<size_t>(owners[i])] += bytes[i];
+  }
+  require(sums[0] == 102 && sums[1] == 102, "size-sorted greedy owner balance");
+}
+
 void test_owned_indices() {
   const std::vector<int64_t> owners{0, 1, 2, 1, 0};
   auto rank0 = cverl::distributed::owned_parameter_indices(owners, 0);
@@ -499,6 +512,7 @@ void test_flat_sharded_adamw_single_dp_skips_data_collectives() {
 int main() {
   try {
     test_greedy_owners_cover_every_parameter();
+    test_greedy_owners_sort_by_size_before_assignment();
     test_owned_indices();
     test_validation();
     test_flat_parameter_shards_roundtrip();

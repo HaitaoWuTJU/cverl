@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <numeric>
 #include <stdexcept>
 
 namespace cverl::distributed {
@@ -320,20 +321,26 @@ std::vector<int64_t> greedy_parameter_owner_by_size(const std::vector<int64_t>& 
     throw std::invalid_argument("data_parallel must be positive");
   }
   std::vector<int64_t> bytes_by_rank(static_cast<size_t>(data_parallel), 0);
-  std::vector<int64_t> owner_by_parameter;
-  owner_by_parameter.reserve(parameter_bytes.size());
+  std::vector<int64_t> owner_by_parameter(parameter_bytes.size(), 0);
+  std::vector<size_t> order(parameter_bytes.size());
+  std::iota(order.begin(), order.end(), 0);
   for (int64_t bytes : parameter_bytes) {
     if (bytes < 0) {
       throw std::invalid_argument("parameter byte size must be non-negative");
     }
+  }
+  std::stable_sort(order.begin(), order.end(), [&](size_t lhs, size_t rhs) {
+    return parameter_bytes[lhs] > parameter_bytes[rhs];
+  });
+  for (size_t parameter_index : order) {
     int64_t owner = 0;
     for (int64_t rank = 1; rank < data_parallel; ++rank) {
       if (bytes_by_rank[static_cast<size_t>(rank)] < bytes_by_rank[static_cast<size_t>(owner)]) {
         owner = rank;
       }
     }
-    owner_by_parameter.push_back(owner);
-    bytes_by_rank[static_cast<size_t>(owner)] += bytes;
+    owner_by_parameter[parameter_index] = owner;
+    bytes_by_rank[static_cast<size_t>(owner)] += parameter_bytes[parameter_index];
   }
   return owner_by_parameter;
 }
