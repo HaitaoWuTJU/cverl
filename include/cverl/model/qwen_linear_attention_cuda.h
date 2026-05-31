@@ -1,5 +1,9 @@
 #pragma once
 
+#include <cstdint>
+#include <tuple>
+#include <vector>
+
 #include <torch/torch.h>
 
 namespace cverl {
@@ -13,6 +17,14 @@ std::tuple<torch::Tensor, torch::Tensor> qwen_linear_attention_cuda_forward(
     const torch::Tensor& beta,
     const torch::Tensor& g,
     bool save_states);
+
+std::tuple<torch::Tensor, torch::Tensor> qwen_linear_attention_cuda_forward_checkpointed(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    const torch::Tensor& beta,
+    const torch::Tensor& g,
+    int64_t checkpoint_interval);
 
 std::vector<torch::Tensor> qwen_linear_attention_cuda_backward(
     const torch::Tensor& grad_out,
@@ -30,5 +42,15 @@ std::vector<torch::Tensor> qwen_linear_attention_cuda_backward_recompute(
     const torch::Tensor& value,
     const torch::Tensor& beta,
     const torch::Tensor& g);
+
+std::vector<torch::Tensor> qwen_linear_attention_cuda_backward_checkpointed(
+    const torch::Tensor& grad_out,
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    const torch::Tensor& beta,
+    const torch::Tensor& g,
+    const torch::Tensor& checkpoints,
+    int64_t checkpoint_interval);
 
 }  // namespace cverl

@@ -25,6 +25,22 @@ std::tuple<torch::Tensor, torch::Tensor> qwen_linear_attention_cuda_forward(
   throw std::runtime_error("Qwen linear attention CUDA kernel was not built");
 }
 
+std::tuple<torch::Tensor, torch::Tensor> qwen_linear_attention_cuda_forward_checkpointed(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    const torch::Tensor& beta,
+    const torch::Tensor& g,
+    int64_t checkpoint_interval) {
+  (void)query;
+  (void)key;
+  (void)value;
+  (void)beta;
+  (void)g;
+  (void)checkpoint_interval;
+  throw std::runtime_error("Qwen linear attention CUDA kernel was not built");
+}
+
 std::vector<torch::Tensor> qwen_linear_attention_cuda_backward(
     const torch::Tensor& grad_out,
     const torch::Tensor& query,
@@ -56,6 +72,26 @@ std::vector<torch::Tensor> qwen_linear_attention_cuda_backward_recompute(
   (void)value;
   (void)beta;
   (void)g;
+  throw std::runtime_error("Qwen linear attention CUDA kernel was not built");
+}
+
+std::vector<torch::Tensor> qwen_linear_attention_cuda_backward_checkpointed(
+    const torch::Tensor& grad_out,
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    const torch::Tensor& beta,
+    const torch::Tensor& g,
+    const torch::Tensor& checkpoints,
+    int64_t checkpoint_interval) {
+  (void)grad_out;
+  (void)query;
+  (void)key;
+  (void)value;
+  (void)beta;
+  (void)g;
+  (void)checkpoints;
+  (void)checkpoint_interval;
   throw std::runtime_error("Qwen linear attention CUDA kernel was not built");
 }
 #endif

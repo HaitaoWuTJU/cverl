@@ -185,9 +185,40 @@ bool use_cuda_linear_attention_kernel(const torch::Tensor& query, int64_t kd, in
          kd == 128 && vd == 128;
 }
 
-bool save_cuda_linear_attention_states() {
-  const char* env = std::getenv("CVERL_LINEAR_ATTN_SAVE_STATES");
-  return env != nullptr && std::string(env) == "1";
+enum class CudaLinearAttentionStateMode {
+  None = 0,
+  Full = 1,
+  Chunk = 2,
+};
+
+CudaLinearAttentionStateMode cuda_linear_attention_state_mode() {
+  const char* mode_env = std::getenv("CVERL_LINEAR_ATTN_STATE_MODE");
+  if (mode_env != nullptr && *mode_env != '\0') {
+    const std::string mode(mode_env);
+    if (mode == "none" || mode == "recompute") {
+      return CudaLinearAttentionStateMode::None;
+    }
+    if (mode == "full") {
+      return CudaLinearAttentionStateMode::Full;
+    }
+    if (mode == "chunk" || mode == "checkpoint") {
+      return CudaLinearAttentionStateMode::Chunk;
+    }
+    throw std::invalid_argument("CVERL_LINEAR_ATTN_STATE_MODE must be none|recompute|full|chunk|checkpoint");
+  }
+
+  const char* save_env = std::getenv("CVERL_LINEAR_ATTN_SAVE_STATES");
+  return (save_env != nullptr && std::string(save_env) == "1") ? CudaLinearAttentionStateMode::Full
+                                                               : CudaLinearAttentionStateMode::None;
+}
+
+int64_t cuda_linear_attention_checkpoint_interval() {
+  const char* env = std::getenv("CVERL_LINEAR_ATTN_CHECKPOINT_INTERVAL");
+  int64_t value = (env == nullptr || *env == '\0') ? linear_attention_chunk_size() : std::stoll(env);
+  if (value <= 0) {
+    throw std::invalid_argument("CVERL_LINEAR_ATTN_CHECKPOINT_INTERVAL must be positive");
+  }
+  return value;
 }
 
 class QwenLinearAttentionCudaFunction
@@ -199,12 +230,31 @@ class QwenLinearAttentionCudaFunction
                                torch::Tensor value,
                                torch::Tensor beta,
                                torch::Tensor g) {
-    const bool save_states = save_cuda_linear_attention_states();
-    auto result = qwen_linear_attention_cuda_forward(
-        query.contiguous(), key.contiguous(), value.contiguous(), beta.contiguous(), g.contiguous(), save_states);
+    const auto state_mode = cuda_linear_attention_state_mode();
+    const int64_t checkpoint_interval =
+        state_mode == CudaLinearAttentionStateMode::Chunk ? cuda_linear_attention_checkpoint_interval() : 0;
+    std::tuple<torch::Tensor, torch::Tensor> result;
+    if (state_mode == CudaLinearAttentionStateMode::Chunk) {
+      result = qwen_linear_attention_cuda_forward_checkpointed(
+          query.contiguous(),
+          key.contiguous(),
+          value.contiguous(),
+          beta.contiguous(),
+          g.contiguous(),
+          checkpoint_interval);
+    } else {
+      result = qwen_linear_attention_cuda_forward(
+          query.contiguous(),
+          key.contiguous(),
+          value.contiguous(),
+          beta.contiguous(),
+          g.contiguous(),
+          state_mode == CudaLinearAttentionStateMode::Full);
+    }
     auto out = std::get<0>(result);
     auto states = std::get<1>(result);
-    ctx->saved_data["save_states"] = save_states;
+    ctx->saved_data["state_mode"] = static_cast<int64_t>(state_mode);
+    ctx->saved_data["checkpoint_interval"] = checkpoint_interval;
     ctx->save_for_backward({query, key, value, beta, g, states});
     return out;
   }
@@ -212,9 +262,11 @@ class QwenLinearAttentionCudaFunction
   static torch::autograd::tensor_list backward(torch::autograd::AutogradContext* ctx,
                                                torch::autograd::tensor_list grad_outputs) {
     auto saved = ctx->get_saved_variables();
-    const bool save_states = ctx->saved_data["save_states"].toBool();
+    const auto state_mode =
+        static_cast<CudaLinearAttentionStateMode>(ctx->saved_data["state_mode"].toInt());
+    const int64_t checkpoint_interval = ctx->saved_data["checkpoint_interval"].toInt();
     std::vector<torch::Tensor> grads;
-    if (save_states) {
+    if (state_mode == CudaLinearAttentionStateMode::Full) {
       grads = qwen_linear_attention_cuda_backward(
           grad_outputs[0].contiguous(),
           saved[0].contiguous(),
@@ -223,6 +275,16 @@ class QwenLinearAttentionCudaFunction
           saved[3].contiguous(),
           saved[4].contiguous(),
           saved[5].contiguous());
+    } else if (state_mode == CudaLinearAttentionStateMode::Chunk) {
+      grads = qwen_linear_attention_cuda_backward_checkpointed(
+          grad_outputs[0].contiguous(),
+          saved[0].contiguous(),
+          saved[1].contiguous(),
+          saved[2].contiguous(),
+          saved[3].contiguous(),
+          saved[4].contiguous(),
+          saved[5].contiguous(),
+          checkpoint_interval);
     } else {
       grads = qwen_linear_attention_cuda_backward_recompute(
           grad_outputs[0].contiguous(),

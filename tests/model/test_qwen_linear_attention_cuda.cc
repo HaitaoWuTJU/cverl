@@ -52,20 +52,30 @@ int main() {
 
   auto saved_forward = cverl::qwen_linear_attention_cuda_forward(q, k, v, beta, g, true);
   auto recompute_forward = cverl::qwen_linear_attention_cuda_forward(q, k, v, beta, g, false);
+  auto checkpointed_forward = cverl::qwen_linear_attention_cuda_forward_checkpointed(q, k, v, beta, g, 2);
   auto saved_out = std::get<0>(saved_forward);
   auto recompute_out = std::get<0>(recompute_forward);
+  auto checkpointed_out = std::get<0>(checkpointed_forward);
   require_close(recompute_out.cpu(), saved_out.cpu(), 2e-4, 2e-4, "forward");
+  require_close(checkpointed_out.cpu(), saved_out.cpu(), 2e-4, 2e-4, "checkpointed forward");
 
   auto saved_grads = cverl::qwen_linear_attention_cuda_backward(
       grad_out, q, k, v, beta, g, std::get<1>(saved_forward));
   auto recompute_grads = cverl::qwen_linear_attention_cuda_backward_recompute(
       grad_out, q, k, v, beta, g);
+  auto checkpointed_grads = cverl::qwen_linear_attention_cuda_backward_checkpointed(
+      grad_out, q, k, v, beta, g, std::get<1>(checkpointed_forward), 2);
 
   require_close(recompute_grads[0].cpu(), saved_grads[0].cpu(), 5e-4, 5e-4, "dq");
   require_close(recompute_grads[1].cpu(), saved_grads[1].cpu(), 5e-4, 5e-4, "dk");
   require_close(recompute_grads[2].cpu(), saved_grads[2].cpu(), 5e-4, 5e-4, "dv");
   require_close(recompute_grads[3].cpu(), saved_grads[3].cpu(), 5e-4, 5e-4, "dbeta");
   require_close(recompute_grads[4].cpu(), saved_grads[4].cpu(), 5e-4, 5e-4, "dg");
+  require_close(checkpointed_grads[0].cpu(), saved_grads[0].cpu(), 5e-4, 5e-4, "checkpointed dq");
+  require_close(checkpointed_grads[1].cpu(), saved_grads[1].cpu(), 5e-4, 5e-4, "checkpointed dk");
+  require_close(checkpointed_grads[2].cpu(), saved_grads[2].cpu(), 5e-4, 5e-4, "checkpointed dv");
+  require_close(checkpointed_grads[3].cpu(), saved_grads[3].cpu(), 5e-4, 5e-4, "checkpointed dbeta");
+  require_close(checkpointed_grads[4].cpu(), saved_grads[4].cpu(), 5e-4, 5e-4, "checkpointed dg");
 
   std::cout << "test_qwen_linear_attention_cuda passed\n";
   return 0;
