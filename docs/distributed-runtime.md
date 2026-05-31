@@ -75,6 +75,8 @@ gathers one compact metric tensor per step. Do not call `Tensor::item()` inside
 the 1F1B micro-batch loop; it serializes the CUDA stream and destroys overlap.
 Gradient buckets avoid `torch::cat` for single-tensor flushes; preserve this
 fast path for small replicated TP parameters and bucket-boundary tail tensors.
+Qwen TP replicated parameters are classified once at trainer startup; the
+per-step gradient sync should only walk the precomputed tensor list.
 
 ## Current TP/DP Implementation
 

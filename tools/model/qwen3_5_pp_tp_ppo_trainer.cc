@@ -355,8 +355,21 @@ bool qwen_tp_replicated_parameter(const std::string& name) {
   return false;
 }
 
-void sync_tp_replicated_gradients(const std::vector<std::string>& names,
-                                  const std::vector<torch::Tensor>& params,
+std::vector<torch::Tensor> collect_tp_replicated_parameters(const std::vector<std::string>& names,
+                                                            const std::vector<torch::Tensor>& params) {
+  if (names.size() != params.size()) {
+    throw std::runtime_error("TP replicated parameter collection name/param size mismatch");
+  }
+  std::vector<torch::Tensor> replicated_params;
+  for (size_t i = 0; i < params.size(); ++i) {
+    if (qwen_tp_replicated_parameter(names[i])) {
+      replicated_params.push_back(params[i]);
+    }
+  }
+  return replicated_params;
+}
+
+void sync_tp_replicated_gradients(const std::vector<torch::Tensor>& replicated_params,
                                   cverl::distributed::ParallelGroup& tp_group,
                                   int64_t bucket_bytes) {
   if (tp_group.world_size == 1) {
@@ -364,20 +377,6 @@ void sync_tp_replicated_gradients(const std::vector<std::string>& names,
   }
   if (tp_group.collectives == nullptr) {
     throw std::runtime_error("TP replicated gradient sync requires collectives");
-  }
-  if (names.size() != params.size()) {
-    throw std::runtime_error("TP replicated gradient sync name/param size mismatch");
-  }
-  std::vector<torch::Tensor> replicated_params;
-  for (size_t i = 0; i < params.size(); ++i) {
-    if (!qwen_tp_replicated_parameter(names[i])) {
-      continue;
-    }
-    auto& p = params[i];
-    if (!p.defined() || !p.grad().defined()) {
-      continue;
-    }
-    replicated_params.push_back(p);
   }
   cverl::distributed::data_parallel_sync_gradients(
       replicated_params, *tp_group.collectives, tp_group.ranks, true, bucket_bytes);
@@ -1544,6 +1543,7 @@ int main(int argc, char** argv) {
     for (const auto& p : params) {
       param_bytes.push_back(p.numel() * static_cast<int64_t>(p.element_size()));
     }
+    const auto tp_replicated_params = collect_tp_replicated_parameters(param_names, params);
     std::vector<int64_t> dp_optimizer_owner_by_param(params.size(), 0);
     if (dp_shard_optimizer) {
       dp_optimizer_owner_by_param = cverl::distributed::greedy_parameter_owner_by_size(param_bytes, dp_size);
@@ -1746,7 +1746,7 @@ int main(int argc, char** argv) {
         }
       }
 
-      sync_tp_replicated_gradients(param_names, params, tp_group, tp_grad_bucket_bytes);
+      sync_tp_replicated_gradients(tp_replicated_params, tp_group, tp_grad_bucket_bytes);
       bool flat_step_done = false;
       double local_grad_norm_sq = 0.0;
       double global_grad_norm = 0.0;
