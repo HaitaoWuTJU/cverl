@@ -418,6 +418,66 @@ std::tuple<torch::Tensor, torch::Tensor> linear_attention_recurrent_with_state(c
   return linear_attention_chunked_recurrent_with_state(query, key, value, beta, g, initial_state, kd, vd);
 }
 
+class LinearAttentionInitialStateRecvFunction final
+    : public torch::autograd::Function<LinearAttentionInitialStateRecvFunction> {
+ public:
+  static torch::Tensor forward(torch::autograd::AutogradContext* ctx,
+                               torch::Tensor state_like,
+                               int64_t collectives_addr,
+                               int64_t prev_peer) {
+    auto* collectives =
+        reinterpret_cast<distributed::Collectives*>(static_cast<uintptr_t>(collectives_addr));
+    if (collectives == nullptr) {
+      throw std::invalid_argument("linear attention CP initial state recv requires collectives");
+    }
+    ctx->saved_data["collectives_addr"] = collectives_addr;
+    ctx->saved_data["prev_peer"] = prev_peer;
+    return collectives->recv_like(state_like.contiguous(), prev_peer).contiguous();
+  }
+
+  static torch::autograd::tensor_list backward(torch::autograd::AutogradContext* ctx,
+                                               torch::autograd::tensor_list grad_outputs) {
+    auto* collectives = reinterpret_cast<distributed::Collectives*>(
+        static_cast<uintptr_t>(ctx->saved_data["collectives_addr"].toInt()));
+    const int64_t prev_peer = ctx->saved_data["prev_peer"].toInt();
+    if (grad_outputs.at(0).defined()) {
+      collectives->send(grad_outputs.at(0).contiguous(), prev_peer);
+    }
+    return {torch::Tensor(), torch::Tensor(), torch::Tensor()};
+  }
+};
+
+class LinearAttentionFinalStateSendFunction final
+    : public torch::autograd::Function<LinearAttentionFinalStateSendFunction> {
+ public:
+  static torch::Tensor forward(torch::autograd::AutogradContext* ctx,
+                               torch::Tensor local_output,
+                               torch::Tensor final_state,
+                               int64_t collectives_addr,
+                               int64_t next_peer) {
+    auto* collectives =
+        reinterpret_cast<distributed::Collectives*>(static_cast<uintptr_t>(collectives_addr));
+    if (collectives == nullptr) {
+      throw std::invalid_argument("linear attention CP final state send requires collectives");
+    }
+    ctx->saved_data["collectives_addr"] = collectives_addr;
+    ctx->saved_data["next_peer"] = next_peer;
+    ctx->save_for_backward({final_state});
+    collectives->send(final_state.contiguous(), next_peer);
+    return local_output;
+  }
+
+  static torch::autograd::tensor_list backward(torch::autograd::AutogradContext* ctx,
+                                               torch::autograd::tensor_list grad_outputs) {
+    auto saved = ctx->get_saved_variables();
+    auto* collectives = reinterpret_cast<distributed::Collectives*>(
+        static_cast<uintptr_t>(ctx->saved_data["collectives_addr"].toInt()));
+    const int64_t next_peer = ctx->saved_data["next_peer"].toInt();
+    auto grad_final = collectives->recv_like(saved.at(0).contiguous(), next_peer).contiguous();
+    return {grad_outputs.at(0), grad_final, torch::Tensor(), torch::Tensor()};
+  }
+};
+
 torch::Tensor linear_attention_context_initial_state(const torch::Tensor& state_like,
                                                      const distributed::ParallelGroup& context_group,
                                                      int64_t context_rank) {
@@ -425,17 +485,21 @@ torch::Tensor linear_attention_context_initial_state(const torch::Tensor& state_
     return torch::Tensor();
   }
   const int64_t prev_peer = context_group.ranks.at(static_cast<size_t>(context_rank - 1));
-  return context_group.collectives->recv_like(state_like.contiguous(), prev_peer).contiguous();
+  const auto collectives_addr = static_cast<int64_t>(reinterpret_cast<uintptr_t>(context_group.collectives));
+  return LinearAttentionInitialStateRecvFunction::apply(
+      state_like.contiguous().set_requires_grad(true), collectives_addr, prev_peer);
 }
 
-void linear_attention_send_final_state(const torch::Tensor& final_state,
-                                       const distributed::ParallelGroup& context_group,
-                                       int64_t context_rank) {
+torch::Tensor linear_attention_attach_final_state_carry(const torch::Tensor& local_output,
+                                                        const torch::Tensor& final_state,
+                                                        const distributed::ParallelGroup& context_group,
+                                                        int64_t context_rank) {
   if (context_rank + 1 >= context_group.world_size) {
-    return;
+    return local_output;
   }
   const int64_t next_peer = context_group.ranks.at(static_cast<size_t>(context_rank + 1));
-  context_group.collectives->send(final_state.contiguous(), next_peer);
+  const auto collectives_addr = static_cast<int64_t>(reinterpret_cast<uintptr_t>(context_group.collectives));
+  return LinearAttentionFinalStateSendFunction::apply(local_output, final_state, collectives_addr, next_peer);
 }
 
 std::string layer_prefix(int64_t layer_idx) {
@@ -906,8 +970,9 @@ torch::Tensor Qwen35TextModel::linear_attention_context_parallel(const torch::Te
                                                     initial_state,
                                                     kd,
                                                     vd);
-  linear_attention_send_final_state(std::get<1>(scan), context_group, context_rank);
-  auto core_local = std::get<0>(scan)
+  auto scan_output =
+      linear_attention_attach_final_state_carry(std::get<0>(scan), std::get<1>(scan), context_group, context_rank);
+  auto core_local = scan_output
                         .transpose(1, 2)
                         .contiguous()
                         .reshape({bsz * seq_local * vh, vd});

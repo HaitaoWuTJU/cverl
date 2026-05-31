@@ -366,7 +366,9 @@ void run_linear_attention_case() {
   auto shard0 = cverl::distributed::context_parallel_slice_padded(hidden, 0, 2, 1, 0.0);
   auto shard1 = cverl::distributed::context_parallel_slice_padded(hidden, 1, 2, 1, 0.0);
 
-  SendRecvCollectives rank0_collectives(0, 2, remote_linear_attention_messages(shard1, weights, model.config()));
+  auto rank0_final_state_grad = torch::zeros_like(linear_attention_prefix_state(hidden, 2, weights, model.config()));
+  SendRecvCollectives rank0_collectives(
+      0, 2, remote_linear_attention_messages(shard1, weights, model.config()), {rank0_final_state_grad});
   cverl::distributed::ParallelGroup rank0_group{8, 2, {8, 9}, &rank0_collectives};
   auto shard0_grad = shard0.detach().clone().set_requires_grad(true);
   auto out0 = model.forward_hidden_range_context_parallel(shard0_grad, 0, 1, rank0_group, 4, false);
@@ -404,6 +406,10 @@ void run_linear_attention_case() {
   require(shard1_grad.grad().defined() &&
               torch::allclose(shard1_grad.grad(), dense_hidden1.grad().narrow(1, 2, 2), 1.0e-5, 1.0e-5),
           "Qwen CP linear-attention rank1 hidden gradient must match dense slice");
+  require(rank0_collectives.recv_calls() == 1,
+          "Qwen CP linear-attention rank0 should receive final-state gradient during backward");
+  require(rank1_collectives.send_calls() == 1,
+          "Qwen CP linear-attention rank1 should send initial-state gradient during backward");
   std::filesystem::remove_all(dir);
 }
 

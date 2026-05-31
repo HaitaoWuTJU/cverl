@@ -251,14 +251,13 @@ Current code exposes the distributed shape directly:
   recurrent core only over the local token shard with an explicit initial
   state. Forward now carries that recurrent state point-to-point across CP
   ranks: rank 0 starts from zero state, each rank scans its local shard and
-  sends its final state to the next rank. The next CP efficiency/correctness
-  step is adding a matching backward carry so gradients through the initial
-  state return to the previous owner rank instead of stopping at the received
-  state tensor. The final PPO logprob slice gathers hidden with autograd so
-  gradients reduce-scatter back to owner shards. Qwen CP accepts either
-  group-local rank ids or real global ranks in the CP group and resolves
-  shard/RoPE/ring scheduling through the group-local index. `TP>1` with
-  `CP>1` is intentionally rejected until
+  sends its final state to the next rank. The state carry is autograd-aware:
+  backward receives the final-state gradient from the next CP rank and sends
+  the initial-state gradient back to the previous CP rank. The final PPO
+  logprob slice gathers hidden with autograd so gradients reduce-scatter back
+  to owner shards. Qwen CP accepts either group-local rank ids or real global
+  ranks in the CP group and resolves shard/RoPE/ring scheduling through the
+  group-local index. `TP>1` with `CP>1` is intentionally rejected until
   TP-sharded CP attention and MLP are fused into one Megatron-style execution
   path.
 
@@ -287,8 +286,9 @@ CPU regression coverage includes:
   exercises projected QKV/Z/B/A CP exchange. Both validate that CP rank-local
   forward shards and local-output hidden gradients match the corresponding
   dense slices while using nonzero global CP ranks. The linear-attention case
-  also checks forward recurrent state carry from rank 0 to rank 1. Cross-rank
-  K/V owner-gradient transport remains covered by the CP ring-exchange and
+  also checks forward recurrent state carry from rank 0 to rank 1 and the
+  backward state-gradient carry in the reverse direction. Cross-rank K/V
+  owner-gradient transport remains covered by the CP ring-exchange and
   reduce-scatter cases in `test_distributed_topology`.
 - `test_cp_attention_cuda` when `CVERL_ENABLE_CUDA=ON`: fused CUDA CP
   ring-attention forward/backward against the dense reference.
