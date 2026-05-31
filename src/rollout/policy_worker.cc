@@ -85,25 +85,16 @@ GenerationOutput PolicyRolloutWorker::generate(const TokenBatch& prompts,
   const int64_t pad_id = policy_->pad_id();
   auto prompt_ids = prompts.token_ids.to(torch::TensorOptions().dtype(torch::kLong).device(device));
 
-  std::vector<torch::Tensor> token_steps;
-  std::vector<torch::Tensor> logprob_steps;
-  token_steps.reserve(static_cast<size_t>(config.max_new_tokens));
-  logprob_steps.reserve(static_cast<size_t>(config.max_new_tokens));
-
+  auto token_ids = torch::full({batch, config.max_new_tokens}, pad_id,
+                               torch::TensorOptions().dtype(torch::kLong).device(device));
+  auto logprob_ids = torch::zeros({batch, config.max_new_tokens},
+                                  torch::TensorOptions().dtype(torch::kFloat32).device(device));
   auto lengths = torch::zeros({batch}, torch::TensorOptions().dtype(torch::kLong).device(device));
   auto finished = torch::zeros({batch}, torch::TensorOptions().dtype(torch::kBool).device(device));
   auto active = torch::logical_not(finished);
 
   for (int64_t step = 0; step < config.max_new_tokens; ++step) {
-    torch::Tensor response_context;
-    if (token_steps.empty()) {
-      response_context = torch::full({batch, 1}, pad_id,
-                                     torch::TensorOptions().dtype(torch::kLong).device(device));
-    } else {
-      response_context = torch::cat(token_steps, /*dim=*/1);
-      auto pad_col = torch::full({batch, 1}, pad_id, response_context.options());
-      response_context = torch::cat({response_context, pad_col}, /*dim=*/1);
-    }
+    auto response_context = token_ids.narrow(/*dim=*/1, /*start=*/0, /*length=*/step + 1);
 
     auto logits = policy_->forward(prompt_ids, response_context).index({torch::indexing::Slice(), -1});
     auto next = sample_next_tokens(logits, config).to(torch::TensorOptions().dtype(torch::kLong).device(device));
@@ -114,8 +105,8 @@ GenerationOutput PolicyRolloutWorker::generate(const TokenBatch& prompts,
     active = torch::logical_not(finished);
     auto emitted = torch::where(active, next, torch::full_like(next, pad_id));
     auto emitted_log_probs = torch::where(active, log_probs, torch::zeros_like(log_probs));
-    token_steps.push_back(emitted.unsqueeze(1));
-    logprob_steps.push_back(emitted_log_probs.unsqueeze(1));
+    token_ids.select(/*dim=*/1, step).copy_(emitted);
+    logprob_ids.select(/*dim=*/1, step).copy_(emitted_log_probs);
     lengths = lengths + active.to(torch::kLong);
 
     if (config.eos_token_id >= 0) {
@@ -126,16 +117,9 @@ GenerationOutput PolicyRolloutWorker::generate(const TokenBatch& prompts,
     }
   }
 
-  while (static_cast<int64_t>(token_steps.size()) < config.max_new_tokens) {
-    token_steps.push_back(torch::full({batch, 1}, pad_id,
-                                      torch::TensorOptions().dtype(torch::kLong).device(device)));
-    logprob_steps.push_back(torch::zeros({batch, 1},
-                                         torch::TensorOptions().dtype(torch::kFloat32).device(device)));
-  }
-
   GenerationOutput out;
-  out.token_ids = torch::cat(token_steps, /*dim=*/1).contiguous();
-  out.logprobs = torch::cat(logprob_steps, /*dim=*/1).contiguous();
+  out.token_ids = token_ids.contiguous();
+  out.logprobs = logprob_ids.contiguous();
   out.lengths = lengths.contiguous();
   return out;
 }

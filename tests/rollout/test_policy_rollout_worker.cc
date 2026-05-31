@@ -21,6 +21,29 @@ void require(bool cond, const std::string& msg) {
 
 int main() {
   try {
+    {
+      cverl::torch_backend::CausalLmPolicyOptions opts;
+      opts.kind = cverl::torch_backend::CausalLmPolicyOptions::Kind::kTiny;
+      opts.tiny_vocab_size = 32;
+      opts.tiny_hidden_dim = 16;
+      opts.pad_id = 0;
+      auto policy = cverl::torch_backend::make_causal_lm_policy(opts);
+      cverl::rollout::PolicyRolloutWorker worker(policy);
+
+      cverl::rollout::TokenBatch prompts;
+      prompts.token_ids = torch::tensor({{1, 2, 3}, {4, 5, 6}}, torch::kLong);
+      cverl::rollout::GenerationConfig config;
+      config.max_new_tokens = 4;
+      config.temperature = 0.0;
+      config.eos_token_id = -1;
+      auto out = worker.generate(prompts, config);
+      require(out.token_ids.sizes() == torch::IntArrayRef({2, 4}), "tiny token shape");
+      require(out.logprobs.sizes() == torch::IntArrayRef({2, 4}), "tiny logprob shape");
+      require(torch::all(out.lengths == 4).item<bool>(), "tiny lengths without eos");
+      require(out.token_ids.device().is_cpu(), "tiny tokens stay on CPU");
+      require(out.logprobs.device().is_cpu(), "tiny logprobs stay on CPU");
+    }
+
     std::string model_dir;
     if (const char* env = std::getenv("CVERL_QWEN_MODEL_DIR")) {
       model_dir = env;
