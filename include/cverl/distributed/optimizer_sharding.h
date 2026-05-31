@@ -3,12 +3,37 @@
 #include <cstdint>
 #include <vector>
 
+#include <torch/torch.h>
+
 namespace cverl::distributed {
+
+struct FlatParameterShardRange {
+  int64_t parameter_index = 0;
+  int64_t parameter_offset = 0;
+  int64_t shard_offset = 0;
+  int64_t numel = 0;
+};
+
+struct FlatParameterShard {
+  torch::Tensor shard;
+  int64_t original_numel = 0;
+  int64_t padded_numel = 0;
+  int64_t shard_begin = 0;
+  int64_t shard_end = 0;
+  std::vector<FlatParameterShardRange> ranges;
+};
 
 std::vector<int64_t> greedy_parameter_owner_by_size(const std::vector<int64_t>& parameter_bytes,
                                                     int64_t data_parallel);
 
 std::vector<int64_t> owned_parameter_indices(const std::vector<int64_t>& owner_by_parameter,
                                              int64_t data_rank);
+
+FlatParameterShard flatten_parameter_shard(const std::vector<torch::Tensor>& parameters,
+                                           int64_t data_parallel,
+                                           int64_t data_rank);
+
+void apply_flat_parameter_shard(const FlatParameterShard& shard,
+                                const std::vector<torch::Tensor>& parameters);
 
 }  // namespace cverl::distributed
