@@ -191,6 +191,50 @@ __global__ void cp_ring_attention_forward_kernel(const scalar_t* __restrict__ q,
   }
   __syncthreads();
 
+  if (D <= blockDim.x && V <= blockDim.x) {
+    __shared__ float shared_score;
+    __shared__ float acc_shared[kCpAttentionThreads];
+
+    if (threadIdx.x < V) {
+      acc_shared[threadIdx.x] = 0.0f;
+    }
+    __syncthreads();
+
+    const bool valid_row = valid_query && isfinite(shared_row_max);
+    for (int block = 0; block < num_blocks; ++block) {
+      const int key_begin = static_cast<int>(key_begin_positions[block]);
+      for (int local = 0; local < shard_size; ++local) {
+        const int k_pos = key_begin + local;
+        const bool valid_key = valid_row && k_pos <= q_pos && k_pos < original_sequence_length;
+        const int kt = block * shard_size + local;
+        float score_part = 0.0f;
+        if (valid_key && threadIdx.x < D) {
+          score_part =
+              static_cast<float>(q[q_base + threadIdx.x]) *
+              static_cast<float>(k[kv_bh_base_k + kt * D + threadIdx.x]);
+        }
+        const float score = block_reduce_sum(score_part, reduction);
+        if (threadIdx.x == 0) {
+          shared_score = score;
+        }
+        __syncthreads();
+
+        if (valid_key && threadIdx.x < V) {
+          const float prob = expf(shared_score * scale - shared_row_max) /
+                             fmaxf(shared_row_sum, 1.0e-20f);
+          acc_shared[threadIdx.x] += prob * static_cast<float>(v[kv_bh_base_v + kt * V + threadIdx.x]);
+        }
+        __syncthreads();
+      }
+    }
+
+    if (threadIdx.x < V) {
+      const float value = valid_row ? acc_shared[threadIdx.x] : 0.0f;
+      out[out_base + threadIdx.x] = static_cast<scalar_t>(value);
+    }
+    return;
+  }
+
   for (int j = threadIdx.x; j < V; j += blockDim.x) {
     if (!valid_query || !isfinite(shared_row_max)) {
       out[out_base + j] = static_cast<scalar_t>(0.0f);
