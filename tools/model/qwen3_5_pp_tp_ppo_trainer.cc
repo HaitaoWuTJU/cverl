@@ -1602,9 +1602,18 @@ int main(int argc, char** argv) {
 
     const std::vector<int64_t> hidden_shape{1, seq_len, model.config().hidden_size};
     const auto full_ranks = full_group(world_size);
+    const auto metric_options = torch::TensorOptions().device(device).dtype(torch::kFloat32);
+    std::vector<torch::Tensor> stage_inputs(static_cast<size_t>(micro_batches));
+    std::vector<torch::Tensor> stage_outputs(static_cast<size_t>(micro_batches));
     bool trainer_ok = true;
 
     for (int64_t step = start_step; step < steps; ++step) {
+      for (auto& slot : stage_inputs) {
+        slot = torch::Tensor();
+      }
+      for (auto& slot : stage_outputs) {
+        slot = torch::Tensor();
+      }
       zero_model_gradients(params);
       if (!dp_flat_shard_optimizer) {
         optimizer.zero_grad();
@@ -1615,9 +1624,6 @@ int main(int argc, char** argv) {
               ? cverl::torch_backend::clone_detached(optimizer.master_parameters())
               : std::vector<torch::Tensor>{};
       torch::Tensor flat_gradient_shard;
-      std::vector<torch::Tensor> stage_inputs(static_cast<size_t>(micro_batches));
-      std::vector<torch::Tensor> stage_outputs(static_cast<size_t>(micro_batches));
-      const auto metric_options = torch::TensorOptions().device(device).dtype(torch::kFloat32);
       auto loss_sum_tensor = torch::zeros({}, metric_options);
       auto kl_loss_sum_tensor = torch::zeros({}, metric_options);
       auto kl_sum_tensor = torch::zeros({}, metric_options);

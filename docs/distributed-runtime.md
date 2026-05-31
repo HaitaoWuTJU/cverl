@@ -77,6 +77,8 @@ Gradient buckets avoid `torch::cat` for single-tensor flushes; preserve this
 fast path for small replicated TP parameters and bucket-boundary tail tensors.
 Qwen TP replicated parameters are classified once at trainer startup; the
 per-step gradient sync should only walk the precomputed tensor list.
+Pipeline activation slot vectors are allocated once before the step loop and
+cleared in place each step to avoid allocator churn in long PPO/GRPO runs.
 
 ## Current TP/DP Implementation
 
