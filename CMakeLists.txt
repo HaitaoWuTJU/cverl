@@ -240,8 +240,13 @@ endif()
 if (CVERL_BUILD_TESTS)
   enable_testing()
 
+  function(cverl_register_test target)
+    add_test(NAME ${target} COMMAND $<TARGET_FILE:${target}> ${ARGN})
+  endfunction()
+
   add_executable(test_core_algos_cpu tests/test_core_algos_cpu.cc)
   target_link_libraries(test_core_algos_cpu PRIVATE cverl)
+  cverl_register_test(test_core_algos_cpu)
 
   add_executable(compare_golden tools/compare_golden.cc)
   target_link_libraries(compare_golden PRIVATE cverl)
@@ -262,42 +267,53 @@ if (CVERL_BUILD_TESTS)
   add_executable(test_torch_backend tests/torch/test_torch_backend.cc)
   target_link_libraries(test_torch_backend PRIVATE cverl)
   target_compile_options(test_torch_backend PRIVATE ${TORCH_CXX_FLAGS})
+  cverl_register_test(test_torch_backend)
 
   add_executable(test_fp32_master_adamw tests/torch/test_fp32_master_adamw.cc)
   target_link_libraries(test_fp32_master_adamw PRIVATE cverl)
   target_compile_options(test_fp32_master_adamw PRIVATE ${TORCH_CXX_FLAGS})
+  cverl_register_test(test_fp32_master_adamw)
 
   add_executable(test_simple_grpo_trainer tests/torch/test_simple_grpo_trainer.cc)
   target_link_libraries(test_simple_grpo_trainer PRIVATE cverl)
   target_compile_options(test_simple_grpo_trainer PRIVATE ${TORCH_CXX_FLAGS})
+  cverl_register_test(test_simple_grpo_trainer)
 
   add_executable(test_hf_model_loader tests/model/test_hf_model_loader.cc)
   target_link_libraries(test_hf_model_loader PRIVATE cverl)
   target_compile_options(test_hf_model_loader PRIVATE ${TORCH_CXX_FLAGS})
+  cverl_register_test(test_hf_model_loader)
 
   add_executable(test_safetensors_writer tests/model/test_safetensors_writer.cc)
   target_link_libraries(test_safetensors_writer PRIVATE cverl)
   target_compile_options(test_safetensors_writer PRIVATE ${TORCH_CXX_FLAGS})
+  cverl_register_test(test_safetensors_writer)
 
   add_executable(test_hf_dataset tests/data/test_hf_dataset.cc)
   target_link_libraries(test_hf_dataset PRIVATE cverl)
+  cverl_register_test(test_hf_dataset)
 
   add_executable(test_rollout_shared_memory tests/rollout/test_shared_memory.cc)
   target_link_libraries(test_rollout_shared_memory PRIVATE cverl)
+  cverl_register_test(test_rollout_shared_memory)
 
   add_executable(test_rollout_shared_memory_transport tests/rollout/test_shared_memory_transport.cc)
   target_link_libraries(test_rollout_shared_memory_transport PRIVATE cverl)
+  cverl_register_test(test_rollout_shared_memory_transport)
 
   add_executable(test_rollout_transport tests/rollout/test_transport.cc)
   target_link_libraries(test_rollout_transport PRIVATE cverl)
+  cverl_register_test(test_rollout_transport)
 
   add_executable(test_rollout_worker tests/rollout/test_rollout_worker.cc)
   target_link_libraries(test_rollout_worker PRIVATE cverl)
   target_compile_options(test_rollout_worker PRIVATE ${TORCH_CXX_FLAGS})
+  cverl_register_test(test_rollout_worker)
 
   add_executable(test_policy_rollout_worker tests/rollout/test_policy_rollout_worker.cc)
   target_link_libraries(test_policy_rollout_worker PRIVATE cverl)
   target_compile_options(test_policy_rollout_worker PRIVATE ${TORCH_CXX_FLAGS})
+  cverl_register_test(test_policy_rollout_worker)
 
   add_library(test_rollout_worker_plugin_fixture SHARED tests/rollout/plugin_worker_fixture.cc)
   target_link_libraries(test_rollout_worker_plugin_fixture PRIVATE cverl)
@@ -306,72 +322,89 @@ if (CVERL_BUILD_TESTS)
   add_executable(test_plugin_worker tests/rollout/test_plugin_worker.cc)
   target_link_libraries(test_plugin_worker PRIVATE cverl)
   target_compile_options(test_plugin_worker PRIVATE ${TORCH_CXX_FLAGS})
+  cverl_register_test(test_plugin_worker $<TARGET_FILE:test_rollout_worker_plugin_fixture>)
 
   add_executable(test_gsm8k_reward tests/reward/test_gsm8k_reward.cc)
   target_link_libraries(test_gsm8k_reward PRIVATE cverl)
+  cverl_register_test(test_gsm8k_reward)
 
   add_executable(test_byte_tokenizer tests/text/test_byte_tokenizer.cc)
   target_link_libraries(test_byte_tokenizer PRIVATE cverl)
+  cverl_register_test(test_byte_tokenizer)
 
   add_executable(test_hf_bpe_tokenizer tests/text/test_hf_bpe_tokenizer.cc)
   target_link_libraries(test_hf_bpe_tokenizer PRIVATE cverl)
   target_compile_definitions(test_hf_bpe_tokenizer PRIVATE
     CVERL_PROJECT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+  cverl_register_test(test_hf_bpe_tokenizer)
 
   add_executable(test_rollout_batch tests/rollout/test_rollout_batch.cc)
   target_link_libraries(test_rollout_batch PRIVATE cverl)
   target_compile_options(test_rollout_batch PRIVATE ${TORCH_CXX_FLAGS})
+  cverl_register_test(test_rollout_batch)
 
   if (CVERL_ENABLE_CUDA)
     add_executable(test_gpu_ipc_rollout_batch tests/rollout/test_gpu_ipc_rollout_batch.cc)
     target_link_libraries(test_gpu_ipc_rollout_batch PRIVATE cverl)
     target_compile_options(test_gpu_ipc_rollout_batch PRIVATE ${TORCH_CXX_FLAGS})
+    cverl_register_test(test_gpu_ipc_rollout_batch)
 
     add_executable(test_qwen_linear_attention_cuda tests/model/test_qwen_linear_attention_cuda.cc)
     target_link_libraries(test_qwen_linear_attention_cuda PRIVATE cverl)
     target_compile_options(test_qwen_linear_attention_cuda PRIVATE ${TORCH_CXX_FLAGS})
+    cverl_register_test(test_qwen_linear_attention_cuda)
   endif()
 
   add_executable(test_gsm8k_grpo_trainer tests/rollout/test_gsm8k_grpo_trainer.cc)
   target_link_libraries(test_gsm8k_grpo_trainer PRIVATE cverl)
   target_compile_options(test_gsm8k_grpo_trainer PRIVATE ${TORCH_CXX_FLAGS})
+  cverl_register_test(test_gsm8k_grpo_trainer)
 
   add_executable(test_reference_policy_kl tests/torch/test_reference_policy_kl.cc)
   target_link_libraries(test_reference_policy_kl PRIVATE cverl)
   target_compile_options(test_reference_policy_kl PRIVATE ${TORCH_CXX_FLAGS})
+  cverl_register_test(test_reference_policy_kl)
 
   add_executable(test_qwen3_5_causal_lm_policy tests/torch/test_qwen3_5_causal_lm_policy.cc)
   target_link_libraries(test_qwen3_5_causal_lm_policy PRIVATE cverl)
   target_compile_options(test_qwen3_5_causal_lm_policy PRIVATE ${TORCH_CXX_FLAGS})
+  cverl_register_test(test_qwen3_5_causal_lm_policy)
 
   add_executable(test_qwen3_5_grpo_step tests/torch/test_qwen3_5_grpo_step.cc)
   target_link_libraries(test_qwen3_5_grpo_step PRIVATE cverl)
   target_compile_options(test_qwen3_5_grpo_step PRIVATE ${TORCH_CXX_FLAGS})
+  cverl_register_test(test_qwen3_5_grpo_step)
 
   add_executable(test_qwen3_5_param_dtype tests/torch/test_qwen3_5_param_dtype.cc)
   target_link_libraries(test_qwen3_5_param_dtype PRIVATE cverl)
   target_compile_options(test_qwen3_5_param_dtype PRIVATE ${TORCH_CXX_FLAGS})
+  cverl_register_test(test_qwen3_5_param_dtype)
 
   add_executable(test_distributed_topology tests/distributed/test_topology.cc)
   target_link_libraries(test_distributed_topology PRIVATE cverl)
   target_compile_options(test_distributed_topology PRIVATE ${TORCH_CXX_FLAGS})
+  cverl_register_test(test_distributed_topology)
 
   add_executable(test_parallel_ops tests/distributed/test_parallel_ops.cc)
   target_link_libraries(test_parallel_ops PRIVATE cverl)
   target_compile_options(test_parallel_ops PRIVATE ${TORCH_CXX_FLAGS})
+  cverl_register_test(test_parallel_ops)
 
   add_executable(test_weight_sync tests/distributed/test_weight_sync.cc)
   target_link_libraries(test_weight_sync PRIVATE cverl)
   target_compile_options(test_weight_sync PRIVATE ${TORCH_CXX_FLAGS})
+  cverl_register_test(test_weight_sync)
 
   if (CVERL_ENABLE_NCCL)
     add_executable(test_nccl_collectives tests/distributed/test_nccl_collectives.cc)
     target_link_libraries(test_nccl_collectives PRIVATE cverl)
     target_compile_options(test_nccl_collectives PRIVATE ${TORCH_CXX_FLAGS})
+    cverl_register_test(test_nccl_collectives)
 
     add_executable(test_nccl_gpu_batch_transport tests/rollout/test_nccl_gpu_batch_transport.cc)
     target_link_libraries(test_nccl_gpu_batch_transport PRIVATE cverl)
     target_compile_options(test_nccl_gpu_batch_transport PRIVATE ${TORCH_CXX_FLAGS})
+    cverl_register_test(test_nccl_gpu_batch_transport)
 
     add_executable(nccl_rollout_batch_source tools/rollout/nccl_rollout_batch_source.cc)
     target_link_libraries(nccl_rollout_batch_source PRIVATE cverl)

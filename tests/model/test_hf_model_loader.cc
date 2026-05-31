@@ -5,12 +5,18 @@
 #include <string>
 
 int main(int argc, char** argv) {
-  if (argc != 2) {
-    std::cerr << "usage: test_hf_model_loader <model-dir>\n";
-    return 2;
+  std::string model_dir;
+  if (argc == 2) {
+    model_dir = argv[1];
+  } else if (const char* env = std::getenv("CVERL_QWEN_MODEL_DIR")) {
+    model_dir = env;
+  } else {
+    std::cout << "test_hf_model_loader skipped: set CVERL_QWEN_MODEL_DIR "
+                 "or pass model_dir as argv[1]\n";
+    return 0;
   }
 
-  cverl::HfModelLoader loader(argv[1]);
+  cverl::HfModelLoader loader(model_dir);
   loader.load_metadata();
   if (loader.config().model_type.empty() || loader.config().hidden_size <= 0 || loader.config().vocab_size <= 0) {
     std::cerr << "invalid config summary\n";
