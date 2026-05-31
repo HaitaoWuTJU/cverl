@@ -694,12 +694,14 @@ torch::Tensor context_parallel_causal_attention_ring_exchange_kv(const torch::Te
   if (key_local.size(2) != shard || value_local.size(2) != shard) {
     throw std::invalid_argument("query/key/value local CP shards must have matching sequence length");
   }
-  auto key_ring =
-      context_parallel_ring_exchange_autograd(key_local.contiguous(), collectives, context_group, context_rank, 2)
-          .contiguous();
-  auto value_ring =
-      context_parallel_ring_exchange_autograd(value_local.contiguous(), collectives, context_group, context_rank, 2)
-          .contiguous();
+  if (key_local.sizes().slice(0, 3) != value_local.sizes().slice(0, 3)) {
+    throw std::invalid_argument("key/value local CP shards must match [B,H,S] for fused ring exchange");
+  }
+  auto kv_local = torch::cat({key_local.contiguous(), value_local.contiguous()}, -1).contiguous();
+  auto kv_ring = context_parallel_ring_exchange_autograd(kv_local, collectives, context_group, context_rank, 2)
+                     .contiguous();
+  auto key_ring = kv_ring.narrow(-1, 0, key_local.size(-1)).contiguous();
+  auto value_ring = kv_ring.narrow(-1, key_local.size(-1), value_local.size(-1)).contiguous();
   const auto schedule = context_parallel_ring_schedule(context_group, context_group.at(static_cast<size_t>(context_rank)));
   std::vector<int64_t> key_begin_positions;
   key_begin_positions.reserve(schedule.size());

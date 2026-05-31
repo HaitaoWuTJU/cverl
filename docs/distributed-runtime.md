@@ -224,12 +224,14 @@ Current code exposes the distributed shape directly:
   uses FlashAttention-style streaming over KV blocks, maintaining row max,
   row sum, and value accumulator instead of materializing the full `[Q,K]`
   score/probability matrix. Qwen CP full attention consumes blocks in the
-  same order as the CP ring schedule. The current ring-exchange path obtains
-  those blocks through grouped `send_recv` and has an autograd wrapper that
-  reorders ring gradients into rank order and prefers `reduce_scatter` so K/V
-  owners receive accumulated gradients without all-gather; it falls back to
-  reverse-ring accumulation when the active collectives backend cannot
-  reduce-scatter the CP group. Ring-exchanged KV attention now
+  same order as the CP ring schedule. The current ring-exchange path fuses
+  K/V into one grouped `send_recv` payload per ring hop, then splits the
+  received ring tensor back into K and V blocks for attention. Its autograd
+  wrapper reorders ring gradients into rank order and prefers
+  `reduce_scatter` so K/V owners receive accumulated gradients without
+  all-gather; it falls back to reverse-ring accumulation when the active
+  collectives backend cannot reduce-scatter the CP group. Ring-exchanged KV
+  attention now
   uses a recompute-autograd path: forward saves Q/K/V inputs and block
   metadata, not per-block score/probability tensors; backward recomputes the
   streaming attention and returns gradients to the ring-exchange owner-gradient

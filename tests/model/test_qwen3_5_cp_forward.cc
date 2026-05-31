@@ -58,6 +58,8 @@ class SendRecvCollectives final : public cverl::distributed::Collectives {
     return out;
   }
 
+  int64_t send_recv_calls() const { return static_cast<int64_t>(next_); }
+
  private:
   std::vector<torch::Tensor> responses_;
   int64_t rank_ = 0;
@@ -240,13 +242,13 @@ void run_full_attention_case() {
   auto kv1 = remote_full_attention_kv(shard1, 2, weights, model.config());
 
   SendRecvCollectives rank0_collectives(
-      0, 2, {kv1.first.transpose(0, 2).contiguous(), kv1.second.transpose(0, 2).contiguous()});
+      0, 2, {torch::cat({kv1.first, kv1.second}, -1).transpose(0, 2).contiguous()});
   cverl::distributed::ParallelGroup rank0_group{0, 2, {0, 1}, &rank0_collectives};
   auto shard0_grad = shard0.detach().clone().set_requires_grad(true);
   auto out0 = model.forward_hidden_range_context_parallel(shard0_grad, 0, 1, rank0_group, 4, false);
 
   SendRecvCollectives rank1_collectives(
-      1, 2, {kv0.first.transpose(0, 2).contiguous(), kv0.second.transpose(0, 2).contiguous()});
+      1, 2, {torch::cat({kv0.first, kv0.second}, -1).transpose(0, 2).contiguous()});
   cverl::distributed::ParallelGroup rank1_group{1, 2, {0, 1}, &rank1_collectives};
   auto shard1_grad = shard1.detach().clone().set_requires_grad(true);
   auto out1 = model.forward_hidden_range_context_parallel(shard1_grad, 0, 1, rank1_group, 4, false);
@@ -255,6 +257,8 @@ void run_full_attention_case() {
           "Qwen CP full-attention rank0 forward shard must match dense slice");
   require(torch::allclose(out1, dense.narrow(1, 2, 2), 1.0e-5, 1.0e-5),
           "Qwen CP full-attention rank1 forward shard must match dense slice");
+  require(rank0_collectives.send_recv_calls() == 1 && rank1_collectives.send_recv_calls() == 1,
+          "Qwen CP full attention should fuse K/V into one ring exchange per rank");
   auto grad0 = torch::randn_like(out0);
   auto grad1 = torch::randn_like(out1);
   auto dense_hidden0 = hidden.detach().clone().set_requires_grad(true);

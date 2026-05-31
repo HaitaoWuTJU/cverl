@@ -135,6 +135,8 @@ class PrecomputedAllGatherCollectives final : public cverl::distributed::Collect
     return send_recv_responses_.at(index);
   }
 
+  int64_t send_recv_calls() const { return static_cast<int64_t>(send_recv_call_count_); }
+
  private:
   std::vector<std::vector<torch::Tensor>> responses_;
   std::vector<torch::Tensor> send_recv_responses_;
@@ -559,14 +561,10 @@ void test_context_parallel_causal_attention() {
   auto q0_exchange = q.narrow(2, 0, 3).contiguous().set_requires_grad(true);
   auto k0_exchange = k.narrow(2, 0, 3).contiguous().set_requires_grad(true);
   auto v0_exchange = v.narrow(2, 0, 3).contiguous().set_requires_grad(true);
+  auto kv1 = torch::cat({k1, v1}, -1).contiguous();
   PrecomputedAllGatherCollectives attention_exchange_collectives(
       {},
-      {k1.transpose(0, 2).contiguous(),
-       v1.transpose(0, 2).contiguous(),
-       torch::zeros_like(v0_exchange.transpose(0, 2).contiguous()),
-       torch::zeros_like(v0_exchange.transpose(0, 2).contiguous()),
-       torch::zeros_like(k0_exchange.transpose(0, 2).contiguous()),
-       torch::zeros_like(k0_exchange.transpose(0, 2).contiguous())});
+      {kv1.transpose(0, 2).contiguous()});
   auto ring_exchanged_attention = cverl::distributed::context_parallel_causal_attention_ring_exchange_kv(
       q0_exchange, k0_exchange, v0_exchange, attention_exchange_collectives, {0, 1}, 0, 6, scale);
   require(torch::allclose(ring_exchanged_attention, dense.narrow(2, 0, 3), 1.0e-5, 1.0e-5),
@@ -581,6 +579,8 @@ void test_context_parallel_causal_attention() {
   require(v0_exchange.grad().defined() &&
               torch::allclose(v0_exchange.grad(), dense_v.grad().narrow(2, 0, 3), 1.0e-5, 1.0e-5),
           "CP ring-exchange value gradient matches dense");
+  require(attention_exchange_collectives.send_recv_calls() == 1,
+          "CP ring-exchange attention should fuse K/V into one ring payload");
   gathered.sum().backward();
   require(q0.grad().defined() && torch::allclose(q0.grad(), dense_q.grad().narrow(2, 0, 3), 1.0e-5, 1.0e-5),
           "CP gathered KV query gradient matches dense local-output gradient");
@@ -602,7 +602,7 @@ void test_context_parallel_causal_attention() {
   require(padded.narrow(2, 2, 1).abs().sum().item<float>() == 0.0f, "CP padded tail query output is zero");
   PrecomputedAllGatherCollectives padded_ring_collectives(
       {},
-      {k0.detach().transpose(0, 2).contiguous(), v0.detach().transpose(0, 2).contiguous()});
+      {torch::cat({k0.detach(), v0.detach()}, -1).transpose(0, 2).contiguous()});
   auto padded_ring = cverl::distributed::context_parallel_causal_attention_ring_exchange_kv(
       q1, k1, v1, padded_ring_collectives, {0, 1}, 1, 5, scale);
   require(torch::allclose(padded_ring.narrow(2, 0, 2), dense5, 1.0e-5, 1.0e-5),
