@@ -459,7 +459,9 @@ void test_context_parallel_causal_attention() {
           "CP streaming value block 1 gradient matches dense");
 
   auto ring_x0 = k.narrow(2, 0, 3).contiguous().set_requires_grad(true);
-  PrecomputedAllGatherCollectives ring_exchange_collectives({}, {k.narrow(2, 3, 3).transpose(0, 2).contiguous()});
+  auto ring_zero = torch::zeros_like(k.narrow(2, 0, 3).transpose(0, 2).contiguous());
+  PrecomputedAllGatherCollectives ring_exchange_collectives(
+      {}, {k.narrow(2, 3, 3).transpose(0, 2).contiguous(), ring_zero, ring_zero});
   auto ring_exchanged =
       cverl::distributed::context_parallel_ring_exchange_autograd(ring_x0, ring_exchange_collectives, {0, 1}, 0, 2);
   require(torch::allclose(ring_exchanged, k, 1.0e-5, 1.0e-5), "CP ring exchange forward order");
@@ -500,7 +502,12 @@ void test_context_parallel_causal_attention() {
   auto v0_exchange = v.narrow(2, 0, 3).contiguous().set_requires_grad(true);
   PrecomputedAllGatherCollectives attention_exchange_collectives(
       {},
-      {k1.transpose(0, 2).contiguous(), v1.transpose(0, 2).contiguous()});
+      {k1.transpose(0, 2).contiguous(),
+       v1.transpose(0, 2).contiguous(),
+       torch::zeros_like(v0_exchange.transpose(0, 2).contiguous()),
+       torch::zeros_like(v0_exchange.transpose(0, 2).contiguous()),
+       torch::zeros_like(k0_exchange.transpose(0, 2).contiguous()),
+       torch::zeros_like(k0_exchange.transpose(0, 2).contiguous())});
   auto ring_exchanged_attention = cverl::distributed::context_parallel_causal_attention_ring_exchange_kv(
       q0_exchange, k0_exchange, v0_exchange, attention_exchange_collectives, {0, 1}, 0, 6, scale);
   require(torch::allclose(ring_exchanged_attention, dense.narrow(2, 0, 3), 1.0e-5, 1.0e-5),

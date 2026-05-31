@@ -226,10 +226,10 @@ Current code exposes the distributed shape directly:
   score/probability matrix. Qwen CP full attention consumes blocks in the
   same order as the CP ring schedule. The current ring-exchange path obtains
   those blocks through grouped `send_recv` and has an autograd wrapper that
-  reorders ring-layout gradients back to rank order before reducing them to
-  K/V owner ranks. Full industrial CP training still needs a fused CUDA
-  ring-attention kernel and a ring reduce-scatter backward to replace the
-  remaining high-level tensor ops and reduce-scatter fallback.
+  sends owner-gradient blocks around the reverse ring so K/V owners receive
+  accumulated gradients without all-gather. Full industrial CP training still
+  needs a fused CUDA ring-attention kernel and a lower-latency reduce-scatter
+  ring schedule to replace the current per-owner ring accumulation.
 - `qwen3_5_pp_tp_ppo_trainer`: accepts DP/PP/CP/TP topology dimensions and
   records all four axes in metrics and checkpoint manifests. For `CP>1,TP=1`,
   PP stages now pass local sequence shards, Qwen range forward keeps

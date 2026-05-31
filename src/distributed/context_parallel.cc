@@ -148,8 +148,23 @@ class ContextParallelRingExchangeFunction final
       const int64_t rank_index = context_parallel_group_index(group, schedule[i].kv_rank);
       rank_order[static_cast<size_t>(rank_index)] = moved.narrow(0, static_cast<int64_t>(i) * shard, shard);
     }
-    auto rank_order_grad = torch::cat(rank_order, 0).contiguous();
-    auto local = collectives->reduce_scatter(rank_order_grad, ReduceOp::Sum, group, 0).contiguous();
+    torch::Tensor local;
+    const int64_t send_rank = schedule.empty() ? -1 : schedule.front().send_rank;
+    const int64_t recv_rank = schedule.empty() ? -1 : schedule.front().recv_rank;
+    for (int64_t owner = 0; owner < static_cast<int64_t>(group.size()); ++owner) {
+      auto current = rank_order[static_cast<size_t>(owner)].contiguous();
+      auto total = current.clone();
+      for (int64_t hop = 0; hop + 1 < static_cast<int64_t>(group.size()); ++hop) {
+        current = collectives->send_recv(current.contiguous(), send_rank, current, recv_rank).contiguous();
+        total = total + current;
+      }
+      if (owner == context_rank) {
+        local = total.contiguous();
+      }
+    }
+    if (!local.defined()) {
+      throw std::runtime_error("ring exchange backward did not produce local owner gradient");
+    }
     if (dim != 0) {
       local = local.transpose(0, dim).contiguous();
     }
