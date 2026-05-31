@@ -3,9 +3,11 @@ set -euo pipefail
 
 BUILD_DIR="${BUILD_DIR:-build-h20-nccl}"
 MODEL_DIR="${1:-../models/Qwen3.5-0.8B}"
+DP_SIZE="${DP_SIZE:-1}"
 PP_SIZE="${PP_SIZE:-2}"
 TP_SIZE="${TP_SIZE:-2}"
-WORLD_SIZE=$((PP_SIZE * TP_SIZE))
+WORLD_SIZE=$((DP_SIZE * PP_SIZE * TP_SIZE))
+LOCAL_WORLD_SIZE="${LOCAL_WORLD_SIZE:-${WORLD_SIZE}}"
 LAYERS="${LAYERS:-2}"
 PROMPT_LEN="${PROMPT_LEN:-2}"
 RESPONSE_LEN="${RESPONSE_LEN:-2}"
@@ -13,6 +15,7 @@ MICRO_BATCHES="${MICRO_BATCHES:-${PP_SIZE}}"
 STEPS="${STEPS:-1}"
 LR="${LR:-1e-8}"
 CLIP_RATIO="${CLIP_RATIO:-0.2}"
+MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
 ADVANTAGE_SCALE="${ADVANTAGE_SCALE:-1.0}"
 MASTER_WEIGHTS="${MASTER_WEIGHTS:-false}"
 SKIP_OPTIMIZER_STEP="${SKIP_OPTIMIZER_STEP:-false}"
@@ -30,6 +33,7 @@ JSONL_MAX_EXAMPLES="${JSONL_MAX_EXAMPLES:-16}"
 TOKENIZER_JSON="${TOKENIZER_JSON:-${MODEL_DIR}/tokenizer.json}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-}"
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-0}"
+RESUME_CHECKPOINT="${RESUME_CHECKPOINT:-}"
 METRICS_CSV="${METRICS_CSV:-}"
 DTYPE="${DTYPE:-bfloat16}"
 ID_PREFIX="${ID_PREFIX:-/tmp/cverl_qwen_pp_tp_ppo}"
@@ -48,15 +52,18 @@ fi
 rm -f "${ID_PREFIX}"_*.bin /tmp/cverl_qwen_pp_tp_ppo_rank_*.log
 
 for ((rank = 0; rank < WORLD_SIZE; ++rank)); do
+  local_rank=$((rank % LOCAL_WORLD_SIZE))
   RANK="${rank}" \
   WORLD_SIZE="${WORLD_SIZE}" \
-  LOCAL_RANK="${rank}" \
+  LOCAL_WORLD_SIZE="${LOCAL_WORLD_SIZE}" \
+  LOCAL_RANK="${local_rank}" \
   CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}" \
     "${TRAINER}" "${MODEL_DIR}" \
       --global-rank "${rank}" \
+      --dp-size "${DP_SIZE}" \
       --pp-size "${PP_SIZE}" \
       --tp-size "${TP_SIZE}" \
-      --device "${rank}" \
+      --device "${local_rank}" \
       --layers "${LAYERS}" \
       --prompt-len "${PROMPT_LEN}" \
       --response-len "${RESPONSE_LEN}" \
@@ -64,6 +71,7 @@ for ((rank = 0; rank < WORLD_SIZE; ++rank)); do
       --steps "${STEPS}" \
       --lr "${LR}" \
       --clip-ratio "${CLIP_RATIO}" \
+      --max-grad-norm "${MAX_GRAD_NORM}" \
       --advantage-scale "${ADVANTAGE_SCALE}" \
       --master-weights "${MASTER_WEIGHTS}" \
       --skip-optimizer-step "${SKIP_OPTIMIZER_STEP}" \
@@ -81,6 +89,7 @@ for ((rank = 0; rank < WORLD_SIZE; ++rank)); do
       --tokenizer-json "${TOKENIZER_JSON}" \
       --checkpoint-dir "${CHECKPOINT_DIR}" \
       --checkpoint-every "${CHECKPOINT_EVERY}" \
+      --resume-checkpoint "${RESUME_CHECKPOINT}" \
       --metrics-csv "${METRICS_CSV}" \
       --dtype "${DTYPE}" \
       --id-prefix "${ID_PREFIX}" \

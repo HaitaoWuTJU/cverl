@@ -41,18 +41,20 @@ require_exec() {
 
 run_case() {
   local name="$1"
-  local pp="$2"
-  local tp="$3"
-  local micro_batches="$4"
+  local dp="$2"
+  local pp="$3"
+  local tp="$4"
+  local micro_batches="$5"
   local log="${OUT_DIR}/${name}.log"
 
-  echo "running ${name}: PP=${pp} TP=${tp} micro_batches=${micro_batches} steps=${STEPS}"
+  echo "running ${name}: DP=${dp} PP=${pp} TP=${tp} micro_batches=${micro_batches} steps=${STEPS}"
   (
     cd "${ROOT_DIR}"
     NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME}" \
     NCCL_DEBUG="${NCCL_DEBUG}" \
     CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}" \
     BUILD_DIR="${BUILD_DIR}" \
+    DP_SIZE="${dp}" \
     PP_SIZE="${pp}" \
     TP_SIZE="${tp}" \
     LAYERS="${LAYERS}" \
@@ -62,6 +64,7 @@ run_case() {
     STEPS="${STEPS}" \
     DTYPE="${DTYPE}" \
     ADVANTAGE_SCALE="${ADVANTAGE_SCALE}" \
+    MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}" \
     LR="${LR}" \
     JSONL_INPUT="${JSONL_INPUT}" \
     JSONL_MAX_EXAMPLES="${JSONL_MAX_EXAMPLES}" \
@@ -109,7 +112,8 @@ if [[ "${RUN_BASIC_TESTS}" = "1" ]]; then
   ) | tee "${OUT_DIR}/test_nccl_collectives.log"
 fi
 
-run_case "qwen_pp2_tp2_ppo_5step" 2 2 2
-run_case "qwen_pp4_tp1_ppo_5step" 4 1 4
+run_case "qwen_pp2_tp2_ppo_5step" 1 2 2 2
+run_case "qwen_pp4_tp1_ppo_5step" 1 4 1 4
+run_case "qwen_dp2_pp1_tp2_ppo_5step" 2 1 2 1
 
 echo "multi-GPU Qwen PPO regression passed"

@@ -268,6 +268,24 @@ void sync_tp_replicated_gradients(const std::vector<std::string>& names,
   }
 }
 
+void sync_data_parallel_gradients(const std::vector<torch::Tensor>& params,
+                                  cverl::distributed::ParallelGroup& dp_group) {
+  if (dp_group.world_size == 1) {
+    return;
+  }
+  if (dp_group.collectives == nullptr) {
+    throw std::runtime_error("DP gradient sync requires collectives");
+  }
+  for (auto& p : params) {
+    if (!p.defined() || !p.grad().defined()) {
+      continue;
+    }
+    auto synced = dp_group.collectives->all_reduce(
+        p.grad().contiguous(), cverl::distributed::ReduceOp::Mean, dp_group.ranks);
+    p.mutable_grad().copy_(synced);
+  }
+}
+
 struct PpPpoBatch {
   std::vector<torch::Tensor> token_ids;
   std::vector<torch::Tensor> advantages;
@@ -373,6 +391,7 @@ void save_rank_checkpoint(const std::string& checkpoint_dir,
                           int64_t step,
                           int64_t global_rank,
                           int64_t world_size,
+                          int64_t dp_rank,
                           int64_t pp_rank,
                           int64_t pp_size,
                           int64_t tp_rank,
@@ -413,6 +432,7 @@ void save_rank_checkpoint(const std::string& checkpoint_dir,
 
   nlohmann::json rank_meta;
   rank_meta["global_rank"] = global_rank;
+  rank_meta["data_rank"] = dp_rank;
   rank_meta["pipeline_rank"] = pp_rank;
   rank_meta["tensor_rank"] = tp_rank;
   rank_meta["layer_begin"] = layer_begin;
@@ -438,6 +458,7 @@ void save_rank_checkpoint(const std::string& checkpoint_dir,
 void write_checkpoint_manifest(const std::string& checkpoint_dir,
                                int64_t step,
                                int64_t world_size,
+                               int64_t dp_size,
                                int64_t pp_size,
                                int64_t tp_size,
                                const cverl::torch_backend::Fp32MasterAdamW& optimizer) {
@@ -451,6 +472,7 @@ void write_checkpoint_manifest(const std::string& checkpoint_dir,
   manifest["complete"] = true;
   manifest["use_master_weights"] = optimizer.uses_master_weights();
   manifest["world_size"] = world_size;
+  manifest["data_parallel"] = dp_size;
   manifest["pipeline_parallel"] = pp_size;
   manifest["tensor_parallel"] = tp_size;
   manifest["optimizer"] = {
@@ -466,6 +488,7 @@ void write_checkpoint_manifest(const std::string& checkpoint_dir,
   for (int64_t rank = 0; rank < world_size; ++rank) {
     const int64_t tp = rank % tp_size;
     const int64_t pp = (rank / tp_size) % pp_size;
+    const int64_t dp = rank / (pp_size * tp_size);
     const std::string param_file = "rank_" + std::to_string(rank) + ".pt";
     const std::string metadata_file = "rank_" + std::to_string(rank) + ".json";
     if (!std::filesystem::exists(step_dir / param_file) ||
@@ -474,6 +497,7 @@ void write_checkpoint_manifest(const std::string& checkpoint_dir,
     }
     manifest["rank_files"].push_back({
         {"global_rank", rank},
+        {"data_rank", dp},
         {"pipeline_rank", pp},
         {"tensor_rank", tp},
         {"param_file", param_file},
@@ -487,6 +511,7 @@ void write_checkpoint_manifest(const std::string& checkpoint_dir,
 
 int64_t load_rank_checkpoint(const std::string& checkpoint_path,
                              int64_t global_rank,
+                             int64_t dp_rank,
                              int64_t pp_rank,
                              int64_t tp_rank,
                              const std::vector<std::string>& param_names,
@@ -518,6 +543,7 @@ int64_t load_rank_checkpoint(const std::string& checkpoint_path,
     in >> rank_meta;
   }
   if (rank_meta.value("global_rank", global_rank) != global_rank ||
+      rank_meta.value("data_rank", dp_rank) != dp_rank ||
       rank_meta.value("pipeline_rank", pp_rank) != pp_rank ||
       rank_meta.value("tensor_rank", tp_rank) != tp_rank) {
     throw std::runtime_error("resume checkpoint rank metadata does not match current rank topology");
@@ -583,6 +609,7 @@ int64_t load_rank_checkpoint(const std::string& checkpoint_path,
 
 void append_metrics_csv(const std::string& path,
                         int64_t step,
+                        int64_t dp_size,
                         int64_t pp_size,
                         int64_t tp_size,
                         int64_t micro_batches,
@@ -610,11 +637,12 @@ void append_metrics_csv(const std::string& path,
   }
   std::ofstream out(path, std::ios::app);
   if (write_header) {
-    out << "step,pp,tp,micro_batches,layers,prompt_len,response_len,rollout_rows,"
+    out << "step,dp,pp,tp,micro_batches,layers,prompt_len,response_len,rollout_rows,"
         << "mean_reward,success_rate,adv_abs_sum,loss_sum,ppo_kl_sum,clipfrac_sum,"
         << "grad_norm_sum,global_grad_norm,grad_clip_scale,param_delta_sum\n";
   }
   out << step << ","
+      << dp_size << ","
       << pp_size << ","
       << tp_size << ","
       << micro_batches << ","
@@ -954,9 +982,10 @@ int main(int argc, char** argv) {
     const std::string model_dir = argv[1];
     const int64_t global_rank =
         arg_i64(argc, argv, "--global-rank", std::getenv("RANK") ? std::stoll(std::getenv("RANK")) : 0);
+    const int64_t dp_size = arg_i64(argc, argv, "--dp-size", 1);
     const int64_t pp_size = arg_i64(argc, argv, "--pp-size", 2);
     const int64_t tp_size = arg_i64(argc, argv, "--tp-size", 2);
-    const int64_t world_size = pp_size * tp_size;
+    const int64_t world_size = dp_size * pp_size * tp_size;
     const int64_t device_idx =
         arg_i64(argc, argv, "--device", std::getenv("LOCAL_RANK") ? std::stoll(std::getenv("LOCAL_RANK")) : global_rank);
     const int64_t layers = arg_i64(argc, argv, "--layers", 2);
@@ -990,8 +1019,8 @@ int main(int argc, char** argv) {
     const auto dtype = parse_dtype(arg_str(argc, argv, "--dtype", "bfloat16"));
     const std::string id_prefix = arg_str(argc, argv, "--id-prefix", "/tmp/cverl_qwen_pp_tp_ppo");
 
-    if (pp_size <= 0 || tp_size <= 0 || micro_batches <= 0 || steps <= 0) {
-      throw std::invalid_argument("pp-size, tp-size, micro-batches, and steps must be positive");
+    if (dp_size <= 0 || pp_size <= 0 || tp_size <= 0 || micro_batches <= 0 || steps <= 0) {
+      throw std::invalid_argument("dp-size, pp-size, tp-size, micro-batches, and steps must be positive");
     }
     if (prompt_len <= 0 || response_len <= 0 || max_grad_norm < 0.0) {
       throw std::invalid_argument("prompt-len and response-len must be positive");
@@ -1001,7 +1030,7 @@ int main(int argc, char** argv) {
     const auto device = torch::Device(torch::kCUDA, static_cast<int>(device_idx));
 
     cverl::distributed::ParallelDims dims;
-    dims.data_parallel = 1;
+    dims.data_parallel = dp_size;
     dims.pipeline_parallel = pp_size;
     dims.context_parallel = 1;
     dims.tensor_parallel = tp_size;
@@ -1020,19 +1049,37 @@ int main(int argc, char** argv) {
     auto peers = cverl::distributed::pipeline_peers(topology, info);
 
     const std::string full_id_path = id_prefix + "_full.bin";
-    const std::string tp_id_path = id_prefix + "_tp_pp" + std::to_string(info.pipeline_rank) + ".bin";
+    const std::string tp_id_path = id_prefix + "_tp_dp" + std::to_string(info.data_rank) +
+                                   "_pp" + std::to_string(info.pipeline_rank) + ".bin";
+    const std::string dp_id_path = id_prefix + "_dp_pp" + std::to_string(info.pipeline_rank) +
+                                   "_tp" + std::to_string(info.tensor_rank) + ".bin";
+    const std::string model_id_path = id_prefix + "_model_dp" + std::to_string(info.data_rank) + ".bin";
     if (global_rank == 0) {
       cverl::distributed::write_nccl_unique_id_file(full_id_path, cverl::distributed::create_nccl_unique_id());
     }
     if (info.tensor_rank == 0) {
       cverl::distributed::write_nccl_unique_id_file(tp_id_path, cverl::distributed::create_nccl_unique_id());
     }
+    if (info.data_rank == 0) {
+      cverl::distributed::write_nccl_unique_id_file(dp_id_path, cverl::distributed::create_nccl_unique_id());
+    }
+    if (info.pipeline_rank == 0 && info.tensor_rank == 0) {
+      cverl::distributed::write_nccl_unique_id_file(model_id_path, cverl::distributed::create_nccl_unique_id());
+    }
 
     auto full_id = cverl::distributed::read_nccl_unique_id_file(full_id_path);
     auto tp_id = cverl::distributed::read_nccl_unique_id_file(tp_id_path);
+    auto dp_id = cverl::distributed::read_nccl_unique_id_file(dp_id_path);
+    auto model_id = cverl::distributed::read_nccl_unique_id_file(model_id_path);
     cverl::distributed::NcclCollectives full_comm(global_rank, world_size, static_cast<int>(device_idx), full_id);
     cverl::distributed::NcclCollectives tp_comm(info.tensor_rank, tp_size, static_cast<int>(device_idx), tp_id);
+    cverl::distributed::NcclCollectives dp_comm(info.data_rank, dp_size, static_cast<int>(device_idx), dp_id);
+    const int64_t model_parallel_size = pp_size * tp_size;
+    const int64_t model_parallel_rank = info.pipeline_rank * tp_size + info.tensor_rank;
+    cverl::distributed::NcclCollectives model_comm(
+        model_parallel_rank, model_parallel_size, static_cast<int>(device_idx), model_id);
     cverl::distributed::ParallelGroup tp_group{info.tensor_rank, tp_size, full_group(tp_size), &tp_comm};
+    cverl::distributed::ParallelGroup dp_group{info.data_rank, dp_size, full_group(dp_size), &dp_comm};
     std::unique_ptr<cverl::distributed::NcclCollectives> rollout_data_comm;
     if (!rollout_nccl_id_file.empty()) {
       if (rollout_nccl_world_size <= world_size) {
@@ -1078,6 +1125,7 @@ int main(int argc, char** argv) {
     if (!resume_checkpoint.empty()) {
       start_step = load_rank_checkpoint(resume_checkpoint,
                                         global_rank,
+                                        info.data_rank,
                                         info.pipeline_rank,
                                         info.tensor_rank,
                                         param_names,
@@ -1214,11 +1262,13 @@ int main(int argc, char** argv) {
       }
 
       sync_tp_replicated_gradients(param_names, params, tp_group);
+      sync_data_parallel_gradients(params, dp_group);
       const double local_grad_norm_sq = optimizer.grad_l2_norm_sq();
       auto grad_sq_tensor =
           torch::tensor({local_grad_norm_sq}, torch::TensorOptions().device(device).dtype(torch::kFloat32));
       auto global_grad_sq_tensor =
-          full_comm.all_reduce(grad_sq_tensor.contiguous(), cverl::distributed::ReduceOp::Sum, full_ranks);
+          model_comm.all_reduce(
+              grad_sq_tensor.contiguous(), cverl::distributed::ReduceOp::Sum, full_group(model_parallel_size));
       const double global_grad_norm =
           std::sqrt(static_cast<double>(global_grad_sq_tensor.cpu()[0].item<float>()));
       double grad_clip_scale = 1.0;
@@ -1241,6 +1291,7 @@ int main(int argc, char** argv) {
                              step,
                              global_rank,
                              world_size,
+                             info.data_rank,
                              info.pipeline_rank,
                              pp_size,
                              info.tensor_rank,
@@ -1252,7 +1303,7 @@ int main(int argc, char** argv) {
                              optimizer);
         full_comm.barrier();
         if (global_rank == 0) {
-          write_checkpoint_manifest(checkpoint_dir, step, world_size, pp_size, tp_size, optimizer);
+          write_checkpoint_manifest(checkpoint_dir, step, world_size, dp_size, pp_size, tp_size, optimizer);
         }
         full_comm.barrier();
       }
@@ -1304,6 +1355,7 @@ int main(int argc, char** argv) {
         }
         append_metrics_csv(metrics_csv,
                            step,
+                           dp_size,
                            pp_size,
                            tp_size,
                            micro_batches,
@@ -1322,6 +1374,7 @@ int main(int argc, char** argv) {
                            reported_grad_clip_scale,
                            total_param_delta);
         std::cout << "step=" << step
+                  << " dp=" << dp_size
                   << " pp=" << pp_size
                   << " tp=" << tp_size
                   << " micro_batches=" << micro_batches
@@ -1355,8 +1408,16 @@ int main(int argc, char** argv) {
     full_comm.barrier();
     if (global_rank == 0) {
       std::filesystem::remove(full_id_path);
-      for (int64_t pp = 0; pp < pp_size; ++pp) {
-        std::filesystem::remove(id_prefix + "_tp_pp" + std::to_string(pp) + ".bin");
+      for (int64_t d = 0; d < dp_size; ++d) {
+        std::filesystem::remove(id_prefix + "_model_dp" + std::to_string(d) + ".bin");
+        for (int64_t pp = 0; pp < pp_size; ++pp) {
+          std::filesystem::remove(
+              id_prefix + "_tp_dp" + std::to_string(d) + "_pp" + std::to_string(pp) + ".bin");
+          for (int64_t tp = 0; tp < tp_size; ++tp) {
+            std::filesystem::remove(
+                id_prefix + "_dp_pp" + std::to_string(pp) + "_tp" + std::to_string(tp) + ".bin");
+          }
+        }
       }
       return trainer_ok ? 0 : 2;
     }
