@@ -569,6 +569,86 @@ void save_rank_checkpoint(const std::string& checkpoint_dir,
   write_json_atomic(step_dir / rank_meta_file, rank_meta);
 }
 
+void save_rank_flat_checkpoint(const std::string& checkpoint_dir,
+                               int64_t step,
+                               int64_t global_rank,
+                               int64_t world_size,
+                               int64_t dp_rank,
+                               int64_t pp_rank,
+                               int64_t pp_size,
+                               int64_t tp_rank,
+                               int64_t tp_size,
+                               int64_t layer_begin,
+                               int64_t layer_end,
+                               const std::vector<std::string>& param_names,
+                               const std::vector<torch::Tensor>& params,
+                               const cverl::distributed::FlatParameterShard& flat_param_shard,
+                               const cverl::torch_backend::FlatAdamW& optimizer) {
+  if (checkpoint_dir.empty()) {
+    return;
+  }
+  if (param_names.size() != params.size()) {
+    throw std::runtime_error("flat checkpoint parameter name/param size mismatch");
+  }
+  const auto step_dir = std::filesystem::path(checkpoint_dir) / checkpoint_step_name(step);
+  std::filesystem::create_directories(step_dir);
+  if (!flat_param_shard.shard.defined() ||
+      optimizer.parameter_shard().numel() != flat_param_shard.shard.numel() ||
+      optimizer.exp_avg().numel() != flat_param_shard.shard.numel() ||
+      optimizer.exp_avg_sq().numel() != flat_param_shard.shard.numel()) {
+    throw std::runtime_error("flat checkpoint optimizer shard size mismatch");
+  }
+
+  torch::serialize::OutputArchive archive;
+  for (size_t i = 0; i < params.size(); ++i) {
+    archive.write("param_" + std::to_string(i), params[i].detach().to(torch::kCPU));
+  }
+  archive.write("flat_param_shard", optimizer.parameter_shard().detach().to(torch::kCPU));
+  archive.write("flat_exp_avg", optimizer.exp_avg().detach().to(torch::kCPU));
+  archive.write("flat_exp_avg_sq", optimizer.exp_avg_sq().detach().to(torch::kCPU));
+  archive.write("optim_step", torch::tensor(optimizer.step_count(), torch::kInt64));
+
+  const std::string rank_file = "rank_" + std::to_string(global_rank) + ".pt";
+  const std::string rank_meta_file = "rank_" + std::to_string(global_rank) + ".json";
+  const auto rank_path = step_dir / rank_file;
+  const auto rank_tmp_path = step_dir / (rank_file + ".tmp");
+  archive.save_to(rank_tmp_path.string());
+  std::filesystem::rename(rank_tmp_path, rank_path);
+
+  nlohmann::json rank_meta;
+  rank_meta["global_rank"] = global_rank;
+  rank_meta["data_rank"] = dp_rank;
+  rank_meta["pipeline_rank"] = pp_rank;
+  rank_meta["tensor_rank"] = tp_rank;
+  rank_meta["layer_begin"] = layer_begin;
+  rank_meta["layer_end"] = layer_end;
+  rank_meta["param_file"] = rank_file;
+  rank_meta["optimizer_step"] = optimizer.step_count();
+  rank_meta["optimizer_kind"] = "FlatAdamW";
+  rank_meta["optimizer_param_indices"] = full_index_list(params.size());
+  rank_meta["flat_parameter_shard"] = {
+      {"original_numel", flat_param_shard.original_numel},
+      {"padded_numel", flat_param_shard.padded_numel},
+      {"shard_begin", flat_param_shard.shard_begin},
+      {"shard_end", flat_param_shard.shard_end},
+      {"numel", flat_param_shard.shard.numel()},
+  };
+  rank_meta["parameters"] = nlohmann::json::array();
+  for (size_t i = 0; i < params.size(); ++i) {
+    nlohmann::json item;
+    item["index"] = i;
+    item["name"] = param_names[i];
+    item["dtype"] = c10::toString(params[i].scalar_type());
+    item["shape"] = std::vector<int64_t>(params[i].sizes().begin(), params[i].sizes().end());
+    item["checkpoint_key"] = "param_" + std::to_string(i);
+    rank_meta["parameters"].push_back(std::move(item));
+  }
+  write_json_atomic(step_dir / rank_meta_file, rank_meta);
+  (void)world_size;
+  (void)pp_size;
+  (void)tp_size;
+}
+
 void write_checkpoint_manifest(const std::string& checkpoint_dir,
                                int64_t step,
                                int64_t world_size,
@@ -608,6 +688,60 @@ void write_checkpoint_manifest(const std::string& checkpoint_dir,
     if (!std::filesystem::exists(step_dir / param_file) ||
         !std::filesystem::exists(step_dir / metadata_file)) {
       throw std::runtime_error("checkpoint is incomplete before manifest write");
+    }
+    manifest["rank_files"].push_back({
+        {"global_rank", rank},
+        {"data_rank", dp},
+        {"pipeline_rank", pp},
+        {"tensor_rank", tp},
+        {"param_file", param_file},
+        {"metadata_file", metadata_file},
+    });
+  }
+  write_json_atomic(step_dir / "manifest.json", manifest);
+  write_text_atomic(std::filesystem::path(checkpoint_dir) / "latest_checkpoint.txt",
+                    checkpoint_step_name(step) + "\n");
+}
+
+void write_flat_checkpoint_manifest(const std::string& checkpoint_dir,
+                                    int64_t step,
+                                    int64_t world_size,
+                                    int64_t dp_size,
+                                    int64_t pp_size,
+                                    int64_t tp_size,
+                                    const cverl::torch_backend::FlatAdamW& optimizer) {
+  if (checkpoint_dir.empty()) {
+    return;
+  }
+  const auto step_dir = std::filesystem::path(checkpoint_dir) / checkpoint_step_name(step);
+  nlohmann::json manifest;
+  manifest["step"] = step + 1;
+  manifest["format"] = "cverl_pp_tp_rank_local_checkpoint_v3";
+  manifest["complete"] = true;
+  manifest["optimizer_kind"] = "FlatAdamW";
+  manifest["world_size"] = world_size;
+  manifest["data_parallel"] = dp_size;
+  manifest["pipeline_parallel"] = pp_size;
+  manifest["tensor_parallel"] = tp_size;
+  manifest["optimizer"] = {
+      {"type", "FlatAdamW"},
+      {"lr", optimizer.options().lr},
+      {"beta1", optimizer.options().beta1},
+      {"beta2", optimizer.options().beta2},
+      {"eps", optimizer.options().eps},
+      {"weight_decay", optimizer.options().weight_decay},
+      {"step", optimizer.step_count()},
+  };
+  manifest["rank_files"] = nlohmann::json::array();
+  for (int64_t rank = 0; rank < world_size; ++rank) {
+    const int64_t tp = rank % tp_size;
+    const int64_t pp = (rank / tp_size) % pp_size;
+    const int64_t dp = rank / (pp_size * tp_size);
+    const std::string param_file = "rank_" + std::to_string(rank) + ".pt";
+    const std::string metadata_file = "rank_" + std::to_string(rank) + ".json";
+    if (!std::filesystem::exists(step_dir / param_file) ||
+        !std::filesystem::exists(step_dir / metadata_file)) {
+      throw std::runtime_error("flat checkpoint is incomplete before manifest write");
     }
     manifest["rank_files"].push_back({
         {"global_rank", rank},
@@ -737,6 +871,113 @@ int64_t load_rank_checkpoint(const std::string& checkpoint_path,
     throw std::runtime_error("resume checkpoint optimizer step mismatch");
   }
   optimizer.load_state(checkpoint_params, exp_avg, exp_avg_sq, archive_step);
+  return archive_step;
+}
+
+int64_t load_rank_flat_checkpoint(const std::string& checkpoint_path,
+                                  int64_t global_rank,
+                                  int64_t dp_rank,
+                                  int64_t pp_rank,
+                                  int64_t tp_rank,
+                                  const std::vector<std::string>& param_names,
+                                  std::vector<torch::Tensor>& params,
+                                  const cverl::distributed::FlatParameterShard& flat_param_shard,
+                                  cverl::torch_backend::FlatAdamW& optimizer) {
+  if (checkpoint_path.empty()) {
+    return 0;
+  }
+  auto step_dir = std::filesystem::path(checkpoint_path);
+  if (!std::filesystem::exists(step_dir / ("rank_" + std::to_string(global_rank) + ".json")) &&
+      std::filesystem::exists(step_dir / "latest_checkpoint.txt")) {
+    std::ifstream latest_in(step_dir / "latest_checkpoint.txt");
+    std::string latest_step;
+    latest_in >> latest_step;
+    if (latest_step.empty()) {
+      throw std::runtime_error("resume flat checkpoint latest_checkpoint.txt is empty");
+    }
+    step_dir /= latest_step;
+  }
+  const auto rank_meta_path = step_dir / ("rank_" + std::to_string(global_rank) + ".json");
+  const auto manifest_path = step_dir / "manifest.json";
+  if (!std::filesystem::exists(rank_meta_path)) {
+    throw std::runtime_error("resume flat checkpoint missing rank metadata: " + rank_meta_path.string());
+  }
+
+  nlohmann::json rank_meta;
+  {
+    std::ifstream in(rank_meta_path);
+    in >> rank_meta;
+  }
+  if (rank_meta.value("global_rank", global_rank) != global_rank ||
+      rank_meta.value("data_rank", dp_rank) != dp_rank ||
+      rank_meta.value("pipeline_rank", pp_rank) != pp_rank ||
+      rank_meta.value("tensor_rank", tp_rank) != tp_rank ||
+      rank_meta.value("optimizer_kind", std::string{}) != "FlatAdamW") {
+    throw std::runtime_error("resume flat checkpoint rank metadata does not match current rank topology");
+  }
+  const auto& param_meta = rank_meta.at("parameters");
+  if (!param_meta.is_array() || param_meta.size() != param_names.size() || param_names.size() != params.size()) {
+    throw std::runtime_error("resume flat checkpoint parameter metadata size mismatch");
+  }
+  for (size_t i = 0; i < param_names.size(); ++i) {
+    const auto& item = param_meta.at(i);
+    if (item.at("index").get<size_t>() != i || item.at("name").get<std::string>() != param_names[i]) {
+      throw std::runtime_error("resume flat checkpoint parameter order/name mismatch at index " + std::to_string(i));
+    }
+    const auto shape = item.at("shape").get<std::vector<int64_t>>();
+    if (shape != std::vector<int64_t>(params[i].sizes().begin(), params[i].sizes().end())) {
+      throw std::runtime_error("resume flat checkpoint parameter shape mismatch for " + param_names[i]);
+    }
+  }
+  const auto& shard_meta = rank_meta.at("flat_parameter_shard");
+  if (shard_meta.at("original_numel").get<int64_t>() != flat_param_shard.original_numel ||
+      shard_meta.at("padded_numel").get<int64_t>() != flat_param_shard.padded_numel ||
+      shard_meta.at("shard_begin").get<int64_t>() != flat_param_shard.shard_begin ||
+      shard_meta.at("shard_end").get<int64_t>() != flat_param_shard.shard_end ||
+      shard_meta.at("numel").get<int64_t>() != flat_param_shard.shard.numel()) {
+    throw std::runtime_error("resume flat checkpoint shard metadata mismatch");
+  }
+
+  int64_t manifest_step = rank_meta.value("optimizer_step", 0);
+  if (std::filesystem::exists(manifest_path)) {
+    nlohmann::json manifest;
+    std::ifstream in(manifest_path);
+    in >> manifest;
+    const std::string format = manifest.value("format", std::string{});
+    if (format != "cverl_pp_tp_rank_local_checkpoint_v3" ||
+        manifest.value("optimizer_kind", std::string{}) != "FlatAdamW") {
+      throw std::runtime_error("unsupported resume flat checkpoint format");
+    }
+    if (!manifest.value("complete", false)) {
+      throw std::runtime_error("resume flat checkpoint manifest is not marked complete");
+    }
+    manifest_step = manifest.at("optimizer").at("step").get<int64_t>();
+  }
+
+  const std::string rank_file = rank_meta.value("param_file", "rank_" + std::to_string(global_rank) + ".pt");
+  torch::serialize::InputArchive archive;
+  archive.load_from((step_dir / rank_file).string());
+  {
+    torch::NoGradGuard no_grad;
+    for (size_t i = 0; i < params.size(); ++i) {
+      torch::Tensor param;
+      archive.read("param_" + std::to_string(i), param);
+      params[i].copy_(param.detach().to(params[i].device(), params[i].scalar_type()));
+    }
+  }
+  torch::Tensor flat_param;
+  torch::Tensor exp_avg;
+  torch::Tensor exp_avg_sq;
+  archive.read("flat_param_shard", flat_param);
+  archive.read("flat_exp_avg", exp_avg);
+  archive.read("flat_exp_avg_sq", exp_avg_sq);
+  torch::Tensor optim_step_tensor;
+  archive.read("optim_step", optim_step_tensor);
+  const int64_t archive_step = optim_step_tensor.item<int64_t>();
+  if (manifest_step != archive_step) {
+    throw std::runtime_error("resume flat checkpoint optimizer step mismatch");
+  }
+  optimizer.load_state(flat_param, exp_avg, exp_avg_sq, archive_step);
   return archive_step;
 }
 
@@ -1307,24 +1548,33 @@ int main(int argc, char** argv) {
     cverl::distributed::FlatParameterShard flat_param_shard;
     std::unique_ptr<cverl::torch_backend::FlatAdamW> flat_optimizer;
     if (dp_flat_shard_optimizer) {
-      if (!resume_checkpoint.empty() || checkpoint_every > 0) {
-        throw std::runtime_error(
-            "flat DP sharded optimizer checkpoint/resume is not wired yet; use --dp-flat-shard-optimizer false");
-      }
       flat_param_shard = cverl::distributed::flatten_parameter_shard(params, dp_size, info.data_rank);
       flat_optimizer = std::make_unique<cverl::torch_backend::FlatAdamW>(flat_param_shard.shard, optim_options);
     }
     int64_t start_step = 0;
     if (!resume_checkpoint.empty()) {
-      start_step = load_rank_checkpoint(resume_checkpoint,
-                                        global_rank,
-                                        info.data_rank,
-                                        info.pipeline_rank,
-                                        info.tensor_rank,
-                                        param_names,
-                                        params,
-                                        optimizer,
-                                        optimizer_param_indices);
+      if (dp_flat_shard_optimizer) {
+        start_step = load_rank_flat_checkpoint(resume_checkpoint,
+                                               global_rank,
+                                               info.data_rank,
+                                               info.pipeline_rank,
+                                               info.tensor_rank,
+                                               param_names,
+                                               params,
+                                               flat_param_shard,
+                                               *flat_optimizer);
+        flat_param_shard.shard.copy_(flat_optimizer->parameter_shard());
+      } else {
+        start_step = load_rank_checkpoint(resume_checkpoint,
+                                          global_rank,
+                                          info.data_rank,
+                                          info.pipeline_rank,
+                                          info.tensor_rank,
+                                          param_names,
+                                          params,
+                                          optimizer,
+                                          optimizer_param_indices);
+      }
       if (start_step > steps) {
         throw std::runtime_error("resume checkpoint step is greater than requested --steps");
       }
@@ -1544,24 +1794,46 @@ int main(int argc, char** argv) {
                            optimizer_param_before, optimizer.master_parameters())
                      : cverl::torch_backend::parameter_delta_sum(param_before, params));
       if (checkpoint_every > 0 && (step + 1) % checkpoint_every == 0) {
-        save_rank_checkpoint(checkpoint_dir,
-                             step,
-                             global_rank,
-                             world_size,
-                             info.data_rank,
-                             info.pipeline_rank,
-                             pp_size,
-                             info.tensor_rank,
-                             tp_size,
-                             range.begin,
-                             range.end,
-                             param_names,
-                             params,
-                             optimizer,
-                             optimizer_param_indices);
+        if (dp_flat_shard_optimizer) {
+          save_rank_flat_checkpoint(checkpoint_dir,
+                                    step,
+                                    global_rank,
+                                    world_size,
+                                    info.data_rank,
+                                    info.pipeline_rank,
+                                    pp_size,
+                                    info.tensor_rank,
+                                    tp_size,
+                                    range.begin,
+                                    range.end,
+                                    param_names,
+                                    params,
+                                    flat_param_shard,
+                                    *flat_optimizer);
+        } else {
+          save_rank_checkpoint(checkpoint_dir,
+                               step,
+                               global_rank,
+                               world_size,
+                               info.data_rank,
+                               info.pipeline_rank,
+                               pp_size,
+                               info.tensor_rank,
+                               tp_size,
+                               range.begin,
+                               range.end,
+                               param_names,
+                               params,
+                               optimizer,
+                               optimizer_param_indices);
+        }
         full_comm.barrier();
         if (global_rank == 0) {
-          write_checkpoint_manifest(checkpoint_dir, step, world_size, dp_size, pp_size, tp_size, optimizer);
+          if (dp_flat_shard_optimizer) {
+            write_flat_checkpoint_manifest(checkpoint_dir, step, world_size, dp_size, pp_size, tp_size, *flat_optimizer);
+          } else {
+            write_checkpoint_manifest(checkpoint_dir, step, world_size, dp_size, pp_size, tp_size, optimizer);
+          }
         }
         full_comm.barrier();
       }

@@ -49,6 +49,8 @@ Current distributed support:
 - Tensor-parallel linear helpers: column-parallel, row-parallel, and SwiGLU MLP
 - Qwen3.5 TP entry points for MLP, full attention, and linear attention
 - Data-parallel gradient all-reduce/average helper
+- Flat DP optimizer shard path with gradient reduce-scatter, parameter
+  all-gather, and rank-local FlatAdamW checkpoint/resume
 - Single-process collectives for CPU tests
 
 Current efficient rollout foundation:
