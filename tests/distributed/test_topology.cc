@@ -44,6 +44,46 @@ void require_throws(Fn&& fn, const char* msg) {
   require(failed, msg);
 }
 
+class PrecomputedAllGatherCollectives final : public cverl::distributed::Collectives {
+ public:
+  explicit PrecomputedAllGatherCollectives(std::vector<torch::Tensor> parts) : parts_(std::move(parts)) {}
+
+  int64_t rank() const override { return 0; }
+  int64_t world_size() const override { return static_cast<int64_t>(parts_.size()); }
+  void barrier() override {}
+
+  torch::Tensor broadcast(const torch::Tensor& input,
+                          int64_t /*root*/,
+                          const std::vector<int64_t>& /*group*/) override {
+    return input;
+  }
+
+  torch::Tensor all_reduce(const torch::Tensor& input,
+                           cverl::distributed::ReduceOp /*op*/,
+                           const std::vector<int64_t>& /*group*/) override {
+    return input;
+  }
+
+  torch::Tensor all_gather(const torch::Tensor& /*input*/,
+                           const std::vector<int64_t>& /*group*/,
+                           int64_t dim) override {
+    return torch::cat(parts_, dim);
+  }
+
+  torch::Tensor reduce_scatter(const torch::Tensor& input,
+                               cverl::distributed::ReduceOp /*op*/,
+                               const std::vector<int64_t>& /*group*/,
+                               int64_t /*dim*/) override {
+    return input;
+  }
+
+  void send(const torch::Tensor& /*input*/, int64_t /*peer*/) override {}
+  torch::Tensor recv_like(const torch::Tensor& like, int64_t /*peer*/) override { return torch::empty_like(like); }
+
+ private:
+  std::vector<torch::Tensor> parts_;
+};
+
 cverl::distributed::ClusterSpec make_spec() {
   cverl::distributed::ClusterSpec spec;
   spec.parallel.data_parallel = 2;
@@ -284,6 +324,36 @@ void test_context_parallel_slice() {
                  "non-divisible context slice rejected");
 }
 
+void test_context_parallel_padded_slice_and_gather() {
+  auto x = torch::arange(5, torch::kFloat32).view({1, 5});
+  require(cverl::distributed::context_parallel_padded_length(5, 2) == 6, "context padded length");
+  auto r0 = cverl::distributed::context_parallel_sequence_range(5, 0, 2);
+  auto r1 = cverl::distributed::context_parallel_sequence_range(5, 1, 2);
+  require(r0.begin == 0 && r0.end == 3 && r0.padded_end == 3, "context range 0");
+  require(r1.begin == 3 && r1.end == 5 && r1.padded_end == 6, "context range 1");
+
+  auto s0 = cverl::distributed::context_parallel_slice_padded(x, 0, 2, 1, -1.0);
+  auto s1 = cverl::distributed::context_parallel_slice_padded(x, 1, 2, 1, -1.0);
+  require(torch::allclose(s0, torch::tensor({0.0f, 1.0f, 2.0f}).view({1, 3})), "padded context slice 0");
+  require(torch::allclose(s1, torch::tensor({3.0f, 4.0f, -1.0f}).view({1, 3})), "padded context slice 1");
+
+  PrecomputedAllGatherCollectives collectives({s0.transpose(0, 1).contiguous(), s1.transpose(0, 1).contiguous()});
+  auto gathered = cverl::distributed::context_parallel_gather_padded(s0, collectives, {0, 1}, 1, 5);
+  require(torch::allclose(gathered, x), "padded context gather trims padding");
+}
+
+void test_context_parallel_ring_schedule() {
+  auto schedule = cverl::distributed::context_parallel_ring_schedule({0, 1, 2, 3}, 2);
+  require(schedule.size() == 4, "context ring schedule size");
+  require(schedule[0].kv_rank == 2 && schedule[0].send_rank == 3 && schedule[0].recv_rank == 1,
+          "context ring step 0");
+  require(schedule[1].kv_rank == 1 && schedule[2].kv_rank == 0 && schedule[3].kv_rank == 3,
+          "context ring kv order");
+  require(cverl::distributed::context_parallel_group_index({8, 9}, 9) == 1, "context group index");
+  require_throws([&]() { (void)cverl::distributed::context_parallel_ring_schedule({0, 1}, 3); },
+                 "context ring rejects non-member rank");
+}
+
 void test_dtype_names() {
   require(cverl::distributed::dtype_policy_name(cverl::distributed::DTypePolicy::Float32) == "float32", "float32 name");
   require(cverl::distributed::dtype_policy_name(cverl::distributed::DTypePolicy::Float16) == "float16", "float16 name");
@@ -303,6 +373,8 @@ int main() {
     test_pipeline_peers();
     test_pipeline_1f1b_schedule();
     test_context_parallel_slice();
+    test_context_parallel_padded_slice_and_gather();
+    test_context_parallel_ring_schedule();
     test_dtype_names();
   } catch (const std::exception& e) {
     std::cerr << "test_topology failed: " << e.what() << "\n";
