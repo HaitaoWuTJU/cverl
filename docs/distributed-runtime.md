@@ -137,7 +137,10 @@ The runtime config separates memory decisions from model code:
   than full-state saving or pure recompute. Full-state mode is only for golden
   tests/debugging; pure recompute is available by env override and runs a
   tiled recompute backward kernel without allocating full states, checkpoints,
-  or per-chunk replay cache.
+  or per-chunk replay cache. Chunk replay backward can also run in compact
+  per-value-tile mode, reducing temporary replay cache from
+  `B*H*chunk*K*V` to `B*H*chunk*K*value_tile` at the cost of serializing value
+  tiles inside each checkpoint chunk.
 - Sharded optimizer and sharded gradients enabled by default.
 - DP flat sharded AdamW supports both Megatron-style no-master BF16/FP16
   parameter shards and FP32 master shards. Gradients and Adam moments stay

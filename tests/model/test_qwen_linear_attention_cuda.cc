@@ -73,6 +73,12 @@ int main() {
       grad_out, q, k, v, beta, g, std::get<1>(checkpointed_forward), 2);
   unsetenv("CVERL_LINEAR_ATTN_CHUNK_REPLAY_BACKWARD");
   setenv("CVERL_LINEAR_ATTN_CHUNK_REPLAY_BACKWARD", "1", 1);
+  setenv("CVERL_LINEAR_ATTN_COMPACT_REPLAY_BACKWARD", "1", 1);
+  auto compact_chunk_replay_grads = cverl::qwen_linear_attention_cuda_backward_checkpointed(
+      grad_out, q, k, v, beta, g, std::get<1>(checkpointed_forward), 2);
+  unsetenv("CVERL_LINEAR_ATTN_COMPACT_REPLAY_BACKWARD");
+  unsetenv("CVERL_LINEAR_ATTN_CHUNK_REPLAY_BACKWARD");
+  setenv("CVERL_LINEAR_ATTN_CHUNK_REPLAY_BACKWARD", "1", 1);
   setenv("CVERL_LINEAR_ATTN_REPLAY_MAX_BYTES_MB", "0", 1);
   auto budget_recompute_grads = cverl::qwen_linear_attention_cuda_backward_checkpointed(
       grad_out, q, k, v, beta, g, std::get<1>(checkpointed_forward), 2);
@@ -94,6 +100,11 @@ int main() {
   require_close(chunk_replay_grads[2].cpu(), saved_grads[2].cpu(), 5e-4, 5e-4, "chunk replay dv");
   require_close(chunk_replay_grads[3].cpu(), saved_grads[3].cpu(), 5e-4, 5e-4, "chunk replay dbeta");
   require_close(chunk_replay_grads[4].cpu(), saved_grads[4].cpu(), 5e-4, 5e-4, "chunk replay dg");
+  require_close(compact_chunk_replay_grads[0].cpu(), saved_grads[0].cpu(), 5e-4, 5e-4, "compact chunk replay dq");
+  require_close(compact_chunk_replay_grads[1].cpu(), saved_grads[1].cpu(), 5e-4, 5e-4, "compact chunk replay dk");
+  require_close(compact_chunk_replay_grads[2].cpu(), saved_grads[2].cpu(), 5e-4, 5e-4, "compact chunk replay dv");
+  require_close(compact_chunk_replay_grads[3].cpu(), saved_grads[3].cpu(), 5e-4, 5e-4, "compact chunk replay dbeta");
+  require_close(compact_chunk_replay_grads[4].cpu(), saved_grads[4].cpu(), 5e-4, 5e-4, "compact chunk replay dg");
   require_close(budget_recompute_grads[0].cpu(), saved_grads[0].cpu(), 5e-4, 5e-4, "budget recompute dq");
   require_close(budget_recompute_grads[1].cpu(), saved_grads[1].cpu(), 5e-4, 5e-4, "budget recompute dk");
   require_close(budget_recompute_grads[2].cpu(), saved_grads[2].cpu(), 5e-4, 5e-4, "budget recompute dv");

@@ -327,7 +327,8 @@ Implemented pieces:
 - linear attention via LibTorch depthwise `conv1d` and recurrent gated delta rule
 - CUDA linear attention for `kd=128, vd=128`; forward is tiled over the value
   dimension and backward can recompute, use recurrent-state checkpoints, or
-  replay each checkpoint chunk once with a temporary state cache
+  replay each checkpoint chunk once with either a full-value or compact
+  per-value-tile temporary state cache
 - full attention with grouped KV heads, causal masking, RoPE, q/k norm, and output gate
 - SwiGLU MLP
 - final norm
@@ -350,6 +351,7 @@ CVERL_LINEAR_ATTN_CHECKPOINT_INTERVAL=16
 CVERL_LINEAR_ATTN_CHECKPOINT_MAX_BYTES_MB=256  # optional per-layer checkpoint budget
 CVERL_LINEAR_ATTN_CHUNK_REPLAY_BACKWARD=1      # default: faster checkpointed backward; set 0 for debug fallback
 CVERL_LINEAR_ATTN_REPLAY_MAX_BYTES_MB=0        # optional; 0 forces chunk recompute instead of replay cache
+CVERL_LINEAR_ATTN_COMPACT_REPLAY_BACKWARD=1    # replay one value tile at a time to reduce temporary cache memory
 CVERL_LINEAR_ATTN_SAVE_STATES=0     # default: chunk checkpoints to reduce activation memory
 CVERL_LINEAR_ATTN_SAVE_STATES=1     # debug/comparison: save every recurrent state
 ```

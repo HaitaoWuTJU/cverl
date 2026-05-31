@@ -59,6 +59,21 @@ bool replay_states_within_budget(int64_t bytes) {
   return bytes <= max_bytes;
 }
 
+bool use_compact_chunk_replay_backward() {
+  const char* env = std::getenv("CVERL_LINEAR_ATTN_COMPACT_REPLAY_BACKWARD");
+  if (env == nullptr || *env == '\0') {
+    return false;
+  }
+  const std::string value(env);
+  if (value == "1" || value == "true" || value == "on" || value == "yes") {
+    return true;
+  }
+  if (value == "0" || value == "false" || value == "off" || value == "no") {
+    return false;
+  }
+  throw std::invalid_argument("CVERL_LINEAR_ATTN_COMPACT_REPLAY_BACKWARD must be 0|1|false|true|off|on");
+}
+
 __global__ void qwen_linear_attn_forward_kernel(const float* __restrict__ q,
                                                 const float* __restrict__ k,
                                                 const float* __restrict__ v,
@@ -1231,11 +1246,14 @@ __global__ void qwen_linear_attn_backward_checkpointed_chunk_replay_tiled_kernel
     int K,
     int V,
     int C,
-    int value_tile) {
+    int value_tile,
+    int tile_index_offset,
+    int replay_value_stride,
+    int carry_value_stride) {
   int bh = blockIdx.x;
   int b = bh / H;
   int h = bh - b * H;
-  const int tile_begin = blockIdx.y * value_tile;
+  const int tile_begin = (blockIdx.y + tile_index_offset) * value_tile;
   const int tile_cols = value_tile < (V - tile_begin) ? value_tile : (V - tile_begin);
   if (tile_cols <= 0 || chunk_len <= 0) {
     return;
@@ -1251,15 +1269,16 @@ __global__ void qwen_linear_attn_backward_checkpointed_chunk_replay_tiled_kernel
   const int v_base = (((b * H + h) * T) * V);
   const int scalar_base = ((b * H + h) * T);
   const int checkpoint_base = (((b * H + h) * C) * K) * V;
-  const int replay_base = (((b * H + h) * checkpoint_interval) * K) * V;
-  const int carry_base = (((b * H + h) * K) * V);
+  const int replay_base = (((b * H + h) * checkpoint_interval) * K) * replay_value_stride;
+  const int carry_base = ((b * H + h) * K) * carry_value_stride;
   const int c = chunk_begin / checkpoint_interval;
 
   for (int idx = threadIdx.x; idx < state_elems; idx += blockDim.x) {
     const int kk = idx / tile_cols;
     const int local_j = idx - kk * tile_cols;
     const int j = tile_begin + local_j;
-    dstate[idx] = dstate_carry[carry_base + kk * V + j];
+    const int carry_j = (carry_value_stride == V) ? j : local_j;
+    dstate[idx] = dstate_carry[carry_base + kk * carry_value_stride + carry_j];
     prev[idx] = checkpoints[checkpoint_base + c * K * V + kk * V + j];
     state[idx] = 0.0f;
   }
@@ -1290,8 +1309,10 @@ __global__ void qwen_linear_attn_backward_checkpointed_chunk_replay_tiled_kernel
       const int kk = idx / tile_cols;
       const int local_j = idx - kk * tile_cols;
       const int j = tile_begin + local_j;
+      const int replay_j = (replay_value_stride == V) ? j : local_j;
       prev[idx] = state[idx];
-      replay_states[replay_base + local_t * K * V + kk * V + j] = state[idx];
+      replay_states[replay_base + local_t * K * replay_value_stride + kk * replay_value_stride + replay_j] =
+          state[idx];
     }
     __syncthreads();
   }
@@ -1304,11 +1325,14 @@ __global__ void qwen_linear_attn_backward_checkpointed_chunk_replay_tiled_kernel
       const int kk = idx / tile_cols;
       const int local_j = idx - kk * tile_cols;
       const int j = tile_begin + local_j;
-      state[idx] = replay_states[replay_base + local_t * K * V + kk * V + j];
+      const int replay_j = (replay_value_stride == V) ? j : local_j;
+      state[idx] =
+          replay_states[replay_base + local_t * K * replay_value_stride + kk * replay_value_stride + replay_j];
       if (local_t == 0) {
         prev[idx] = checkpoints[checkpoint_base + c * K * V + kk * V + j];
       } else {
-        prev[idx] = replay_states[replay_base + (local_t - 1) * K * V + kk * V + j];
+        prev[idx] = replay_states[replay_base + (local_t - 1) * K * replay_value_stride +
+                                   kk * replay_value_stride + replay_j];
       }
     }
     __syncthreads();
@@ -1393,7 +1417,8 @@ __global__ void qwen_linear_attn_backward_checkpointed_chunk_replay_tiled_kernel
     const int kk = idx / tile_cols;
     const int local_j = idx - kk * tile_cols;
     const int j = tile_begin + local_j;
-    dstate_carry[carry_base + kk * V + j] = dstate[idx];
+    const int carry_j = (carry_value_stride == V) ? j : local_j;
+    dstate_carry[carry_base + kk * carry_value_stride + carry_j] = dstate[idx];
   }
 }
 
@@ -1616,7 +1641,13 @@ std::vector<torch::Tensor> qwen_linear_attention_cuda_backward_checkpointed(
   const int64_t replay_bytes = static_cast<int64_t>(B) * static_cast<int64_t>(H) *
                                static_cast<int64_t>(interval) * static_cast<int64_t>(K) *
                                static_cast<int64_t>(V) * static_cast<int64_t>(query.element_size());
-  if (use_chunk_replay_backward() && replay_states_within_budget(replay_bytes)) {
+  const int64_t compact_replay_bytes = static_cast<int64_t>(B) * static_cast<int64_t>(H) *
+                                       static_cast<int64_t>(interval) * static_cast<int64_t>(K) *
+                                       static_cast<int64_t>(value_tile) *
+                                       static_cast<int64_t>(query.element_size());
+  const bool chunk_replay = use_chunk_replay_backward();
+  const bool compact_replay = use_compact_chunk_replay_backward();
+  if (chunk_replay && !compact_replay && replay_states_within_budget(replay_bytes)) {
     auto dstate_carry = torch::zeros({B, H, K, V}, query.options());
     auto replay_states = torch::empty({B, H, interval, K, V}, query.options());
     check_cuda(cudaFuncSetAttribute(qwen_linear_attn_backward_checkpointed_chunk_replay_tiled_kernel,
@@ -1629,8 +1660,31 @@ std::vector<torch::Tensor> qwen_linear_attention_cuda_backward_checkpointed(
           grad_out.data_ptr<float>(), query.data_ptr<float>(), key.data_ptr<float>(), value.data_ptr<float>(),
           beta.data_ptr<float>(), g.data_ptr<float>(), checkpoints.data_ptr<float>(), dstate_carry.data_ptr<float>(),
           replay_states.data_ptr<float>(), dq.data_ptr<float>(), dk.data_ptr<float>(), dv.data_ptr<float>(),
-          dbeta.data_ptr<float>(), dg.data_ptr<float>(), interval, begin, chunk_len, B, H, T, K, V, C, value_tile);
+          dbeta.data_ptr<float>(), dg.data_ptr<float>(), interval, begin, chunk_len, B, H, T, K, V, C, value_tile,
+          0, V, V);
       check_cuda(cudaGetLastError(), "qwen_linear_attn_backward_checkpointed_chunk_replay_tiled_kernel");
+    }
+    return {dq, dk, dv, dbeta, dg};
+  }
+  if (chunk_replay && (compact_replay || replay_states_within_budget(compact_replay_bytes))) {
+    auto dstate_carry = torch::empty({B, H, K, value_tile}, query.options());
+    auto replay_states = torch::empty({B, H, interval, K, value_tile}, query.options());
+    check_cuda(cudaFuncSetAttribute(qwen_linear_attn_backward_checkpointed_chunk_replay_tiled_kernel,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    static_cast<int>(shared)),
+               "cudaFuncSetAttribute compact tiled checkpointed chunk replay backward");
+    for (int tile = 0; tile < value_tiles; ++tile) {
+      dstate_carry.zero_();
+      for (int begin = ((T - 1) / interval) * interval; begin >= 0; begin -= interval) {
+        const int chunk_len = std::min(interval, T - begin);
+        qwen_linear_attn_backward_checkpointed_chunk_replay_tiled_kernel<<<dim3(B * H, 1), 256, shared>>>(
+            grad_out.data_ptr<float>(), query.data_ptr<float>(), key.data_ptr<float>(), value.data_ptr<float>(),
+            beta.data_ptr<float>(), g.data_ptr<float>(), checkpoints.data_ptr<float>(),
+            dstate_carry.data_ptr<float>(), replay_states.data_ptr<float>(), dq.data_ptr<float>(),
+            dk.data_ptr<float>(), dv.data_ptr<float>(), dbeta.data_ptr<float>(), dg.data_ptr<float>(), interval,
+            begin, chunk_len, B, H, T, K, V, C, value_tile, tile, value_tile, value_tile);
+        check_cuda(cudaGetLastError(), "qwen_linear_attn_backward_checkpointed_compact_chunk_replay_tiled_kernel");
+      }
     }
     return {dq, dk, dv, dbeta, dg};
   }
