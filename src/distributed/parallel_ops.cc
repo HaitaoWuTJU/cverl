@@ -43,6 +43,39 @@ struct GradBucketEntry {
   int64_t numel = 0;
 };
 
+torch::Tensor flatten_grad_bucket(const std::vector<GradBucketEntry>& bucket,
+                                  int64_t padded_numel = -1) {
+  int64_t original_numel = 0;
+  for (const auto& entry : bucket) {
+    original_numel += entry.numel;
+  }
+  if (padded_numel < 0) {
+    padded_numel = original_numel;
+  }
+  if (padded_numel < original_numel) {
+    throw std::invalid_argument("flatten_grad_bucket padded_numel is smaller than original numel");
+  }
+  if (bucket.empty()) {
+    return torch::empty({padded_numel}, torch::TensorOptions().dtype(torch::kFloat32));
+  }
+  if (bucket.size() == 1 && padded_numel == original_numel) {
+    const auto& entry = bucket.front();
+    return entry.grad.contiguous().view({entry.numel});
+  }
+
+  auto flat = torch::empty({padded_numel}, bucket.front().grad.options());
+  int64_t offset = 0;
+  for (const auto& entry : bucket) {
+    flat.narrow(0, offset, entry.numel)
+        .copy_(entry.grad.contiguous().view({entry.numel}));
+    offset += entry.numel;
+  }
+  if (padded_numel > original_numel) {
+    flat.narrow(0, original_numel, padded_numel - original_numel).zero_();
+  }
+  return flat;
+}
+
 void flush_grad_bucket(std::vector<GradBucketEntry>* bucket,
                        Collectives& collectives,
                        const std::vector<int64_t>& data_group,
@@ -51,18 +84,7 @@ void flush_grad_bucket(std::vector<GradBucketEntry>* bucket,
     return;
   }
 
-  torch::Tensor flat;
-  if (bucket->size() == 1) {
-    const auto& entry = bucket->front();
-    flat = entry.grad.contiguous().view({entry.numel});
-  } else {
-    std::vector<torch::Tensor> flat_grads;
-    flat_grads.reserve(bucket->size());
-    for (const auto& entry : *bucket) {
-      flat_grads.push_back(entry.grad.contiguous().view({entry.numel}));
-    }
-    flat = torch::cat(flat_grads, 0).contiguous();
-  }
+  auto flat = flatten_grad_bucket(*bucket);
   auto synced = collectives.all_reduce(flat, average ? ReduceOp::Mean : ReduceOp::Sum, data_group).contiguous();
   int64_t offset = 0;
   for (const auto& entry : *bucket) {
@@ -94,18 +116,7 @@ void flush_grad_reduce_scatter_bucket(std::vector<GradBucketEntry>* bucket,
     meta.parameter_indices.push_back(entry.parameter_index);
     meta.parameter_numels.push_back(entry.numel);
   }
-  torch::Tensor flat;
-  if (bucket->size() == 1) {
-    const auto& entry = bucket->front();
-    flat = entry.grad.contiguous().view({entry.numel});
-  } else {
-    std::vector<torch::Tensor> flat_grads;
-    flat_grads.reserve(bucket->size());
-    for (const auto& entry : *bucket) {
-      flat_grads.push_back(entry.grad.contiguous().view({entry.numel}));
-    }
-    flat = torch::cat(flat_grads, 0).contiguous();
-  }
+  auto flat = flatten_grad_bucket(*bucket);
   if (data_group.size() == 1) {
     meta.shard = flat.contiguous();
     meta.original_numel = original_numel;
@@ -119,7 +130,7 @@ void flush_grad_reduce_scatter_bucket(std::vector<GradBucketEntry>* bucket,
   const int64_t remainder = flat.numel() % group_size;
   const int64_t pad = remainder == 0 ? 0 : group_size - remainder;
   if (pad > 0) {
-    flat = torch::cat({flat, torch::zeros({pad}, flat.options())}, 0).contiguous();
+    flat = flatten_grad_bucket(*bucket, flat.numel() + pad);
   }
   auto shard = collectives.reduce_scatter(
       flat, average ? ReduceOp::Mean : ReduceOp::Sum, data_group, 0).contiguous();
