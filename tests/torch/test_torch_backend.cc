@@ -106,6 +106,41 @@ int main() {
     return 1;
   }
 
+  torch::Tensor rewards = torch::tensor({{1.0f, 0.0f},
+                                         {3.0f, 0.0f},
+                                         {5.0f, 0.0f},
+                                         {9.0f, 0.0f},
+                                         {4.0f, 1.0f}}, torch::kFloat32);
+  torch::Tensor reward_mask = torch::tensor({{1.0f, 1.0f},
+                                             {1.0f, 0.0f},
+                                             {1.0f, 1.0f},
+                                             {0.0f, 1.0f},
+                                             {1.0f, 0.0f}}, torch::kFloat32);
+  torch::Tensor group_ids = torch::tensor({7, 7, 3, 3, 99}, torch::kLong);
+  torch::Tensor returns;
+  auto grpo = cverl::torch_backend::grpo_outcome_advantage(
+      rewards, reward_mask, group_ids, 1.0e-6, false, &returns);
+  auto expected_grpo = torch::tensor({{-1.0f, -1.0f},
+                                     {1.0f, 0.0f},
+                                     {-2.0f, -2.0f},
+                                     {0.0f, 2.0f},
+                                     {5.0f, 0.0f}}, torch::kFloat32);
+  if (!torch::allclose(grpo, expected_grpo, 1.0e-5, 1.0e-6) ||
+      !torch::allclose(returns, expected_grpo, 1.0e-5, 1.0e-6)) {
+    std::cerr << "torch grpo advantage mismatch\n";
+    std::cerr << "actual: " << grpo << "\nexpected: " << expected_grpo << "\n";
+    return 1;
+  }
+
+  auto grpo_norm = cverl::torch_backend::grpo_outcome_advantage(
+      rewards.narrow(0, 0, 2), reward_mask.narrow(0, 0, 2), group_ids.narrow(0, 0, 2), 1.0e-6, true, nullptr);
+  const float inv_std = 1.0f / (std::sqrt(2.0f) + 1.0e-6f);
+  auto expected_norm = torch::tensor({{-inv_std, -inv_std}, {inv_std, 0.0f}}, torch::kFloat32);
+  if (!torch::allclose(grpo_norm, expected_norm, 1.0e-5, 1.0e-6)) {
+    std::cerr << "torch grpo normalized advantage mismatch\n";
+    return 1;
+  }
+
   std::cout << "cverl LibTorch backend tests passed\n";
   return 0;
 }

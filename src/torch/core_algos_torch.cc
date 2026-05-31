@@ -1,8 +1,7 @@
 #include "cverl/torch/core_algos_torch.h"
 
 #include <limits>
-#include <unordered_map>
-#include <vector>
+#include <tuple>
 
 namespace cverl::torch_backend {
 namespace {
@@ -122,31 +121,29 @@ torch::Tensor grpo_outcome_advantage(
 
   torch::NoGradGuard no_grad;
   torch::Tensor scores = token_level_rewards.sum(/*dim=*/-1);
-  torch::Tensor group_cpu = group_ids.to(torch::kCPU).to(torch::kLong).contiguous();
-  auto group_acc = group_cpu.accessor<int64_t, 1>();
+  torch::Tensor group_values;
+  torch::Tensor inverse;
+  torch::Tensor counts_i64;
+  std::tie(group_values, inverse, counts_i64) =
+      at::_unique2(group_ids.to(scores.device(), torch::kLong).contiguous(),
+                   /*sorted=*/true,
+                   /*return_inverse=*/true,
+                   /*return_counts=*/true);
+  (void)group_values;
 
-  std::unordered_map<int64_t, std::vector<int64_t>> groups;
-  for (int64_t i = 0; i < group_ids.size(0); ++i) {
-    groups[group_acc[i]].push_back(i);
-  }
+  auto counts = counts_i64.to(scores.device(), scores.scalar_type());
+  auto group_sums = torch::zeros({counts.size(0)}, scores.options());
+  group_sums.index_add_(0, inverse, scores);
+  auto group_means = group_sums / counts.clamp_min(1.0);
+  group_means = torch::where(counts > 1.0, group_means, torch::zeros_like(group_means));
 
-  torch::Tensor scalars = torch::empty_like(scores);
-  for (const auto& entry : groups) {
-    std::vector<torch::Tensor> group_scores;
-    group_scores.reserve(entry.second.size());
-    for (int64_t row : entry.second) {
-      group_scores.push_back(scores.index({row}));
-    }
-    torch::Tensor stacked = torch::stack(group_scores);
-    torch::Tensor mean = entry.second.size() == 1 ? torch::zeros({}, scores.options()) : stacked.mean();
-    torch::Tensor std = entry.second.size() == 1 ? torch::ones({}, scores.options()) : stacked.std(/*unbiased=*/true);
-    for (int64_t row : entry.second) {
-      torch::Tensor scalar = scores.index({row}) - mean;
-      if (norm_adv_by_std) {
-        scalar = scalar / (std + epsilon);
-      }
-      scalars.index_put_({row}, scalar);
-    }
+  torch::Tensor scalars = scores - group_means.index_select(0, inverse);
+  if (norm_adv_by_std) {
+    auto group_sq_sums = torch::zeros_like(group_sums);
+    group_sq_sums.index_add_(0, inverse, scalars.square());
+    auto group_std = torch::sqrt(group_sq_sums / (counts - 1.0).clamp_min(1.0));
+    group_std = torch::where(counts > 1.0, group_std, torch::ones_like(group_std));
+    scalars = scalars / (group_std.index_select(0, inverse) + epsilon);
   }
 
   torch::Tensor advantages = scalars.unsqueeze(-1) * response_mask;
