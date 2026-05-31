@@ -46,6 +46,19 @@ bool use_chunk_replay_backward() {
   throw std::invalid_argument("CVERL_LINEAR_ATTN_CHUNK_REPLAY_BACKWARD must be 0|1|false|true|off|on");
 }
 
+bool replay_states_within_budget(int64_t bytes) {
+  const char* env = std::getenv("CVERL_LINEAR_ATTN_REPLAY_MAX_BYTES_MB");
+  if (env == nullptr || *env == '\0') {
+    return true;
+  }
+  const int64_t max_mb = std::stoll(env);
+  if (max_mb < 0) {
+    throw std::invalid_argument("CVERL_LINEAR_ATTN_REPLAY_MAX_BYTES_MB must be non-negative");
+  }
+  const int64_t max_bytes = max_mb * 1024LL * 1024LL;
+  return bytes <= max_bytes;
+}
+
 __global__ void qwen_linear_attn_forward_kernel(const float* __restrict__ q,
                                                 const float* __restrict__ k,
                                                 const float* __restrict__ v,
@@ -1420,7 +1433,10 @@ std::vector<torch::Tensor> qwen_linear_attention_cuda_backward_checkpointed(
   if (shared > 192 * 1024) {
     throw std::runtime_error("Qwen linear attention CUDA tiled checkpointed backward shared memory limit exceeded");
   }
-  if (use_chunk_replay_backward()) {
+  const int64_t replay_bytes = static_cast<int64_t>(B) * static_cast<int64_t>(H) *
+                               static_cast<int64_t>(interval) * static_cast<int64_t>(K) *
+                               static_cast<int64_t>(V) * static_cast<int64_t>(query.element_size());
+  if (use_chunk_replay_backward() && replay_states_within_budget(replay_bytes)) {
     auto dstate_carry = torch::zeros({B, H, K, V}, query.options());
     auto replay_states = torch::empty({B, H, interval, K, V}, query.options());
     check_cuda(cudaFuncSetAttribute(qwen_linear_attn_backward_checkpointed_chunk_replay_tiled_kernel,

@@ -349,6 +349,7 @@ CVERL_LINEAR_ATTN_STATE_MODE=chunk  # none|recompute|full|chunk|checkpoint
 CVERL_LINEAR_ATTN_CHECKPOINT_INTERVAL=16
 CVERL_LINEAR_ATTN_CHECKPOINT_MAX_BYTES_MB=256  # optional per-layer checkpoint budget
 CVERL_LINEAR_ATTN_CHUNK_REPLAY_BACKWARD=1      # default: faster checkpointed backward; set 0 for debug fallback
+CVERL_LINEAR_ATTN_REPLAY_MAX_BYTES_MB=0        # optional; 0 forces chunk recompute instead of replay cache
 CVERL_LINEAR_ATTN_SAVE_STATES=0     # default: chunk checkpoints to reduce activation memory
 CVERL_LINEAR_ATTN_SAVE_STATES=1     # debug/comparison: save every recurrent state
 ```

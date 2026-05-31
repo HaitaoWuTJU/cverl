@@ -72,6 +72,12 @@ int main() {
   auto chunk_replay_grads = cverl::qwen_linear_attention_cuda_backward_checkpointed(
       grad_out, q, k, v, beta, g, std::get<1>(checkpointed_forward), 2);
   unsetenv("CVERL_LINEAR_ATTN_CHUNK_REPLAY_BACKWARD");
+  setenv("CVERL_LINEAR_ATTN_CHUNK_REPLAY_BACKWARD", "1", 1);
+  setenv("CVERL_LINEAR_ATTN_REPLAY_MAX_BYTES_MB", "0", 1);
+  auto budget_recompute_grads = cverl::qwen_linear_attention_cuda_backward_checkpointed(
+      grad_out, q, k, v, beta, g, std::get<1>(checkpointed_forward), 2);
+  unsetenv("CVERL_LINEAR_ATTN_REPLAY_MAX_BYTES_MB");
+  unsetenv("CVERL_LINEAR_ATTN_CHUNK_REPLAY_BACKWARD");
 
   require_close(recompute_grads[0].cpu(), saved_grads[0].cpu(), 5e-4, 5e-4, "dq");
   require_close(recompute_grads[1].cpu(), saved_grads[1].cpu(), 5e-4, 5e-4, "dk");
@@ -88,6 +94,11 @@ int main() {
   require_close(chunk_replay_grads[2].cpu(), saved_grads[2].cpu(), 5e-4, 5e-4, "chunk replay dv");
   require_close(chunk_replay_grads[3].cpu(), saved_grads[3].cpu(), 5e-4, 5e-4, "chunk replay dbeta");
   require_close(chunk_replay_grads[4].cpu(), saved_grads[4].cpu(), 5e-4, 5e-4, "chunk replay dg");
+  require_close(budget_recompute_grads[0].cpu(), saved_grads[0].cpu(), 5e-4, 5e-4, "budget recompute dq");
+  require_close(budget_recompute_grads[1].cpu(), saved_grads[1].cpu(), 5e-4, 5e-4, "budget recompute dk");
+  require_close(budget_recompute_grads[2].cpu(), saved_grads[2].cpu(), 5e-4, 5e-4, "budget recompute dv");
+  require_close(budget_recompute_grads[3].cpu(), saved_grads[3].cpu(), 5e-4, 5e-4, "budget recompute dbeta");
+  require_close(budget_recompute_grads[4].cpu(), saved_grads[4].cpu(), 5e-4, 5e-4, "budget recompute dg");
 
   std::cout << "test_qwen_linear_attention_cuda passed\n";
   return 0;
