@@ -384,16 +384,23 @@ void sync_tp_replicated_gradients(const std::vector<std::string>& names,
 }
 
 struct PpPpoBatch {
-  std::vector<torch::Tensor> token_ids;
-  std::vector<torch::Tensor> advantages;
-  std::vector<torch::Tensor> response_masks;
-  std::vector<torch::Tensor> old_log_probs;
-  std::vector<torch::Tensor> ref_log_probs;
+  torch::Tensor token_ids;
+  torch::Tensor advantages;
+  torch::Tensor response_masks;
+  torch::Tensor old_log_probs;
+  torch::Tensor ref_log_probs;
   int64_t rows = 0;
   double mean_reward = 0.0;
   double success_rate = 0.0;
   double adv_abs_sum = 0.0;
 };
+
+torch::Tensor rollout_row(const torch::Tensor& tensor, int64_t row, int64_t width) {
+  if (!tensor.defined()) {
+    return {};
+  }
+  return tensor.narrow(0, row, 1).view({1, width});
+}
 
 torch::ScalarType parse_dtype(const std::string& dtype) {
   if (dtype == "float32" || dtype == "fp32") {
@@ -1131,14 +1138,9 @@ PpPpoBatch load_rollout_ppo_batch(const std::string& path,
   out.success_rate =
       (rollout_batch.scalar_rewards >= reward_opts.correct_score - 1e-6).to(torch::kFloat32).mean().item<double>();
   out.adv_abs_sum = advantages.abs().sum().item<double>();
-  out.token_ids.reserve(static_cast<size_t>(out.rows));
-  out.advantages.reserve(static_cast<size_t>(out.rows));
-  out.response_masks.reserve(static_cast<size_t>(out.rows));
-  for (int64_t i = 0; i < out.rows; ++i) {
-    out.token_ids.push_back(torch::cat({prompt_ids.index({i}), response_ids.index({i})}, 0).view({1, prompt_len + response_len}));
-    out.advantages.push_back(advantages.index({i}).view({1, response_len}));
-    out.response_masks.push_back(response_mask.index({i}).view({1, response_len}));
-  }
+  out.token_ids = torch::cat({prompt_ids, response_ids}, 1).contiguous();
+  out.advantages = advantages.contiguous();
+  out.response_masks = response_mask.contiguous();
   return out;
 }
 
@@ -1252,22 +1254,11 @@ PpPpoBatch load_rollout_ipc_batch(const std::string& path,
   out.mean_reward = doc.value("mean_reward", 0.0);
   out.success_rate = doc.value("success_rate", 0.0);
   out.adv_abs_sum = advantages.abs().sum().item<double>();
-  out.token_ids.reserve(static_cast<size_t>(batch));
-  out.advantages.reserve(static_cast<size_t>(batch));
-  out.response_masks.reserve(static_cast<size_t>(batch));
-  out.old_log_probs.reserve(static_cast<size_t>(batch));
-  out.ref_log_probs.reserve(static_cast<size_t>(batch));
-  for (int64_t i = 0; i < batch; ++i) {
-    out.token_ids.push_back(torch::cat({prompt_ids.index({i}), response_ids.index({i})}, 0).view({1, prompt_len + response_len}));
-    out.advantages.push_back(advantages.index({i}).view({1, response_len}));
-    out.response_masks.push_back(response_mask.index({i}).view({1, response_len}));
-    if (old_log_probs.defined()) {
-      out.old_log_probs.push_back(old_log_probs.index({i}).view({1, response_len}));
-    }
-    if (ref_log_probs.defined()) {
-      out.ref_log_probs.push_back(ref_log_probs.index({i}).view({1, response_len}));
-    }
-  }
+  out.token_ids = torch::cat({prompt_ids, response_ids}, 1).contiguous();
+  out.advantages = advantages.contiguous();
+  out.response_masks = response_mask.contiguous();
+  out.old_log_probs = old_log_probs.defined() ? old_log_probs.contiguous() : torch::Tensor();
+  out.ref_log_probs = ref_log_probs.defined() ? ref_log_probs.contiguous() : torch::Tensor();
   return out;
 #endif
 }
@@ -1293,28 +1284,15 @@ PpPpoBatch convert_gpu_rollout_batch(const cverl::rollout::GpuRolloutBatch& gpu_
     out.mean_reward = rewards.mean().item<double>();
     out.success_rate = (rewards >= 1.0 - 1e-6).to(torch::kFloat32).mean().item<double>();
   }
-  out.token_ids.reserve(static_cast<size_t>(batch));
-  out.advantages.reserve(static_cast<size_t>(batch));
-  out.response_masks.reserve(static_cast<size_t>(batch));
-  out.old_log_probs.reserve(static_cast<size_t>(batch));
-  out.ref_log_probs.reserve(static_cast<size_t>(batch));
   auto response_mask = gpu_batch.response_mask.to(torch::kFloat32);
   auto advantages = gpu_batch.advantages.to(torch::kFloat32);
   torch::Tensor old_log_probs = gpu_batch.old_log_probs.defined() ? gpu_batch.old_log_probs.to(torch::kFloat32) : torch::Tensor();
   torch::Tensor ref_log_probs = gpu_batch.ref_log_probs.defined() ? gpu_batch.ref_log_probs.to(torch::kFloat32) : torch::Tensor();
-  for (int64_t i = 0; i < batch; ++i) {
-    out.token_ids.push_back(torch::cat({gpu_batch.prompt_ids.index({i}), gpu_batch.response_ids.index({i})}, 0)
-                                .view({1, prompt_len + response_len})
-                                .contiguous());
-    out.advantages.push_back(advantages.index({i}).view({1, response_len}).contiguous());
-    out.response_masks.push_back(response_mask.index({i}).view({1, response_len}).contiguous());
-    if (old_log_probs.defined()) {
-      out.old_log_probs.push_back(old_log_probs.index({i}).view({1, response_len}).contiguous());
-    }
-    if (ref_log_probs.defined()) {
-      out.ref_log_probs.push_back(ref_log_probs.index({i}).view({1, response_len}).contiguous());
-    }
-  }
+  out.token_ids = torch::cat({gpu_batch.prompt_ids, gpu_batch.response_ids}, 1).contiguous();
+  out.advantages = advantages.contiguous();
+  out.response_masks = response_mask.contiguous();
+  out.old_log_probs = old_log_probs.defined() ? old_log_probs.contiguous() : torch::Tensor();
+  out.ref_log_probs = ref_log_probs.defined() ? ref_log_probs.contiguous() : torch::Tensor();
   return out;
 }
 
@@ -1378,7 +1356,7 @@ torch::Tensor make_token_ids(int64_t seq_len,
                              torch::Device device) {
   if (rollout_batch != nullptr && rollout_batch->rows > 0) {
     const int64_t idx = micro_batch % rollout_batch->rows;
-    return rollout_batch->token_ids[static_cast<size_t>(idx)];
+    return rollout_row(rollout_batch->token_ids, idx, seq_len);
   }
   if (!jsonl_batches.empty()) {
     const int64_t idx = (step * 1024 + micro_batch) % static_cast<int64_t>(jsonl_batches.size());
@@ -1705,10 +1683,10 @@ int main(int argc, char** argv) {
             torch::Tensor response_mask;
             if (active_rollout != nullptr) {
               const int64_t idx = action.micro_batch % active_rollout->rows;
-              advantages = active_rollout->advantages[static_cast<size_t>(idx)];
-              response_mask = active_rollout->response_masks[static_cast<size_t>(idx)];
-              if (!active_rollout->old_log_probs.empty()) {
-                old_log_probs = active_rollout->old_log_probs[static_cast<size_t>(idx)];
+              advantages = rollout_row(active_rollout->advantages, idx, response_len);
+              response_mask = rollout_row(active_rollout->response_masks, idx, response_len);
+              if (active_rollout->old_log_probs.defined()) {
+                old_log_probs = rollout_row(active_rollout->old_log_probs, idx, response_len);
               }
             } else {
               advantages = torch::ones_like(log_probs) * advantage_scale;
@@ -1727,11 +1705,11 @@ int main(int argc, char** argv) {
             torch::Tensor total_loss = loss.pg_loss;
             torch::Tensor kl_loss = torch::zeros({}, total_loss.options());
             if (kl_coef > 0.0) {
-              if (active_rollout == nullptr || active_rollout->ref_log_probs.empty()) {
+              if (active_rollout == nullptr || !active_rollout->ref_log_probs.defined()) {
                 throw std::runtime_error("--kl-coef > 0 requires ref_log_probs in rollout batch");
               }
               const int64_t idx = action.micro_batch % active_rollout->rows;
-              auto ref_log_probs = active_rollout->ref_log_probs[static_cast<size_t>(idx)];
+              auto ref_log_probs = rollout_row(active_rollout->ref_log_probs, idx, response_len);
               auto kl_token = cverl::torch_backend::kl_penalty(log_probs, ref_log_probs, kl_penalty_mode);
               kl_loss = cverl::torch_backend::masked_mean(kl_token, response_mask);
               total_loss = total_loss + kl_coef * kl_loss;
