@@ -1397,6 +1397,7 @@ int main(int argc, char** argv) {
     const bool dp_flat_shard_optimizer =
         dp_shard_optimizer && arg_bool(argc, argv, "--dp-flat-shard-optimizer", true);
     const bool skip_optimizer_step = arg_bool(argc, argv, "--skip-optimizer-step", false);
+    const bool measure_param_delta = arg_bool(argc, argv, "--measure-param-delta", false);
     const bool vary_tokens_by_step = arg_bool(argc, argv, "--vary-tokens-by-step", false);
     const std::string jsonl_input = arg_str(argc, argv, "--jsonl-input", "");
     const std::string rollout_json = arg_str(argc, argv, "--rollout-json", "");
@@ -1589,9 +1590,9 @@ int main(int argc, char** argv) {
       if (!dp_flat_shard_optimizer) {
         optimizer.zero_grad();
       }
-      auto param_before = clone_params(params);
+      auto param_before = measure_param_delta ? clone_params(params) : std::vector<torch::Tensor>{};
       auto optimizer_param_before =
-          (!dp_shard_optimizer && use_master_weights)
+          (measure_param_delta && !dp_shard_optimizer && use_master_weights)
               ? cverl::torch_backend::clone_detached(optimizer.master_parameters())
               : std::vector<torch::Tensor>{};
       torch::Tensor flat_gradient_shard;
@@ -1807,7 +1808,7 @@ int main(int argc, char** argv) {
         }
       }
       const double local_param_delta =
-          skip_optimizer_step
+          (!measure_param_delta || skip_optimizer_step)
               ? 0.0
               : ((!dp_shard_optimizer && use_master_weights)
                      ? cverl::torch_backend::parameter_delta_sum(
@@ -1888,8 +1889,10 @@ int main(int argc, char** argv) {
           const double grad_value = gathered_metrics[i][0].item<double>();
           const double delta_value = gathered_metrics[i][1].item<double>();
           all_have_grad = all_have_grad && std::isfinite(grad_value) && grad_value > 0.0;
-          all_updated = all_updated && std::isfinite(delta_value) && delta_value > 0.0;
-          any_updated = any_updated || (std::isfinite(delta_value) && delta_value > 0.0);
+          if (measure_param_delta) {
+            all_updated = all_updated && std::isfinite(delta_value) && delta_value > 0.0;
+            any_updated = any_updated || (std::isfinite(delta_value) && delta_value > 0.0);
+          }
           total_grad_norm += grad_value;
           total_param_delta += delta_value;
           total_loss += gathered_metrics[i][2].item<double>();
@@ -1900,6 +1903,10 @@ int main(int argc, char** argv) {
             reported_global_grad_norm = gathered_metrics[i][6].item<double>();
             reported_grad_clip_scale = gathered_metrics[i][7].item<double>();
           }
+        }
+        if (!measure_param_delta) {
+          all_updated = !skip_optimizer_step;
+          any_updated = !skip_optimizer_step;
         }
         append_metrics_csv(metrics_csv,
                            step,
@@ -1938,6 +1945,7 @@ int main(int argc, char** argv) {
                   << " tp_grad_bucket_mb=" << tp_grad_bucket_mb
                   << " resumed_from_step=" << start_step
                   << " skip_optimizer_step=" << (skip_optimizer_step ? "true" : "false")
+                  << " measure_param_delta=" << (measure_param_delta ? "true" : "false")
                   << " vary_tokens_by_step=" << (vary_tokens_by_step ? "true" : "false")
                   << " jsonl_examples=" << jsonl_batches.size()
                   << " rollout_rows=" << (active_rollout != nullptr ? active_rollout->rows : 0)
