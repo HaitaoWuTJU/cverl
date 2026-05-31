@@ -94,6 +94,15 @@ void flush_grad_reduce_scatter_bucket(std::vector<GradBucketEntry>* bucket,
     }
     flat = torch::cat(flat_grads, 0).contiguous();
   }
+  if (data_group.size() == 1) {
+    meta.shard = flat.contiguous();
+    meta.original_numel = original_numel;
+    meta.padded_numel = original_numel;
+    out->push_back(std::move(meta));
+    bucket->clear();
+    return;
+  }
+
   const int64_t group_size = static_cast<int64_t>(data_group.size());
   const int64_t remainder = flat.numel() % group_size;
   const int64_t pad = remainder == 0 ? 0 : group_size - remainder;
@@ -182,6 +191,15 @@ void data_parallel_sync_gradients(const std::vector<torch::Tensor>& parameters,
   if (bucket_bytes <= 0) {
     throw std::invalid_argument("data_parallel_sync_gradients bucket_bytes must be positive");
   }
+  if (data_group.empty()) {
+    throw std::invalid_argument("data_parallel_sync_gradients requires non-empty data group");
+  }
+  if (data_group.size() == 1) {
+    if (data_group[0] != collectives.rank()) {
+      throw std::invalid_argument("data_parallel_sync_gradients collectives rank is not in data group");
+    }
+    return;
+  }
   std::vector<GradBucketEntry> bucket;
   bucket.reserve(parameters.size());
   int64_t current_bytes = 0;
@@ -223,6 +241,12 @@ std::vector<GradientReduceScatterBucket> data_parallel_reduce_scatter_gradients(
     int64_t bucket_bytes) {
   if (bucket_bytes <= 0) {
     throw std::invalid_argument("data_parallel_reduce_scatter_gradients bucket_bytes must be positive");
+  }
+  if (data_group.empty()) {
+    throw std::invalid_argument("data_parallel_reduce_scatter_gradients requires non-empty data group");
+  }
+  if (data_group.size() == 1 && data_group[0] != collectives.rank()) {
+    throw std::invalid_argument("data_parallel_reduce_scatter_gradients collectives rank is not in data group");
   }
   std::vector<GradientReduceScatterBucket> out;
   std::vector<GradBucketEntry> bucket;

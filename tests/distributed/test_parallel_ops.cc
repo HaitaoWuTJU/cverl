@@ -10,13 +10,15 @@ namespace {
 
 class CountingCollectives final : public cverl::distributed::Collectives {
  public:
+  explicit CountingCollectives(int64_t world_size = 1, int64_t rank = 0) : world_size_(world_size), rank_(rank) {}
+
   int64_t all_reduce_calls = 0;
   int64_t reduce_scatter_calls = 0;
   int64_t last_all_reduce_numel = 0;
   int64_t last_reduce_scatter_numel = 0;
 
-  int64_t rank() const override { return 0; }
-  int64_t world_size() const override { return 1; }
+  int64_t rank() const override { return rank_; }
+  int64_t world_size() const override { return world_size_; }
   void barrier() override {}
 
   torch::Tensor broadcast(const torch::Tensor& input,
@@ -52,7 +54,11 @@ class CountingCollectives final : public cverl::distributed::Collectives {
     require_group(group);
     ++reduce_scatter_calls;
     last_reduce_scatter_numel = input.numel();
-    return input.clone();
+    if (input.size(0) % world_size_ != 0) {
+      throw std::invalid_argument("CountingCollectives reduce_scatter expects an even first dimension");
+    }
+    const int64_t shard = input.size(0) / world_size_;
+    return input.narrow(0, rank_ * shard, shard).clone();
   }
 
   void send(const torch::Tensor& /*input*/, int64_t peer) override {
@@ -69,11 +75,19 @@ class CountingCollectives final : public cverl::distributed::Collectives {
   }
 
  private:
-  static void require_group(const std::vector<int64_t>& group) {
-    if (group.size() != 1 || group[0] != 0) {
-      throw std::invalid_argument("CountingCollectives only supports group {0}");
+  void require_group(const std::vector<int64_t>& group) const {
+    if (static_cast<int64_t>(group.size()) != world_size_) {
+      throw std::invalid_argument("CountingCollectives group size mismatch");
+    }
+    for (int64_t i = 0; i < world_size_; ++i) {
+      if (group[static_cast<size_t>(i)] != i) {
+        throw std::invalid_argument("CountingCollectives only supports ordered full-world groups");
+      }
     }
   }
+
+  int64_t world_size_ = 1;
+  int64_t rank_ = 0;
 };
 
 void require_allclose(const torch::Tensor& actual,
@@ -191,6 +205,16 @@ void test_dp_sync_single_process() {
   cverl::distributed::data_parallel_sync_gradients({p}, collectives, {0}, true);
   require_allclose(p.grad(), before, "single process dp sync");
 
+  CountingCollectives counting;
+  auto counted = torch::randn({2, 3}, torch::requires_grad());
+  (counted * counted).sum().backward();
+  auto counted_before = counted.grad().clone();
+  cverl::distributed::data_parallel_sync_gradients({counted}, counting, {0}, true);
+  if (counting.all_reduce_calls != 0) {
+    throw std::runtime_error("single-rank dp sync should skip all_reduce");
+  }
+  require_allclose(counted.grad(), counted_before, "single-rank dp sync grad unchanged");
+
   auto no_grad = torch::randn({2, 3});
   auto no_backward = torch::randn({2, 3}, torch::requires_grad());
   cverl::distributed::data_parallel_sync_gradients({no_grad, no_backward}, collectives, {0}, false);
@@ -200,7 +224,7 @@ void test_dp_sync_single_process() {
 }
 
 void test_dp_sync_bucketed() {
-  CountingCollectives collectives;
+  CountingCollectives collectives(2, 0);
   auto p0 = torch::randn({2, 3}, torch::requires_grad());
   auto p1 = torch::randn({4}, torch::requires_grad());
   auto p2 = torch::randn({5}, torch::requires_grad());
@@ -210,7 +234,7 @@ void test_dp_sync_bucketed() {
   auto g1 = p1.grad().clone();
   auto g2 = p2.grad().clone();
 
-  cverl::distributed::data_parallel_sync_gradients({p0, p1, p2}, collectives, {0}, true, 1024 * 1024);
+  cverl::distributed::data_parallel_sync_gradients({p0, p1, p2}, collectives, {0, 1}, true, 1024 * 1024);
   if (collectives.all_reduce_calls != 1) {
     throw std::runtime_error("bucketed dp sync should use one all_reduce for same dtype/device");
   }
@@ -222,7 +246,7 @@ void test_dp_sync_bucketed() {
   require_allclose(p2.grad(), g2, "bucketed dp sync p2");
 
   collectives.all_reduce_calls = 0;
-  cverl::distributed::data_parallel_sync_gradients({p0, p1, p2}, collectives, {0}, true, 16);
+  cverl::distributed::data_parallel_sync_gradients({p0, p1, p2}, collectives, {0, 1}, true, 16);
   if (collectives.all_reduce_calls <= 1) {
     throw std::runtime_error("small dp sync bucket should split all_reduce calls");
   }
@@ -244,11 +268,11 @@ void test_dp_reduce_scatter_bucketed_single_process() {
 
   auto buckets = cverl::distributed::data_parallel_reduce_scatter_gradients(
       {p0, p1, p2}, collectives, {0}, true, 1024 * 1024);
-  if (collectives.reduce_scatter_calls != 1 || buckets.size() != 1) {
-    throw std::runtime_error("reduce-scatter gradients should use one bucket for same dtype/device");
+  if (collectives.reduce_scatter_calls != 0 || buckets.size() != 1) {
+    throw std::runtime_error("single-rank reduce-scatter gradients should skip collectives");
   }
-  if (collectives.last_reduce_scatter_numel != p0.numel() + p1.numel() + p2.numel()) {
-    throw std::runtime_error("reduce-scatter gradient bucket numel mismatch");
+  if (collectives.last_reduce_scatter_numel != 0) {
+    throw std::runtime_error("reduce-scatter gradient bucket should keep default last numel");
   }
   require_allclose(buckets[0].shard, torch::cat({g0, g1, g2}, 0), "reduce-scatter flat shard");
   if (buckets[0].original_numel != g0.numel() + g1.numel() + g2.numel() ||
@@ -263,11 +287,11 @@ void test_dp_reduce_scatter_bucketed_single_process() {
   collectives.reduce_scatter_calls = 0;
   buckets = cverl::distributed::data_parallel_reduce_scatter_gradients(
       {p0, p1, p2}, collectives, {0}, true, 16);
-  if (collectives.reduce_scatter_calls <= 1 || buckets.size() <= 1) {
-    throw std::runtime_error("small reduce-scatter bucket should split calls");
+  if (collectives.reduce_scatter_calls != 0 || buckets.size() <= 1) {
+    throw std::runtime_error("single-rank small reduce-scatter bucket should split metadata without collectives");
   }
-  if (collectives.last_reduce_scatter_numel != p2.numel()) {
-    throw std::runtime_error("single-entry reduce-scatter bucket should reduce only that tensor");
+  if (collectives.last_reduce_scatter_numel != 0) {
+    throw std::runtime_error("single-rank reduce-scatter should keep default last numel");
   }
 }
 

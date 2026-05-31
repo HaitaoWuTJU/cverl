@@ -75,6 +75,8 @@ gathers one compact metric tensor per step. Do not call `Tensor::item()` inside
 the 1F1B micro-batch loop; it serializes the CUDA stream and destroys overlap.
 Gradient buckets avoid `torch::cat` for single-tensor flushes; preserve this
 fast path for small replicated TP parameters and bucket-boundary tail tensors.
+Single-rank DP gradient sync and reduce-scatter return local gradients without
+issuing collectives; this matters for PP/TP-only bring-up runs.
 Qwen TP replicated parameters are classified once at trainer startup; the
 per-step gradient sync should only walk the precomputed tensor list.
 Pipeline activation slot vectors are allocated once before the step loop and
