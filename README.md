@@ -323,8 +323,8 @@ Implemented pieces:
 - decoder layer residual structure
 - Qwen3.5 RMSNorm weight convention
 - linear attention via LibTorch depthwise `conv1d` and recurrent gated delta rule
-- CUDA linear attention for `kd=128, vd=128`; default backward recomputes
-  recurrent states instead of saving `[batch, heads, seq, kd, vd]`
+- CUDA linear attention for `kd=128, vd=128`; forward is tiled over the value
+  dimension and backward can recompute or use recurrent-state checkpoints
 - full attention with grouped KV heads, causal masking, RoPE, q/k norm, and output gate
 - SwiGLU MLP
 - final norm
@@ -341,6 +341,9 @@ CUDA linear attention controls:
 
 ```sh
 CVERL_LINEAR_ATTN_BACKEND=cuda      # cuda|auto|chunked|eager
+CVERL_LINEAR_ATTN_VALUE_TILE=32     # forward tile over vd; lower values reduce shared memory
+CVERL_LINEAR_ATTN_STATE_MODE=chunk  # none|recompute|full|chunk|checkpoint
+CVERL_LINEAR_ATTN_CHECKPOINT_INTERVAL=16
 CVERL_LINEAR_ATTN_SAVE_STATES=0     # default: recompute backward to reduce activation memory
 CVERL_LINEAR_ATTN_SAVE_STATES=1     # debug/comparison: save every recurrent state
 ```

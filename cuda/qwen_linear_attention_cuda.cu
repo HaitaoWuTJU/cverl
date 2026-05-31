@@ -2,7 +2,10 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
+#include <string>
 
 namespace cverl {
 namespace {
@@ -17,6 +20,15 @@ void require_f32_cuda_contiguous(const torch::Tensor& t, const char* name) {
   if (!t.defined() || !t.is_cuda() || !t.is_contiguous() || t.scalar_type() != torch::kFloat32) {
     throw std::invalid_argument(std::string(name) + " must be contiguous CUDA float32");
   }
+}
+
+int value_tile_size(int value_dim) {
+  const char* env = std::getenv("CVERL_LINEAR_ATTN_VALUE_TILE");
+  int tile = (env == nullptr || *env == '\0') ? 32 : std::stoi(env);
+  if (tile <= 0) {
+    throw std::invalid_argument("CVERL_LINEAR_ATTN_VALUE_TILE must be positive");
+  }
+  return std::min(tile, value_dim);
 }
 
 __global__ void qwen_linear_attn_forward_kernel(const float* __restrict__ q,
@@ -75,6 +87,79 @@ __global__ void qwen_linear_attn_forward_kernel(const float* __restrict__ q,
     if (save_states) {
       for (int idx = threadIdx.x; idx < state_elems; idx += blockDim.x) {
         states[state_base + t * state_elems + idx] = state[idx];
+      }
+    }
+    __syncthreads();
+  }
+}
+
+__global__ void qwen_linear_attn_forward_tiled_kernel(const float* __restrict__ q,
+                                                      const float* __restrict__ k,
+                                                      const float* __restrict__ v,
+                                                      const float* __restrict__ beta,
+                                                      const float* __restrict__ g,
+                                                      float* __restrict__ out,
+                                                      float* __restrict__ states,
+                                                      bool save_states,
+                                                      int B,
+                                                      int H,
+                                                      int T,
+                                                      int K,
+                                                      int V,
+                                                      int value_tile) {
+  int bh = blockIdx.x;
+  int b = bh / H;
+  int h = bh - b * H;
+  const int tile_begin = blockIdx.y * value_tile;
+  const int tile_cols = value_tile < (V - tile_begin) ? value_tile : (V - tile_begin);
+  if (tile_cols <= 0) {
+    return;
+  }
+
+  extern __shared__ float state[];
+  const int state_elems = K * tile_cols;
+  for (int idx = threadIdx.x; idx < state_elems; idx += blockDim.x) {
+    state[idx] = 0.0f;
+  }
+  __syncthreads();
+
+  const int q_base = (((b * H + h) * T) * K);
+  const int v_base = (((b * H + h) * T) * V);
+  const int scalar_base = ((b * H + h) * T);
+  const int state_base = ((((b * H + h) * T) * K) * V);
+  for (int t = 0; t < T; ++t) {
+    const float et = expf(g[scalar_base + t]);
+    for (int idx = threadIdx.x; idx < state_elems; idx += blockDim.x) {
+      state[idx] *= et;
+    }
+    __syncthreads();
+
+    for (int local_j = threadIdx.x; local_j < tile_cols; local_j += blockDim.x) {
+      const int j = tile_begin + local_j;
+      float kv = 0.0f;
+      for (int kk = 0; kk < K; ++kk) {
+        kv += state[kk * tile_cols + local_j] * k[q_base + t * K + kk];
+      }
+      float delta = (v[v_base + t * V + j] - kv) * beta[scalar_base + t];
+      for (int kk = 0; kk < K; ++kk) {
+        state[kk * tile_cols + local_j] += k[q_base + t * K + kk] * delta;
+      }
+    }
+    __syncthreads();
+
+    for (int local_j = threadIdx.x; local_j < tile_cols; local_j += blockDim.x) {
+      const int j = tile_begin + local_j;
+      float o = 0.0f;
+      for (int kk = 0; kk < K; ++kk) {
+        o += state[kk * tile_cols + local_j] * q[q_base + t * K + kk];
+      }
+      out[v_base + t * V + j] = o;
+    }
+    if (save_states) {
+      for (int idx = threadIdx.x; idx < state_elems; idx += blockDim.x) {
+        const int kk = idx / tile_cols;
+        const int local_j = idx - kk * tile_cols;
+        states[state_base + t * K * V + kk * V + tile_begin + local_j] = state[idx];
       }
     }
     __syncthreads();
@@ -140,6 +225,83 @@ __global__ void qwen_linear_attn_forward_checkpointed_kernel(const float* __rest
       float o = 0.0f;
       for (int kk = 0; kk < K; ++kk) {
         o += state[kk * V + j] * q[q_base + t * K + kk];
+      }
+      out[v_base + t * V + j] = o;
+    }
+    __syncthreads();
+  }
+}
+
+__global__ void qwen_linear_attn_forward_checkpointed_tiled_kernel(const float* __restrict__ q,
+                                                                   const float* __restrict__ k,
+                                                                   const float* __restrict__ v,
+                                                                   const float* __restrict__ beta,
+                                                                   const float* __restrict__ g,
+                                                                   float* __restrict__ out,
+                                                                   float* __restrict__ checkpoints,
+                                                                   int checkpoint_interval,
+                                                                   int B,
+                                                                   int H,
+                                                                   int T,
+                                                                   int K,
+                                                                   int V,
+                                                                   int C,
+                                                                   int value_tile) {
+  int bh = blockIdx.x;
+  int b = bh / H;
+  int h = bh - b * H;
+  const int tile_begin = blockIdx.y * value_tile;
+  const int tile_cols = value_tile < (V - tile_begin) ? value_tile : (V - tile_begin);
+  if (tile_cols <= 0) {
+    return;
+  }
+
+  extern __shared__ float state[];
+  const int state_elems = K * tile_cols;
+  for (int idx = threadIdx.x; idx < state_elems; idx += blockDim.x) {
+    state[idx] = 0.0f;
+  }
+  __syncthreads();
+
+  const int q_base = (((b * H + h) * T) * K);
+  const int v_base = (((b * H + h) * T) * V);
+  const int scalar_base = ((b * H + h) * T);
+  const int checkpoint_base = (((b * H + h) * C) * K) * V;
+  for (int t = 0; t < T; ++t) {
+    if (t % checkpoint_interval == 0) {
+      const int c = t / checkpoint_interval;
+      for (int idx = threadIdx.x; idx < state_elems; idx += blockDim.x) {
+        const int kk = idx / tile_cols;
+        const int local_j = idx - kk * tile_cols;
+        checkpoints[checkpoint_base + c * K * V + kk * V + tile_begin + local_j] = state[idx];
+      }
+      __syncthreads();
+    }
+
+    const float et = expf(g[scalar_base + t]);
+    for (int idx = threadIdx.x; idx < state_elems; idx += blockDim.x) {
+      state[idx] *= et;
+    }
+    __syncthreads();
+
+    for (int local_j = threadIdx.x; local_j < tile_cols; local_j += blockDim.x) {
+      const int j = tile_begin + local_j;
+      float kv = 0.0f;
+      for (int kk = 0; kk < K; ++kk) {
+        kv += state[kk * tile_cols + local_j] * k[q_base + t * K + kk];
+      }
+      float delta = (v[v_base + t * V + j] - kv) * beta[scalar_base + t];
+      for (int kk = 0; kk < K; ++kk) {
+        state[kk * tile_cols + local_j] += k[q_base + t * K + kk] * delta;
+      }
+    }
+    __syncthreads();
+
+    for (int local_j = threadIdx.x; local_j < tile_cols; local_j += blockDim.x) {
+      const int j = tile_begin + local_j;
+      float o = 0.0f;
+      for (int kk = 0; kk < K; ++kk) {
+        o += state[kk * tile_cols + local_j] * q[q_base + t * K + kk];
       }
       out[v_base + t * V + j] = o;
     }
@@ -585,20 +747,22 @@ std::tuple<torch::Tensor, torch::Tensor> qwen_linear_attention_cuda_forward(
   auto out = torch::empty({B, H, T, V}, query.options());
   auto states = save_states ? torch::empty({B, H, T, K, V}, query.options())
                             : torch::empty({0}, query.options());
-  size_t shared = static_cast<size_t>(K) * static_cast<size_t>(V) * sizeof(float);
+  const int value_tile = value_tile_size(V);
+  const int value_tiles = (V + value_tile - 1) / value_tile;
+  size_t shared = static_cast<size_t>(K) * static_cast<size_t>(value_tile) * sizeof(float);
   if (shared > 96 * 1024) {
-    throw std::runtime_error("Qwen linear attention CUDA kernel shared memory limit exceeded");
+    throw std::runtime_error("Qwen linear attention CUDA tiled forward shared memory limit exceeded");
   }
-  check_cuda(cudaFuncSetAttribute(qwen_linear_attn_forward_kernel,
+  check_cuda(cudaFuncSetAttribute(qwen_linear_attn_forward_tiled_kernel,
                                   cudaFuncAttributeMaxDynamicSharedMemorySize,
                                   static_cast<int>(shared)),
-             "cudaFuncSetAttribute forward");
-  qwen_linear_attn_forward_kernel<<<B * H, 256, shared>>>(
+             "cudaFuncSetAttribute tiled forward");
+  qwen_linear_attn_forward_tiled_kernel<<<dim3(B * H, value_tiles), 256, shared>>>(
       query.data_ptr<float>(), key.data_ptr<float>(), value.data_ptr<float>(),
       beta.data_ptr<float>(), g.data_ptr<float>(), out.data_ptr<float>(),
       save_states ? states.data_ptr<float>() : nullptr, save_states,
-      B, H, T, K, V);
-  check_cuda(cudaGetLastError(), "qwen_linear_attn_forward_kernel");
+      B, H, T, K, V, value_tile);
+  check_cuda(cudaGetLastError(), "qwen_linear_attn_forward_tiled_kernel");
   return {out, states};
 }
 
@@ -626,19 +790,21 @@ std::tuple<torch::Tensor, torch::Tensor> qwen_linear_attention_cuda_forward_chec
   int C = (T + interval - 1) / interval;
   auto out = torch::empty({B, H, T, V}, query.options());
   auto checkpoints = torch::empty({B, H, C, K, V}, query.options());
-  size_t shared = static_cast<size_t>(K) * static_cast<size_t>(V) * sizeof(float);
+  const int value_tile = value_tile_size(V);
+  const int value_tiles = (V + value_tile - 1) / value_tile;
+  size_t shared = static_cast<size_t>(K) * static_cast<size_t>(value_tile) * sizeof(float);
   if (shared > 96 * 1024) {
-    throw std::runtime_error("Qwen linear attention CUDA checkpointed forward shared memory limit exceeded");
+    throw std::runtime_error("Qwen linear attention CUDA tiled checkpointed forward shared memory limit exceeded");
   }
-  check_cuda(cudaFuncSetAttribute(qwen_linear_attn_forward_checkpointed_kernel,
+  check_cuda(cudaFuncSetAttribute(qwen_linear_attn_forward_checkpointed_tiled_kernel,
                                   cudaFuncAttributeMaxDynamicSharedMemorySize,
                                   static_cast<int>(shared)),
-             "cudaFuncSetAttribute checkpointed forward");
-  qwen_linear_attn_forward_checkpointed_kernel<<<B * H, 256, shared>>>(
+             "cudaFuncSetAttribute tiled checkpointed forward");
+  qwen_linear_attn_forward_checkpointed_tiled_kernel<<<dim3(B * H, value_tiles), 256, shared>>>(
       query.data_ptr<float>(), key.data_ptr<float>(), value.data_ptr<float>(),
       beta.data_ptr<float>(), g.data_ptr<float>(), out.data_ptr<float>(),
-      checkpoints.data_ptr<float>(), interval, B, H, T, K, V, C);
-  check_cuda(cudaGetLastError(), "qwen_linear_attn_forward_checkpointed_kernel");
+      checkpoints.data_ptr<float>(), interval, B, H, T, K, V, C, value_tile);
+  check_cuda(cudaGetLastError(), "qwen_linear_attn_forward_checkpointed_tiled_kernel");
   return {out, checkpoints};
 }
 
