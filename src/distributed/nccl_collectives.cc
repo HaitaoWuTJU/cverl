@@ -322,4 +322,36 @@ torch::Tensor NcclCollectives::recv_like(const torch::Tensor& like, int64_t peer
   return out;
 }
 
+torch::Tensor NcclCollectives::send_recv(const torch::Tensor& input,
+                                         int64_t send_peer,
+                                         const torch::Tensor& like,
+                                         int64_t recv_peer) {
+  require_cuda_contiguous(input, "send_recv input");
+  require_cuda_contiguous(like, "send_recv like tensor");
+  if (send_peer < 0 || send_peer >= world_size_ || recv_peer < 0 || recv_peer >= world_size_) {
+    throw std::invalid_argument("send_recv peer out of range");
+  }
+  auto out = torch::empty_like(like);
+  wait_current_stream_before_nccl(stream_, device_index_);
+  check_nccl(ncclGroupStart(), "ncclGroupStart send_recv");
+  auto send_status = ncclSend(input.data_ptr(),
+                              input.numel(),
+                              nccl_dtype(input.scalar_type()),
+                              static_cast<int>(send_peer),
+                              comm_,
+                              stream_);
+  auto recv_status = ncclRecv(out.data_ptr(),
+                              out.numel(),
+                              nccl_dtype(out.scalar_type()),
+                              static_cast<int>(recv_peer),
+                              comm_,
+                              stream_);
+  auto group_status = ncclGroupEnd();
+  check_nccl(send_status, "ncclSend send_recv");
+  check_nccl(recv_status, "ncclRecv send_recv");
+  check_nccl(group_status, "ncclGroupEnd send_recv");
+  finish_nccl_op({input, out});
+  return out;
+}
+
 }  // namespace cverl::distributed

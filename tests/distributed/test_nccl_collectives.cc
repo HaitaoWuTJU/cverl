@@ -127,6 +127,19 @@ int main(int argc, char** argv) {
     require_throws([&]() { (void)comm.all_gather(gathered.contiguous(), group, 1); },
                    "NCCL all_gather should reject dim != 0");
 
+    if (world >= 2) {
+      const int64_t send_peer = (rank + 1) % world;
+      const int64_t recv_peer = (rank + world - 1) % world;
+      auto ring_payload = torch::full({2, 3},
+                                      static_cast<float>(rank),
+                                      torch::TensorOptions().device(torch::kCUDA, static_cast<int>(device)).dtype(torch::kFloat32));
+      auto ring_received = comm.send_recv(ring_payload.contiguous(), send_peer, ring_payload.contiguous(), recv_peer);
+      auto expected_ring = torch::full({2, 3},
+                                       static_cast<float>(recv_peer),
+                                       torch::TensorOptions().device(torch::kCUDA, static_cast<int>(device)).dtype(torch::kFloat32));
+      require_allclose(ring_received, expected_ring, "NCCL ring send_recv mismatch");
+    }
+
     {
       torch::manual_seed(321);
       constexpr int64_t batch = 1;

@@ -225,8 +225,9 @@ Current code exposes the distributed shape directly:
   row sum, and value accumulator instead of materializing the full `[Q,K]`
   score/probability matrix. Qwen CP full attention consumes blocks in the
   same order as the CP ring schedule; the current implementation still obtains
-  those blocks from autograd all-gather, and the next NCCL ring path should
-  replace that source with send/recv while preserving the streaming math.
+  those blocks from autograd all-gather. The NCCL backend now exposes grouped
+  `send_recv`, so the next CP attention step can replace the block source with
+  deadlock-free ring exchange while preserving the streaming math.
   The NCCL smoke test runs this path on GPU ranks. The current differentiable
   gather uses all-gather in forward and reduce-scatter in backward, so local
   K/V owners receive gradients. Full industrial CP training still needs a

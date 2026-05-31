@@ -26,6 +26,7 @@ class Collectives {
   virtual torch::Tensor reduce_scatter(const torch::Tensor& input, ReduceOp op, const std::vector<int64_t>& group, int64_t dim) = 0;
   virtual void send(const torch::Tensor& input, int64_t peer) = 0;
   virtual torch::Tensor recv_like(const torch::Tensor& like, int64_t peer) = 0;
+  virtual torch::Tensor send_recv(const torch::Tensor& input, int64_t send_peer, const torch::Tensor& recv_like, int64_t recv_peer);
 };
 
 class SingleProcessCollectives final : public Collectives {
@@ -39,6 +40,7 @@ class SingleProcessCollectives final : public Collectives {
   torch::Tensor reduce_scatter(const torch::Tensor& input, ReduceOp op, const std::vector<int64_t>& group, int64_t dim) override;
   void send(const torch::Tensor& input, int64_t peer) override;
   torch::Tensor recv_like(const torch::Tensor& like, int64_t peer) override;
+  torch::Tensor send_recv(const torch::Tensor& input, int64_t send_peer, const torch::Tensor& recv_like, int64_t recv_peer) override;
 };
 
 }  // namespace cverl::distributed
