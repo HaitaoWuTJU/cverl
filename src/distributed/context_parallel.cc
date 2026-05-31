@@ -700,11 +700,7 @@ torch::Tensor context_parallel_causal_attention_ring_exchange_kv(const torch::Te
   key_begin_positions.reserve(schedule.size());
   for (size_t i = 0; i < schedule.size(); ++i) {
     const int64_t rank_index = context_parallel_group_index(context_group, schedule[i].kv_rank);
-    const int64_t begin = rank_index * shard;
-    if (begin >= original_sequence_length) {
-      continue;
-    }
-    key_begin_positions.push_back(begin);
+    key_begin_positions.push_back(rank_index * shard);
   }
   return context_parallel_causal_attention_ring_blocks_recompute(
       query_local, key_ring, value_ring, key_begin_positions, context_rank * shard, original_sequence_length, shard, scale);

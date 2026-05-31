@@ -581,6 +581,15 @@ void test_context_parallel_causal_attention() {
   require(torch::allclose(padded.narrow(2, 0, 2), dense5, 1.0e-5, 1.0e-5),
           "CP padded tail valid queries match dense attention");
   require(padded.narrow(2, 2, 1).abs().sum().item<float>() == 0.0f, "CP padded tail query output is zero");
+  PrecomputedAllGatherCollectives padded_ring_collectives(
+      {},
+      {k0.detach().transpose(0, 2).contiguous(), v0.detach().transpose(0, 2).contiguous()});
+  auto padded_ring = cverl::distributed::context_parallel_causal_attention_ring_exchange_kv(
+      q1, k1, v1, padded_ring_collectives, {0, 1}, 1, 5, scale);
+  require(torch::allclose(padded_ring.narrow(2, 0, 2), dense5, 1.0e-5, 1.0e-5),
+          "CP ring-exchange padded tail valid queries match dense attention");
+  require(padded_ring.narrow(2, 2, 1).abs().sum().item<float>() == 0.0f,
+          "CP ring-exchange padded tail query output is zero");
 
   require_throws([&]() { (void)cverl::distributed::context_parallel_causal_attention(local_q, k, v, 4, scale); },
                  "CP causal attention rejects out-of-range query shard");

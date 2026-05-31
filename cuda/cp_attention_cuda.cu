@@ -1,5 +1,6 @@
 #include "cverl/distributed/cp_attention_cuda.h"
 
+#include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
 
 #include <limits>
@@ -38,15 +39,20 @@ void validate_shapes(const torch::Tensor& query_local,
   const int64_t H = query_local.size(1);
   const int64_t D = query_local.size(3);
   const int64_t Tk = key_ring.size(2);
+  if (key_ring.device() != query_local.device() || value_ring.device() != query_local.device()) {
+    throw std::invalid_argument("CP attention CUDA tensors must be on the same CUDA device");
+  }
   if (key_ring.size(0) != B || value_ring.size(0) != B || key_ring.size(1) != H || value_ring.size(1) != H ||
       value_ring.size(2) != Tk || key_ring.size(3) != D ||
-      Tk < shard_size * static_cast<int64_t>(key_begin_positions.size())) {
+      Tk != shard_size * static_cast<int64_t>(key_begin_positions.size())) {
     throw std::invalid_argument("CP attention CUDA shape mismatch");
   }
 }
 
 torch::Tensor positions_tensor(const std::vector<int64_t>& key_begin_positions, torch::Device device) {
-  return torch::tensor(key_begin_positions, torch::TensorOptions().dtype(torch::kLong)).to(device).contiguous();
+  return torch::tensor(key_begin_positions, torch::TensorOptions().dtype(torch::kLong))
+      .to(torch::TensorOptions().dtype(torch::kLong).device(device))
+      .contiguous();
 }
 
 __global__ void cp_ring_attention_forward_kernel(const float* __restrict__ q,
@@ -424,7 +430,8 @@ torch::Tensor cp_ring_attention_cuda_forward(const torch::Tensor& query_local,
 
   constexpr int threads = 128;
   const int rows = static_cast<int>(B * H * Tq);
-  cp_ring_attention_forward_kernel<<<rows, threads>>>(
+  auto stream = at::cuda::getCurrentCUDAStream(query_local.get_device()).stream();
+  cp_ring_attention_forward_kernel<<<rows, threads, 0, stream>>>(
       query_local.data_ptr<float>(),
       key_ring.data_ptr<float>(),
       value_ring.data_ptr<float>(),
@@ -476,7 +483,8 @@ std::vector<torch::Tensor> cp_ring_attention_cuda_backward(const torch::Tensor& 
 
   constexpr int threads = 128;
   const int q_rows = static_cast<int>(B * H * Tq);
-  cp_ring_attention_backward_q_kernel<<<q_rows, threads>>>(
+  auto stream = at::cuda::getCurrentCUDAStream(query_local.get_device()).stream();
+  cp_ring_attention_backward_q_kernel<<<q_rows, threads, 0, stream>>>(
       grad_out.data_ptr<float>(),
       query_local.data_ptr<float>(),
       key_ring.data_ptr<float>(),
@@ -497,7 +505,7 @@ std::vector<torch::Tensor> cp_ring_attention_cuda_backward(const torch::Tensor& 
   check_cuda(cudaGetLastError(), "cp_ring_attention_backward_q_kernel");
 
   const int kv_rows = static_cast<int>(B * H * Tk);
-  cp_ring_attention_backward_kv_kernel<<<kv_rows, threads>>>(
+  cp_ring_attention_backward_kv_kernel<<<kv_rows, threads, 0, stream>>>(
       grad_out.data_ptr<float>(),
       query_local.data_ptr<float>(),
       key_ring.data_ptr<float>(),
