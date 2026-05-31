@@ -546,6 +546,49 @@ void test_context_parallel_causal_attention() {
                  "CP causal attention rejects out-of-range query shard");
 }
 
+void test_context_parallel_ring_exchange_owner_gradient_cp3() {
+  torch::manual_seed(17);
+  auto local = torch::arange(100.0, 112.0, torch::kFloat32).reshape({2, 2, 3}).set_requires_grad(true);
+  auto owner0 = torch::arange(0.0, 12.0, torch::kFloat32).reshape({2, 2, 3});
+  auto owner2 = torch::arange(200.0, 212.0, torch::kFloat32).reshape({2, 2, 3});
+
+  auto moved_owner0 = owner0.transpose(0, 1).contiguous();
+  auto moved_owner2 = owner2.transpose(0, 1).contiguous();
+  auto remote_owner1_from_rank0 = torch::full_like(local.transpose(0, 1).contiguous(), 3.0);
+  auto remote_owner1_from_rank2 = torch::full_like(local.transpose(0, 1).contiguous(), 5.0);
+  auto zeros = torch::zeros_like(local.transpose(0, 1).contiguous());
+
+  PrecomputedAllGatherCollectives collectives(
+      {},
+      {
+          moved_owner0,
+          moved_owner2,
+          zeros,
+          zeros,
+          remote_owner1_from_rank0,
+          remote_owner1_from_rank2,
+          zeros,
+          zeros,
+      },
+      3);
+
+  auto exchanged =
+      cverl::distributed::context_parallel_ring_exchange_autograd(local, collectives, {0, 1, 2}, 1, 1);
+  auto expected = torch::cat({local.detach(), owner0, owner2}, 1);
+  require(torch::allclose(exchanged, expected, 1.0e-5, 1.0e-5),
+          "CP3 ring exchange schedule-order forward on nonzero sequence dim");
+
+  auto grad_owner0 = torch::full_like(owner0, 11.0);
+  auto grad_owner1 = torch::full_like(local, 7.0);
+  auto grad_owner2 = torch::full_like(owner2, 13.0);
+  torch::autograd::backward({exchanged}, {torch::cat({grad_owner1, grad_owner0, grad_owner2}, 1)});
+
+  auto expected_local_grad =
+      grad_owner1 + remote_owner1_from_rank0.transpose(0, 1) + remote_owner1_from_rank2.transpose(0, 1);
+  require(local.grad().defined() && torch::allclose(local.grad(), expected_local_grad, 1.0e-5, 1.0e-5),
+          "CP3 ring exchange backward accumulates remote owner gradients");
+}
+
 void test_dtype_names() {
   require(cverl::distributed::dtype_policy_name(cverl::distributed::DTypePolicy::Float32) == "float32", "float32 name");
   require(cverl::distributed::dtype_policy_name(cverl::distributed::DTypePolicy::Float16) == "float16", "float16 name");
@@ -568,6 +611,7 @@ int main() {
     test_context_parallel_padded_slice_and_gather();
     test_context_parallel_ring_schedule();
     test_context_parallel_causal_attention();
+    test_context_parallel_ring_exchange_owner_gradient_cp3();
     test_dtype_names();
   } catch (const std::exception& e) {
     std::cerr << "test_topology failed: " << e.what() << "\n";

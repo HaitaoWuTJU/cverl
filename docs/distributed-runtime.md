@@ -251,3 +251,12 @@ Run the CP/NCCL smoke on a multi-GPU node with:
 ```sh
 WORLD_SIZE=4 CUDA_VISIBLE_DEVICES=0,1,2,3 examples/run_cp_attention_nccl_smoke.sh
 ```
+
+CPU regression coverage includes:
+
+- `test_distributed_topology`: CP topology, padded sequence sharding,
+  streaming causal attention math, CP=3 ring exchange owner-gradient
+  accumulation, and gather/ring-exchange KV gradient checks.
+- `test_qwen3_5_cp_forward`: synthetic Qwen3.5 full-attention layer with
+  deterministic weights, validating that CP rank-local forward shards match
+  the corresponding dense forward slices.

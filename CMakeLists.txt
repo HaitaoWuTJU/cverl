@@ -381,6 +381,11 @@ if (CVERL_BUILD_TESTS)
   target_compile_options(test_qwen3_5_param_dtype PRIVATE ${TORCH_CXX_FLAGS})
   cverl_register_test(test_qwen3_5_param_dtype)
 
+  add_executable(test_qwen3_5_cp_forward tests/model/test_qwen3_5_cp_forward.cc)
+  target_link_libraries(test_qwen3_5_cp_forward PRIVATE cverl)
+  target_compile_options(test_qwen3_5_cp_forward PRIVATE ${TORCH_CXX_FLAGS})
+  cverl_register_test(test_qwen3_5_cp_forward)
+
   add_executable(test_distributed_topology tests/distributed/test_topology.cc)
   target_link_libraries(test_distributed_topology PRIVATE cverl)
   target_compile_options(test_distributed_topology PRIVATE ${TORCH_CXX_FLAGS})
