@@ -598,6 +598,8 @@ void save_rank_checkpoint(const std::string& checkpoint_dir,
                           int64_t dp_rank,
                           int64_t pp_rank,
                           int64_t pp_size,
+                          int64_t cp_rank,
+                          int64_t cp_size,
                           int64_t tp_rank,
                           int64_t tp_size,
                           int64_t layer_begin,
@@ -649,6 +651,7 @@ void save_rank_checkpoint(const std::string& checkpoint_dir,
   rank_meta["global_rank"] = global_rank;
   rank_meta["data_rank"] = dp_rank;
   rank_meta["pipeline_rank"] = pp_rank;
+  rank_meta["context_rank"] = cp_rank;
   rank_meta["tensor_rank"] = tp_rank;
   rank_meta["layer_begin"] = layer_begin;
   rank_meta["layer_end"] = layer_end;
@@ -673,6 +676,7 @@ void save_rank_checkpoint(const std::string& checkpoint_dir,
     rank_meta["parameters"].push_back(std::move(item));
   }
   write_json_atomic(step_dir / rank_meta_file, rank_meta);
+  (void)cp_size;
 }
 
 void save_rank_flat_checkpoint(const std::string& checkpoint_dir,
@@ -682,6 +686,8 @@ void save_rank_flat_checkpoint(const std::string& checkpoint_dir,
                                int64_t dp_rank,
                                int64_t pp_rank,
                                int64_t pp_size,
+                               int64_t cp_rank,
+                               int64_t cp_size,
                                int64_t tp_rank,
                                int64_t tp_size,
                                int64_t layer_begin,
@@ -728,6 +734,7 @@ void save_rank_flat_checkpoint(const std::string& checkpoint_dir,
   rank_meta["global_rank"] = global_rank;
   rank_meta["data_rank"] = dp_rank;
   rank_meta["pipeline_rank"] = pp_rank;
+  rank_meta["context_rank"] = cp_rank;
   rank_meta["tensor_rank"] = tp_rank;
   rank_meta["layer_begin"] = layer_begin;
   rank_meta["layer_end"] = layer_end;
@@ -760,6 +767,7 @@ void save_rank_flat_checkpoint(const std::string& checkpoint_dir,
   write_json_atomic(step_dir / rank_meta_file, rank_meta);
   (void)world_size;
   (void)pp_size;
+  (void)cp_size;
   (void)tp_size;
 }
 
@@ -768,6 +776,7 @@ void write_checkpoint_manifest(const std::string& checkpoint_dir,
                                int64_t world_size,
                                int64_t dp_size,
                                int64_t pp_size,
+                               int64_t cp_size,
                                int64_t tp_size,
                                const nlohmann::json& training_config,
                                const cverl::torch_backend::Fp32MasterAdamW& optimizer) {
@@ -783,6 +792,7 @@ void write_checkpoint_manifest(const std::string& checkpoint_dir,
   manifest["world_size"] = world_size;
   manifest["data_parallel"] = dp_size;
   manifest["pipeline_parallel"] = pp_size;
+  manifest["context_parallel"] = cp_size;
   manifest["tensor_parallel"] = tp_size;
   manifest["training_config"] = training_config;
   manifest["optimizer"] = {
@@ -797,8 +807,9 @@ void write_checkpoint_manifest(const std::string& checkpoint_dir,
   manifest["rank_files"] = nlohmann::json::array();
   for (int64_t rank = 0; rank < world_size; ++rank) {
     const int64_t tp = rank % tp_size;
-    const int64_t pp = (rank / tp_size) % pp_size;
-    const int64_t dp = rank / (pp_size * tp_size);
+    const int64_t cp = (rank / tp_size) % cp_size;
+    const int64_t pp = (rank / (tp_size * cp_size)) % pp_size;
+    const int64_t dp = rank / (pp_size * cp_size * tp_size);
     const std::string param_file = "rank_" + std::to_string(rank) + ".pt";
     const std::string metadata_file = "rank_" + std::to_string(rank) + ".json";
     if (!std::filesystem::exists(step_dir / param_file) ||
@@ -809,6 +820,7 @@ void write_checkpoint_manifest(const std::string& checkpoint_dir,
         {"global_rank", rank},
         {"data_rank", dp},
         {"pipeline_rank", pp},
+        {"context_rank", cp},
         {"tensor_rank", tp},
         {"param_file", param_file},
         {"metadata_file", metadata_file},
@@ -824,6 +836,7 @@ void write_flat_checkpoint_manifest(const std::string& checkpoint_dir,
                                     int64_t world_size,
                                     int64_t dp_size,
                                     int64_t pp_size,
+                                    int64_t cp_size,
                                     int64_t tp_size,
                                     const nlohmann::json& training_config,
                                     const cverl::torch_backend::FlatAdamW& optimizer,
@@ -843,6 +856,7 @@ void write_flat_checkpoint_manifest(const std::string& checkpoint_dir,
   manifest["world_size"] = world_size;
   manifest["data_parallel"] = dp_size;
   manifest["pipeline_parallel"] = pp_size;
+  manifest["context_parallel"] = cp_size;
   manifest["tensor_parallel"] = tp_size;
   manifest["training_config"] = training_config;
   manifest["optimizer"] = {
@@ -857,8 +871,9 @@ void write_flat_checkpoint_manifest(const std::string& checkpoint_dir,
   manifest["rank_files"] = nlohmann::json::array();
   for (int64_t rank = 0; rank < world_size; ++rank) {
     const int64_t tp = rank % tp_size;
-    const int64_t pp = (rank / tp_size) % pp_size;
-    const int64_t dp = rank / (pp_size * tp_size);
+    const int64_t cp = (rank / tp_size) % cp_size;
+    const int64_t pp = (rank / (tp_size * cp_size)) % pp_size;
+    const int64_t dp = rank / (pp_size * cp_size * tp_size);
     const std::string param_file = "rank_" + std::to_string(rank) + ".pt";
     const std::string metadata_file = "rank_" + std::to_string(rank) + ".json";
     if (!std::filesystem::exists(step_dir / param_file) ||
@@ -869,6 +884,7 @@ void write_flat_checkpoint_manifest(const std::string& checkpoint_dir,
         {"global_rank", rank},
         {"data_rank", dp},
         {"pipeline_rank", pp},
+        {"context_rank", cp},
         {"tensor_rank", tp},
         {"param_file", param_file},
         {"metadata_file", metadata_file},
@@ -886,6 +902,7 @@ nlohmann::json make_training_config_json(const std::string& dtype,
                                          int64_t tp_grad_bucket_mb,
                                          int64_t micro_batches,
                                          int64_t layers,
+                                         int64_t cp_size,
                                          int64_t prompt_len,
                                          int64_t response_len,
                                          double max_grad_norm,
@@ -905,6 +922,7 @@ nlohmann::json make_training_config_json(const std::string& dtype,
   config["tp_grad_bucket_mb"] = tp_grad_bucket_mb;
   config["micro_batches"] = micro_batches;
   config["layers"] = layers;
+  config["context_parallel"] = cp_size;
   config["prompt_len"] = prompt_len;
   config["response_len"] = response_len;
   config["max_grad_norm"] = max_grad_norm;
@@ -923,6 +941,7 @@ int64_t load_rank_checkpoint(const std::string& checkpoint_path,
                              int64_t global_rank,
                              int64_t dp_rank,
                              int64_t pp_rank,
+                             int64_t cp_rank,
                              int64_t tp_rank,
                              const std::vector<std::string>& param_names,
                              std::vector<torch::Tensor>& params,
@@ -956,6 +975,7 @@ int64_t load_rank_checkpoint(const std::string& checkpoint_path,
   if (rank_meta.value("global_rank", global_rank) != global_rank ||
       rank_meta.value("data_rank", dp_rank) != dp_rank ||
       rank_meta.value("pipeline_rank", pp_rank) != pp_rank ||
+      rank_meta.value("context_rank", cp_rank) != cp_rank ||
       rank_meta.value("tensor_rank", tp_rank) != tp_rank) {
     throw std::runtime_error("resume checkpoint rank metadata does not match current rank topology");
   }
@@ -1040,6 +1060,7 @@ int64_t load_rank_flat_checkpoint(const std::string& checkpoint_path,
                                   int64_t global_rank,
                                   int64_t dp_rank,
                                   int64_t pp_rank,
+                                  int64_t cp_rank,
                                   int64_t tp_rank,
                                   const std::vector<std::string>& param_names,
                                   std::vector<torch::Tensor>& params,
@@ -1073,6 +1094,7 @@ int64_t load_rank_flat_checkpoint(const std::string& checkpoint_path,
   if (rank_meta.value("global_rank", global_rank) != global_rank ||
       rank_meta.value("data_rank", dp_rank) != dp_rank ||
       rank_meta.value("pipeline_rank", pp_rank) != pp_rank ||
+      rank_meta.value("context_rank", cp_rank) != cp_rank ||
       rank_meta.value("tensor_rank", tp_rank) != tp_rank ||
       rank_meta.value("optimizer_kind", std::string{}) != "FlatAdamW") {
     throw std::runtime_error("resume flat checkpoint rank metadata does not match current rank topology");
@@ -1162,6 +1184,7 @@ void append_metrics_csv(const std::string& path,
                         int64_t step,
                         int64_t dp_size,
                         int64_t pp_size,
+                        int64_t cp_size,
                         int64_t tp_size,
                         int64_t micro_batches,
                         int64_t layers,
@@ -1197,7 +1220,7 @@ void append_metrics_csv(const std::string& path,
   }
   std::ofstream out(path, std::ios::app);
   if (write_header) {
-    out << "step,dp,pp,tp,micro_batches,layers,prompt_len,response_len,rollout_rows,"
+    out << "step,dp,pp,cp,tp,micro_batches,layers,prompt_len,response_len,rollout_rows,"
         << "dtype,dp_grad_comm_dtype,tp_grad_comm_dtype,master_weights,dp_shard_optimizer,"
         << "dp_flat_shard_optimizer,dp_grad_bucket_mb,tp_grad_bucket_mb,"
         << "mean_reward,success_rate,adv_abs_sum,loss_sum,kl_loss_sum,ppo_kl_sum,clipfrac_sum,"
@@ -1206,6 +1229,7 @@ void append_metrics_csv(const std::string& path,
   out << step << ","
       << dp_size << ","
       << pp_size << ","
+      << cp_size << ","
       << tp_size << ","
       << micro_batches << ","
       << layers << ","
@@ -1542,8 +1566,9 @@ int main(int argc, char** argv) {
         arg_i64(argc, argv, "--global-rank", std::getenv("RANK") ? std::stoll(std::getenv("RANK")) : 0);
     const int64_t dp_size = arg_i64(argc, argv, "--dp-size", 1);
     const int64_t pp_size = arg_i64(argc, argv, "--pp-size", 2);
+    const int64_t cp_size = arg_i64(argc, argv, "--cp-size", 1);
     const int64_t tp_size = arg_i64(argc, argv, "--tp-size", 2);
-    const int64_t world_size = dp_size * pp_size * tp_size;
+    const int64_t world_size = dp_size * pp_size * cp_size * tp_size;
     const int64_t device_idx =
         arg_i64(argc, argv, "--device", std::getenv("LOCAL_RANK") ? std::stoll(std::getenv("LOCAL_RANK")) : global_rank);
     const int64_t layers = arg_i64(argc, argv, "--layers", 2);
@@ -1594,8 +1619,8 @@ int main(int argc, char** argv) {
     const auto tp_grad_comm_dtype = parse_optional_dtype(tp_grad_comm_dtype_arg);
     const std::string id_prefix = arg_str(argc, argv, "--id-prefix", "/tmp/cverl_qwen_pp_tp_ppo");
 
-    if (dp_size <= 0 || pp_size <= 0 || tp_size <= 0 || micro_batches <= 0 || steps <= 0) {
-      throw std::invalid_argument("dp-size, pp-size, tp-size, micro-batches, and steps must be positive");
+    if (dp_size <= 0 || pp_size <= 0 || cp_size <= 0 || tp_size <= 0 || micro_batches <= 0 || steps <= 0) {
+      throw std::invalid_argument("dp-size, pp-size, cp-size, tp-size, micro-batches, and steps must be positive");
     }
     if (prompt_len <= 0 || response_len <= 0 || max_grad_norm < 0.0) {
       throw std::invalid_argument("prompt-len and response-len must be positive");
@@ -1622,6 +1647,7 @@ int main(int argc, char** argv) {
                                                            tp_grad_bucket_mb,
                                                            micro_batches,
                                                            layers,
+                                                           cp_size,
                                                            prompt_len,
                                                            response_len,
                                                            max_grad_norm,
@@ -1640,7 +1666,7 @@ int main(int argc, char** argv) {
     cverl::distributed::ParallelDims dims;
     dims.data_parallel = dp_size;
     dims.pipeline_parallel = pp_size;
-    dims.context_parallel = 1;
+    dims.context_parallel = cp_size;
     dims.tensor_parallel = tp_size;
     dims.micro_batches = micro_batches;
     cverl::distributed::ClusterSpec spec;
@@ -1658,9 +1684,11 @@ int main(int argc, char** argv) {
 
     const std::string full_id_path = id_prefix + "_full.bin";
     const std::string tp_id_path = id_prefix + "_tp_dp" + std::to_string(info.data_rank) +
-                                   "_pp" + std::to_string(info.pipeline_rank) + ".bin";
+                                   "_pp" + std::to_string(info.pipeline_rank) + "_cp" +
+                                   std::to_string(info.context_rank) + ".bin";
     const std::string dp_id_path = id_prefix + "_dp_pp" + std::to_string(info.pipeline_rank) +
-                                   "_tp" + std::to_string(info.tensor_rank) + ".bin";
+                                   "_cp" + std::to_string(info.context_rank) + "_tp" +
+                                   std::to_string(info.tensor_rank) + ".bin";
     const std::string model_id_path = id_prefix + "_model_dp" + std::to_string(info.data_rank) + ".bin";
     if (global_rank == 0) {
       cverl::distributed::write_nccl_unique_id_file(full_id_path, cverl::distributed::create_nccl_unique_id());
@@ -1671,7 +1699,7 @@ int main(int argc, char** argv) {
     if (info.data_rank == 0) {
       cverl::distributed::write_nccl_unique_id_file(dp_id_path, cverl::distributed::create_nccl_unique_id());
     }
-    if (info.pipeline_rank == 0 && info.tensor_rank == 0) {
+    if (info.pipeline_rank == 0 && info.context_rank == 0 && info.tensor_rank == 0) {
       cverl::distributed::write_nccl_unique_id_file(model_id_path, cverl::distributed::create_nccl_unique_id());
     }
 
@@ -1685,8 +1713,9 @@ int main(int argc, char** argv) {
         info.tensor_rank, tp_size, static_cast<int>(device_idx), tp_id, nccl_sync_after_collective);
     cverl::distributed::NcclCollectives dp_comm(
         info.data_rank, dp_size, static_cast<int>(device_idx), dp_id, nccl_sync_after_collective);
-    const int64_t model_parallel_size = pp_size * tp_size;
-    const int64_t model_parallel_rank = info.pipeline_rank * tp_size + info.tensor_rank;
+    const int64_t model_parallel_size = pp_size * cp_size * tp_size;
+    const int64_t model_parallel_rank =
+        (info.pipeline_rank * cp_size + info.context_rank) * tp_size + info.tensor_rank;
     cverl::distributed::NcclCollectives model_comm(
         model_parallel_rank, model_parallel_size, static_cast<int>(device_idx), model_id, nccl_sync_after_collective);
     const auto model_parallel_ranks = full_group(model_parallel_size);
@@ -1767,6 +1796,7 @@ int main(int argc, char** argv) {
                                                global_rank,
                                                info.data_rank,
                                                info.pipeline_rank,
+                                               info.context_rank,
                                                info.tensor_rank,
                                                param_names,
                                                params,
@@ -1780,6 +1810,7 @@ int main(int argc, char** argv) {
                                           global_rank,
                                           info.data_rank,
                                           info.pipeline_rank,
+                                          info.context_rank,
                                           info.tensor_rank,
                                           param_names,
                                           params,
@@ -2080,6 +2111,8 @@ int main(int argc, char** argv) {
                                     info.data_rank,
                                     info.pipeline_rank,
                                     pp_size,
+                                    info.context_rank,
+                                    cp_size,
                                     info.tensor_rank,
                                     tp_size,
                                     range.begin,
@@ -2097,6 +2130,8 @@ int main(int argc, char** argv) {
                                info.data_rank,
                                info.pipeline_rank,
                                pp_size,
+                               info.context_rank,
+                               cp_size,
                                info.tensor_rank,
                                tp_size,
                                range.begin,
@@ -2114,13 +2149,14 @@ int main(int argc, char** argv) {
                                            world_size,
                                            dp_size,
                                            pp_size,
+                                           cp_size,
                                            tp_size,
                                            training_config,
                                            *flat_optimizer,
                                            flat_checkpoint_save_model_params);
           } else {
             write_checkpoint_manifest(
-                checkpoint_dir, step, world_size, dp_size, pp_size, tp_size, training_config, optimizer);
+                checkpoint_dir, step, world_size, dp_size, pp_size, cp_size, tp_size, training_config, optimizer);
           }
         }
         full_comm.barrier();
@@ -2179,6 +2215,7 @@ int main(int argc, char** argv) {
                            step,
                            dp_size,
                            pp_size,
+                           cp_size,
                            tp_size,
                            micro_batches,
                            layers,
@@ -2207,6 +2244,7 @@ int main(int argc, char** argv) {
         std::cout << "step=" << step
                   << " dp=" << dp_size
                   << " pp=" << pp_size
+                  << " cp=" << cp_size
                   << " tp=" << tp_size
                   << " micro_batches=" << micro_batches
                   << " layers=" << layers
@@ -2254,11 +2292,13 @@ int main(int argc, char** argv) {
       for (int64_t d = 0; d < dp_size; ++d) {
         std::filesystem::remove(id_prefix + "_model_dp" + std::to_string(d) + ".bin");
         for (int64_t pp = 0; pp < pp_size; ++pp) {
-          std::filesystem::remove(
-              id_prefix + "_tp_dp" + std::to_string(d) + "_pp" + std::to_string(pp) + ".bin");
-          for (int64_t tp = 0; tp < tp_size; ++tp) {
-            std::filesystem::remove(
-                id_prefix + "_dp_pp" + std::to_string(pp) + "_tp" + std::to_string(tp) + ".bin");
+          for (int64_t cp = 0; cp < cp_size; ++cp) {
+            std::filesystem::remove(id_prefix + "_tp_dp" + std::to_string(d) + "_pp" +
+                                    std::to_string(pp) + "_cp" + std::to_string(cp) + ".bin");
+            for (int64_t tp = 0; tp < tp_size; ++tp) {
+              std::filesystem::remove(id_prefix + "_dp_pp" + std::to_string(pp) + "_cp" +
+                                      std::to_string(cp) + "_tp" + std::to_string(tp) + ".bin");
+            }
           }
         }
       }

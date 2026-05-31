@@ -220,6 +220,11 @@ Current code exposes the distributed shape directly:
   wrappers on the `Collectives` interface.
 - `context_parallel`: sequence-dimension shard/gather helpers used as the
   base for CP attention.
+- `qwen3_5_pp_tp_ppo_trainer`: accepts DP/PP/CP/TP topology dimensions and
+  records all four axes in metrics and checkpoint manifests. CP is wired as a
+  topology/communicator axis; the Qwen forward path still needs CP-aware token
+  sharding and ring-attention kernels before `CP>1` is a true memory-saving
+  training mode.
 
 The next efficiency step is replacing CP all-gather with a ring-attention
 kernel and grouping PP send/recv plus TP/DP collectives into larger scheduled

@@ -5,8 +5,9 @@ BUILD_DIR="${BUILD_DIR:-build-h20-nccl}"
 MODEL_DIR="${1:-../models/Qwen3.5-0.8B}"
 DP_SIZE="${DP_SIZE:-1}"
 PP_SIZE="${PP_SIZE:-2}"
+CP_SIZE="${CP_SIZE:-1}"
 TP_SIZE="${TP_SIZE:-2}"
-WORLD_SIZE=$((DP_SIZE * PP_SIZE * TP_SIZE))
+WORLD_SIZE=$((DP_SIZE * PP_SIZE * CP_SIZE * TP_SIZE))
 LOCAL_WORLD_SIZE="${LOCAL_WORLD_SIZE:-${WORLD_SIZE}}"
 LAYERS="${LAYERS:-2}"
 PROMPT_LEN="${PROMPT_LEN:-2}"
@@ -67,6 +68,7 @@ for ((rank = 0; rank < WORLD_SIZE; ++rank)); do
       --global-rank "${rank}" \
       --dp-size "${DP_SIZE}" \
       --pp-size "${PP_SIZE}" \
+      --cp-size "${CP_SIZE}" \
       --tp-size "${TP_SIZE}" \
       --device "${local_rank}" \
       --layers "${LAYERS}" \
