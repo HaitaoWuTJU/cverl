@@ -613,14 +613,15 @@ torch::Tensor Qwen35TextModel::full_attention_context_parallel(const torch::Tens
 
   k = repeat_kv(k, h / kvh).contiguous();
   v = repeat_kv(v, h / kvh).contiguous();
-  auto context_out = distributed::context_parallel_causal_attention_gather_kv(q.contiguous(),
-                                                                              k,
-                                                                              v,
-                                                                              *context_group.collectives,
-                                                                              context_group.ranks,
-                                                                              context_group.rank,
-                                                                              original_sequence_length,
-                                                                              1.0 / std::sqrt(static_cast<double>(d)));
+  auto context_out = distributed::context_parallel_causal_attention_ring_gather_kv(
+      q.contiguous(),
+      k,
+      v,
+      *context_group.collectives,
+      context_group.ranks,
+      context_group.rank,
+      original_sequence_length,
+      1.0 / std::sqrt(static_cast<double>(d)));
   auto out = context_out.transpose(1, 2).contiguous().reshape({b, s_local, h * d});
   out = (out * torch::sigmoid(gate.to(torch::kFloat32))).to(x.scalar_type());
   return dense(out, weight(p + "o_proj.weight"));

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -294,8 +295,9 @@ torch::Tensor context_parallel_causal_attention_streaming_blocks(
                              query_begin + valid_query,
                              torch::TensorOptions().dtype(torch::kLong).device(query_local.device()))
                    .view({valid_query, 1});
+  const double neg_inf = -std::numeric_limits<float>::infinity();
   auto row_max = torch::full({query.size(0), query.size(1), valid_query, 1},
-                             -1.0e30,
+                             neg_inf,
                              torch::TensorOptions().dtype(torch::kFloat32).device(query_local.device()));
   auto row_sum = torch::zeros_like(row_max);
   auto acc = torch::zeros({query.size(0), query.size(1), valid_query, value_blocks.front().size(3)},
@@ -326,12 +328,16 @@ torch::Tensor context_parallel_causal_attention_streaming_blocks(
                                key_begin_positions[i] + valid_key,
                                torch::TensorOptions().dtype(torch::kLong).device(query_local.device()))
                      .view({1, valid_key});
-    scores = scores.masked_fill((k_pos > q_pos).unsqueeze(0).unsqueeze(0), -1.0e30);
+    const auto valid_mask = (k_pos <= q_pos).unsqueeze(0).unsqueeze(0);
+    scores = scores.masked_fill(torch::logical_not(valid_mask), neg_inf);
 
     auto block_max = std::get<0>(scores.max(-1, true));
     auto next_max = torch::maximum(row_max, block_max);
-    auto old_scale = torch::exp(row_max - next_max);
-    auto exp_scores = torch::exp(scores - next_max);
+    auto has_any = torch::isfinite(next_max);
+    auto safe_next_max = torch::where(has_any, next_max, torch::zeros_like(next_max));
+    auto old_scale = torch::where(torch::isfinite(row_max), torch::exp(row_max - safe_next_max), torch::zeros_like(row_max));
+    auto exp_scores =
+        torch::where(valid_mask, torch::exp(scores - safe_next_max), torch::zeros_like(scores));
     acc = acc * old_scale + torch::matmul(exp_scores, value);
     row_sum = row_sum * old_scale + exp_scores.sum(-1, true);
     row_max = next_max;
@@ -374,6 +380,51 @@ torch::Tensor context_parallel_causal_attention_gather_kv(const torch::Tensor& q
     const int64_t begin = rank_index * shard;
     if (begin >= key_global.size(2)) {
       break;
+    }
+    const int64_t block = std::min<int64_t>(shard, key_global.size(2) - begin);
+    key_blocks.push_back(key_global.narrow(2, begin, block).contiguous());
+    value_blocks.push_back(value_global.narrow(2, begin, block).contiguous());
+    key_begin_positions.push_back(begin);
+  }
+  return context_parallel_causal_attention_streaming_blocks(
+      query_local, key_blocks, value_blocks, key_begin_positions, context_rank * shard, original_sequence_length, scale);
+}
+
+torch::Tensor context_parallel_causal_attention_ring_gather_kv(const torch::Tensor& query_local,
+                                                               const torch::Tensor& key_local,
+                                                               const torch::Tensor& value_local,
+                                                               Collectives& collectives,
+                                                               const std::vector<int64_t>& context_group,
+                                                               int64_t context_rank,
+                                                               int64_t original_sequence_length,
+                                                               double scale) {
+  require_attention_tensor(query_local, "query_local");
+  require_attention_tensor(key_local, "key_local");
+  require_attention_tensor(value_local, "value_local");
+  validate_context_rank(context_rank, static_cast<int64_t>(context_group.size()));
+  const int64_t shard = query_local.size(2);
+  if (key_local.size(2) != shard || value_local.size(2) != shard) {
+    throw std::invalid_argument("query/key/value local CP shards must have matching sequence length");
+  }
+  auto key_global = context_parallel_gather_autograd(key_local.contiguous(), collectives, context_group, 2).contiguous();
+  auto value_global =
+      context_parallel_gather_autograd(value_local.contiguous(), collectives, context_group, 2).contiguous();
+  if (key_global.size(2) < original_sequence_length || value_global.size(2) < original_sequence_length) {
+    throw std::invalid_argument("gathered CP KV is shorter than original_sequence_length");
+  }
+
+  std::vector<torch::Tensor> key_blocks;
+  std::vector<torch::Tensor> value_blocks;
+  std::vector<int64_t> key_begin_positions;
+  const auto schedule = context_parallel_ring_schedule(context_group, context_group.at(static_cast<size_t>(context_rank)));
+  key_blocks.reserve(schedule.size());
+  value_blocks.reserve(schedule.size());
+  key_begin_positions.reserve(schedule.size());
+  for (const auto& step : schedule) {
+    const int64_t rank_index = context_parallel_group_index(context_group, step.kv_rank);
+    const int64_t begin = rank_index * shard;
+    if (begin >= key_global.size(2)) {
+      continue;
     }
     const int64_t block = std::min<int64_t>(shard, key_global.size(2) - begin);
     key_blocks.push_back(key_global.narrow(2, begin, block).contiguous());

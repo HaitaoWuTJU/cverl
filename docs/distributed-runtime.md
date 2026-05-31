@@ -223,8 +223,10 @@ Current code exposes the distributed shape directly:
   causal-attention reference for local query shards. The attention math now
   uses FlashAttention-style streaming over KV blocks, maintaining row max,
   row sum, and value accumulator instead of materializing the full `[Q,K]`
-  score/probability matrix; ring-attention kernels should match this math
-  while replacing the remaining global KV materialization.
+  score/probability matrix. Qwen CP full attention consumes blocks in the
+  same order as the CP ring schedule; the current implementation still obtains
+  those blocks from autograd all-gather, and the next NCCL ring path should
+  replace that source with send/recv while preserving the streaming math.
   The NCCL smoke test runs this path on GPU ranks. The current differentiable
   gather uses all-gather in forward and reduce-scatter in backward, so local
   K/V owners receive gradients. Full industrial CP training still needs a
@@ -233,8 +235,8 @@ Current code exposes the distributed shape directly:
 - `qwen3_5_pp_tp_ppo_trainer`: accepts DP/PP/CP/TP topology dimensions and
   records all four axes in metrics and checkpoint manifests. For `CP>1,TP=1`,
   PP stages now pass local sequence shards, Qwen range forward keeps
-  RMSNorm/MLP/projections local, full attention runs local-Q plus
-  differentiable CP K/V gather, and the final PPO logprob slice gathers hidden
+  RMSNorm/MLP/projections local, full attention runs local-Q plus ring-order
+  differentiable CP K/V blocks, and the final PPO logprob slice gathers hidden
   with autograd so gradients reduce-scatter back to owner shards. `TP>1` with
   `CP>1` is intentionally rejected until TP-sharded CP attention and MLP are
   fused into one Megatron-style execution path.

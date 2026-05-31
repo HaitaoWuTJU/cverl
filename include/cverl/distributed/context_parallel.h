@@ -82,4 +82,13 @@ torch::Tensor context_parallel_causal_attention_gather_kv(const torch::Tensor& q
                                                           int64_t original_sequence_length,
                                                           double scale);
 
+torch::Tensor context_parallel_causal_attention_ring_gather_kv(const torch::Tensor& query_local,
+                                                               const torch::Tensor& key_local,
+                                                               const torch::Tensor& value_local,
+                                                               Collectives& collectives,
+                                                               const std::vector<int64_t>& context_group,
+                                                               int64_t context_rank,
+                                                               int64_t original_sequence_length,
+                                                               double scale);
+
 }  // namespace cverl::distributed

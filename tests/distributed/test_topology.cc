@@ -396,6 +396,11 @@ void test_context_parallel_causal_attention() {
       stream_q, {stream_k1, stream_k0}, {stream_v1, stream_v0}, {3, 0}, 3, 6, scale);
   require(torch::allclose(stream_out, dense.narrow(2, 3, 3), 1.0e-5, 1.0e-5),
           "CP streaming causal attention matches dense regardless of ring block order");
+  auto future_first = cverl::distributed::context_parallel_causal_attention_streaming_blocks(
+      q.narrow(2, 0, 3).contiguous(), {k.narrow(2, 3, 3).contiguous(), k.narrow(2, 0, 3).contiguous()},
+      {v.narrow(2, 3, 3).contiguous(), v.narrow(2, 0, 3).contiguous()}, {3, 0}, 0, 6, scale);
+  require(torch::allclose(future_first, dense.narrow(2, 0, 3), 1.0e-5, 1.0e-5),
+          "CP streaming ignores all-future ring blocks until valid KV arrives");
   auto stream_dense_q = q.detach().clone().set_requires_grad(true);
   auto stream_dense_k = k.detach().clone().set_requires_grad(true);
   auto stream_dense_v = v.detach().clone().set_requires_grad(true);
@@ -444,6 +449,13 @@ void test_context_parallel_causal_attention() {
   auto gathered =
       cverl::distributed::context_parallel_causal_attention_gather_kv(q0, k0, v0, collectives, {0, 1}, 0, 6, scale);
   require(torch::allclose(gathered, dense.narrow(2, 0, 3), 1.0e-5, 1.0e-5), "CP gathered KV causal attention");
+  PrecomputedAllGatherCollectives ring_collectives(std::vector<std::vector<torch::Tensor>>{
+      {k0.transpose(0, 2).contiguous(), k1.transpose(0, 2).contiguous()},
+      {v0.transpose(0, 2).contiguous(), v1.transpose(0, 2).contiguous()}});
+  auto ring_gathered = cverl::distributed::context_parallel_causal_attention_ring_gather_kv(
+      q0, k0, v0, ring_collectives, {0, 1}, 0, 6, scale);
+  require(torch::allclose(ring_gathered, dense.narrow(2, 0, 3), 1.0e-5, 1.0e-5),
+          "CP ring-order gathered KV causal attention");
   gathered.sum().backward();
   require(q0.grad().defined() && torch::allclose(q0.grad(), dense_q.grad().narrow(2, 0, 3), 1.0e-5, 1.0e-5),
           "CP gathered KV query gradient matches dense local-output gradient");
