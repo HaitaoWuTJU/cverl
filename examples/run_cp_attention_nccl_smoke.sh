@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-${ROOT_DIR}/build-h20-nccl}"
 WORLD_SIZE="${WORLD_SIZE:-4}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
-NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-eth1}"
+NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-bond1}"
 NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 ID_FILE="${ID_FILE:-/tmp/cverl_cp_attention_nccl_id.bin}"
 

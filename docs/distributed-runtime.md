@@ -238,11 +238,12 @@ Current code exposes the distributed shape directly:
   path. CUDA builds also expose fused forward and backward kernels for
   ring-ordered CP causal attention that compute causal softmax over ring KV
   blocks without materializing a `[Q,K]` matrix. The CUDA forward computes row
-  max/sum once per query row and reuses that softmax metadata across value
-  columns with block-level reductions across the K dimension; CUDA `dq`
-  backward uses the same reduction pattern for row max, row sum, and
-  `dot(grad_out, out)`. The first CUDA `dk/dv` backward is still a
-  correctness-oriented recompute kernel. Full industrial CP training still
+  max/sum once per query row with block-level reductions across the K dimension
+  and saves per-query log-sum-exp metadata for backward. CUDA `dq/dk/dv`
+  backward uses that saved LSE instead of recomputing row max/sum; `dq` also
+  reduces `dot(grad_out, out)` across the K dimension inside the CTA. The first
+  CUDA `dk/dv` backward still computes one KV row per CTA and recomputes
+  `dot(grad_out, out)` for each key row, so full industrial CP training still
   needs tile/shared-memory optimization, while the NCCL backend now caches
   subgroup communicators with `ncclCommSplit` so CP groups can use the
   reduce-scatter path directly when the installed NCCL version supports it.

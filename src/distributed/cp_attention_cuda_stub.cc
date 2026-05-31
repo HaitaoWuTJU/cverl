@@ -28,6 +28,25 @@ torch::Tensor cp_ring_attention_cuda_forward(const torch::Tensor& query_local,
   throw std::runtime_error("CP attention CUDA kernel was not built");
 }
 
+std::vector<torch::Tensor> cp_ring_attention_cuda_forward_with_lse(const torch::Tensor& query_local,
+                                                                   const torch::Tensor& key_ring,
+                                                                   const torch::Tensor& value_ring,
+                                                                   const std::vector<int64_t>& key_begin_positions,
+                                                                   int64_t query_begin,
+                                                                   int64_t original_sequence_length,
+                                                                   int64_t shard_size,
+                                                                   double scale) {
+  (void)query_local;
+  (void)key_ring;
+  (void)value_ring;
+  (void)key_begin_positions;
+  (void)query_begin;
+  (void)original_sequence_length;
+  (void)shard_size;
+  (void)scale;
+  throw std::runtime_error("CP attention CUDA kernel was not built");
+}
+
 std::vector<torch::Tensor> cp_ring_attention_cuda_backward(const torch::Tensor& grad_out,
                                                            const torch::Tensor& query_local,
                                                            const torch::Tensor& key_ring,
@@ -41,6 +60,29 @@ std::vector<torch::Tensor> cp_ring_attention_cuda_backward(const torch::Tensor& 
   (void)query_local;
   (void)key_ring;
   (void)value_ring;
+  (void)key_begin_positions;
+  (void)query_begin;
+  (void)original_sequence_length;
+  (void)shard_size;
+  (void)scale;
+  throw std::runtime_error("CP attention CUDA kernel was not built");
+}
+
+std::vector<torch::Tensor> cp_ring_attention_cuda_backward_with_lse(const torch::Tensor& grad_out,
+                                                                    const torch::Tensor& query_local,
+                                                                    const torch::Tensor& key_ring,
+                                                                    const torch::Tensor& value_ring,
+                                                                    const torch::Tensor& query_lse,
+                                                                    const std::vector<int64_t>& key_begin_positions,
+                                                                    int64_t query_begin,
+                                                                    int64_t original_sequence_length,
+                                                                    int64_t shard_size,
+                                                                    double scale) {
+  (void)grad_out;
+  (void)query_local;
+  (void)key_ring;
+  (void)value_ring;
+  (void)query_lse;
   (void)key_begin_positions;
   (void)query_begin;
   (void)original_sequence_length;

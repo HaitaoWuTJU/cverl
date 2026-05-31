@@ -24,6 +24,16 @@ void require_f32_cuda_contiguous(const torch::Tensor& t, const char* name) {
   }
 }
 
+void require_f32_cuda_contiguous_lse(const torch::Tensor& t,
+                                     const torch::Tensor& query_local,
+                                     const char* name) {
+  require_f32_cuda_contiguous(t, name);
+  if (t.dim() != 3 || t.size(0) != query_local.size(0) || t.size(1) != query_local.size(1) ||
+      t.size(2) != query_local.size(2)) {
+    throw std::invalid_argument(std::string(name) + " must be contiguous CUDA float32 [B,H,Tq]");
+  }
+}
+
 void validate_shapes(const torch::Tensor& query_local,
                      const torch::Tensor& key_ring,
                      const torch::Tensor& value_ring,
@@ -86,6 +96,7 @@ __global__ void cp_ring_attention_forward_kernel(const float* __restrict__ q,
                                                  const float* __restrict__ v,
                                                  const int64_t* __restrict__ key_begin_positions,
                                                  float* __restrict__ out,
+                                                 float* __restrict__ lse,
                                                  int B,
                                                  int H,
                                                  int Tq,
@@ -113,7 +124,7 @@ __global__ void cp_ring_attention_forward_kernel(const float* __restrict__ q,
   __shared__ float shared_row_sum;
   __shared__ float reduction[kCpAttentionThreads];
 
-  float local_row_max = -CUDART_INF_F;
+  float local_row_max = -INFINITY;
   if (valid_query) {
     const int total_keys = num_blocks * shard_size;
     for (int flat = threadIdx.x; flat < total_keys; flat += blockDim.x) {
@@ -158,6 +169,7 @@ __global__ void cp_ring_attention_forward_kernel(const float* __restrict__ q,
   const float row_sum = block_reduce_sum(local_row_sum, reduction);
   if (threadIdx.x == 0) {
     shared_row_sum = row_sum;
+    lse[row] = isfinite(shared_row_max) ? shared_row_max + logf(fmaxf(row_sum, 1.0e-20f)) : -INFINITY;
   }
   __syncthreads();
 
@@ -191,6 +203,7 @@ __global__ void cp_ring_attention_backward_q_kernel(const float* __restrict__ gr
                                                     const float* __restrict__ q,
                                                     const float* __restrict__ k,
                                                     const float* __restrict__ v,
+                                                    const float* __restrict__ lse,
                                                     const int64_t* __restrict__ key_begin_positions,
                                                     float* __restrict__ dq,
                                                     int B,
@@ -214,42 +227,19 @@ __global__ void cp_ring_attention_backward_q_kernel(const float* __restrict__ gr
   const int go_base = (((b * H + h) * Tq + t) * V);
   const int kv_bh_base_k = ((b * H + h) * Tk) * D;
   const int kv_bh_base_v = ((b * H + h) * Tk) * V;
+  const float row_lse = lse[row];
 
-  __shared__ float shared_row_max;
-  __shared__ float shared_row_sum;
   __shared__ float shared_dot_go_o;
   __shared__ float reduction[kCpAttentionThreads];
 
-  if (q_pos >= original_sequence_length) {
+  if (q_pos >= original_sequence_length || !isfinite(row_lse)) {
     for (int d = threadIdx.x; d < D; d += blockDim.x) {
       dq[q_base + d] = 0.0f;
     }
     return;
   }
 
-  float local_row_max = -CUDART_INF_F;
   const int total_keys = num_blocks * shard_size;
-  for (int flat = threadIdx.x; flat < total_keys; flat += blockDim.x) {
-    const int block = flat / shard_size;
-    const int local = flat - block * shard_size;
-    const int key_begin = static_cast<int>(key_begin_positions[block]);
-    const int k_pos = key_begin + local;
-    if (k_pos <= q_pos && k_pos < original_sequence_length) {
-      const int kt = block * shard_size + local;
-      float score = 0.0f;
-      for (int d = 0; d < D; ++d) {
-        score += q[q_base + d] * k[kv_bh_base_k + kt * D + d];
-      }
-      local_row_max = fmaxf(local_row_max, score * scale);
-    }
-  }
-  const float row_max = block_reduce_max(local_row_max, reduction);
-  if (threadIdx.x == 0) {
-    shared_row_max = row_max;
-  }
-  __syncthreads();
-
-  float local_row_sum = 0.0f;
   float local_dot_go_o = 0.0f;
   for (int flat = threadIdx.x; flat < total_keys; flat += blockDim.x) {
     const int block = flat / shard_size;
@@ -262,20 +252,17 @@ __global__ void cp_ring_attention_backward_q_kernel(const float* __restrict__ gr
       for (int d = 0; d < D; ++d) {
         score += q[q_base + d] * k[kv_bh_base_k + kt * D + d];
       }
-      const float prob_num = expf(score * scale - shared_row_max);
-      local_row_sum += prob_num;
+      const float prob = expf(score * scale - row_lse);
       float dot_go_v = 0.0f;
       for (int j = 0; j < V; ++j) {
         dot_go_v += grad_out[go_base + j] * v[kv_bh_base_v + kt * V + j];
       }
-      local_dot_go_o += prob_num * dot_go_v;
+      local_dot_go_o += prob * dot_go_v;
     }
   }
-  const float row_sum = fmaxf(block_reduce_sum(local_row_sum, reduction), 1.0e-20f);
-  const float dot_go_o_num = block_reduce_sum(local_dot_go_o, reduction);
+  const float dot_go_o = block_reduce_sum(local_dot_go_o, reduction);
   if (threadIdx.x == 0) {
-    shared_row_sum = row_sum;
-    shared_dot_go_o = dot_go_o_num / row_sum;
+    shared_dot_go_o = dot_go_o;
   }
   __syncthreads();
 
@@ -297,7 +284,7 @@ __global__ void cp_ring_attention_backward_q_kernel(const float* __restrict__ gr
         for (int j = 0; j < V; ++j) {
           dot_go_v += grad_out[go_base + j] * v[kv_bh_base_v + kt * V + j];
         }
-        const float prob = expf(score * scale - shared_row_max) / shared_row_sum;
+        const float prob = expf(score * scale - row_lse);
         const float ds = prob * (dot_go_v - shared_dot_go_o);
         acc += ds * k[kv_bh_base_k + kt * D + d];
       }
@@ -310,6 +297,7 @@ __global__ void cp_ring_attention_backward_kv_kernel(const float* __restrict__ g
                                                      const float* __restrict__ q,
                                                      const float* __restrict__ k,
                                                      const float* __restrict__ v,
+                                                     const float* __restrict__ lse,
                                                      const int64_t* __restrict__ key_begin_positions,
                                                      float* __restrict__ dk,
                                                      float* __restrict__ dv,
@@ -357,25 +345,12 @@ __global__ void cp_ring_attention_backward_kv_kernel(const float* __restrict__ g
       if (q_pos < key_pos || q_pos >= original_sequence_length) {
         continue;
       }
+      const float row_lse = lse[(b * H + h) * Tq + tq];
+      if (!isfinite(row_lse)) {
+        continue;
+      }
       const int q_base = q_bh_base + tq * D;
       const int go_base = go_bh_base + tq * V;
-      float row_max = -CUDART_INF_F;
-      for (int b2 = 0; b2 < num_blocks; ++b2) {
-        const int key_begin2 = static_cast<int>(key_begin_positions[b2]);
-        for (int l2 = 0; l2 < shard_size; ++l2) {
-          const int kp2 = key_begin2 + l2;
-          if (kp2 > q_pos || kp2 >= original_sequence_length) {
-            continue;
-          }
-          const int kt2 = b2 * shard_size + l2;
-          float score = 0.0f;
-          for (int kd = 0; kd < D; ++kd) {
-            score += q[q_base + kd] * k[((b * H + h) * Tk + kt2) * D + kd];
-          }
-          row_max = fmaxf(row_max, score * scale);
-        }
-      }
-      float row_sum = 0.0f;
       float dot_go_o = 0.0f;
       for (int b2 = 0; b2 < num_blocks; ++b2) {
         const int key_begin2 = static_cast<int>(key_begin_positions[b2]);
@@ -389,17 +364,14 @@ __global__ void cp_ring_attention_backward_kv_kernel(const float* __restrict__ g
           for (int kd = 0; kd < D; ++kd) {
             score += q[q_base + kd] * k[((b * H + h) * Tk + kt2) * D + kd];
           }
-          const float prob_num = expf(score * scale - row_max);
-          row_sum += prob_num;
+          const float prob = expf(score * scale - row_lse);
           float dot_go_v = 0.0f;
           for (int j = 0; j < V; ++j) {
             dot_go_v += grad_out[go_base + j] * v[((b * H + h) * Tk + kt2) * V + j];
           }
-          dot_go_o += prob_num * dot_go_v;
+          dot_go_o += prob * dot_go_v;
         }
       }
-      row_sum = fmaxf(row_sum, 1.0e-20f);
-      dot_go_o /= row_sum;
       float score = 0.0f;
       for (int kd = 0; kd < D; ++kd) {
         score += q[q_base + kd] * k[k_base + kd];
@@ -408,7 +380,7 @@ __global__ void cp_ring_attention_backward_kv_kernel(const float* __restrict__ g
       for (int j = 0; j < V; ++j) {
         dot_go_v += grad_out[go_base + j] * v[v_base + j];
       }
-      const float prob = expf(score * scale - row_max) / row_sum;
+      const float prob = expf(score * scale - row_lse);
       grad_k += prob * (dot_go_v - dot_go_o) * q[q_base + d] * scale;
     }
     dk[k_base + d] = grad_k;
@@ -421,45 +393,17 @@ __global__ void cp_ring_attention_backward_kv_kernel(const float* __restrict__ g
       if (q_pos < key_pos || q_pos >= original_sequence_length) {
         continue;
       }
+      const float row_lse = lse[(b * H + h) * Tq + tq];
+      if (!isfinite(row_lse)) {
+        continue;
+      }
       const int q_base = q_bh_base + tq * D;
       const int go_base = go_bh_base + tq * V;
-      float row_max = -CUDART_INF_F;
-      for (int b2 = 0; b2 < num_blocks; ++b2) {
-        const int key_begin2 = static_cast<int>(key_begin_positions[b2]);
-        for (int l2 = 0; l2 < shard_size; ++l2) {
-          const int kp2 = key_begin2 + l2;
-          if (kp2 > q_pos || kp2 >= original_sequence_length) {
-            continue;
-          }
-          const int kt2 = b2 * shard_size + l2;
-          float score = 0.0f;
-          for (int kd = 0; kd < D; ++kd) {
-            score += q[q_base + kd] * k[((b * H + h) * Tk + kt2) * D + kd];
-          }
-          row_max = fmaxf(row_max, score * scale);
-        }
-      }
-      float row_sum = 0.0f;
-      for (int b2 = 0; b2 < num_blocks; ++b2) {
-        const int key_begin2 = static_cast<int>(key_begin_positions[b2]);
-        for (int l2 = 0; l2 < shard_size; ++l2) {
-          const int kp2 = key_begin2 + l2;
-          if (kp2 > q_pos || kp2 >= original_sequence_length) {
-            continue;
-          }
-          const int kt2 = b2 * shard_size + l2;
-          float score = 0.0f;
-          for (int kd = 0; kd < D; ++kd) {
-            score += q[q_base + kd] * k[((b * H + h) * Tk + kt2) * D + kd];
-          }
-          row_sum += expf(score * scale - row_max);
-        }
-      }
       float score = 0.0f;
       for (int kd = 0; kd < D; ++kd) {
         score += q[q_base + kd] * k[k_base + kd];
       }
-      const float prob = expf(score * scale - row_max) / fmaxf(row_sum, 1.0e-20f);
+      const float prob = expf(score * scale - row_lse);
       grad_v += prob * grad_out[go_base + j];
     }
     dv[v_base + j] = grad_v;
@@ -480,6 +424,19 @@ torch::Tensor cp_ring_attention_cuda_forward(const torch::Tensor& query_local,
                                              int64_t original_sequence_length,
                                              int64_t shard_size,
                                              double scale) {
+  return cp_ring_attention_cuda_forward_with_lse(
+      query_local, key_ring, value_ring, key_begin_positions, query_begin, original_sequence_length, shard_size, scale)
+      .at(0);
+}
+
+std::vector<torch::Tensor> cp_ring_attention_cuda_forward_with_lse(const torch::Tensor& query_local,
+                                                                   const torch::Tensor& key_ring,
+                                                                   const torch::Tensor& value_ring,
+                                                                   const std::vector<int64_t>& key_begin_positions,
+                                                                   int64_t query_begin,
+                                                                   int64_t original_sequence_length,
+                                                                   int64_t shard_size,
+                                                                   double scale) {
   require_f32_cuda_contiguous(query_local, "query_local");
   require_f32_cuda_contiguous(key_ring, "key_ring");
   require_f32_cuda_contiguous(value_ring, "value_ring");
@@ -493,6 +450,7 @@ torch::Tensor cp_ring_attention_cuda_forward(const torch::Tensor& query_local,
 
   auto positions = positions_tensor(key_begin_positions, query_local.device());
   auto out = torch::empty({B, H, Tq, V}, query_local.options());
+  auto lse = torch::empty({B, H, Tq}, query_local.options());
 
   constexpr int threads = kCpAttentionThreads;
   const int rows = static_cast<int>(B * H * Tq);
@@ -503,6 +461,7 @@ torch::Tensor cp_ring_attention_cuda_forward(const torch::Tensor& query_local,
       value_ring.data_ptr<float>(),
       positions.data_ptr<int64_t>(),
       out.data_ptr<float>(),
+      lse.data_ptr<float>(),
       static_cast<int>(B),
       static_cast<int>(H),
       static_cast<int>(Tq),
@@ -515,7 +474,7 @@ torch::Tensor cp_ring_attention_cuda_forward(const torch::Tensor& query_local,
       static_cast<int>(shard_size),
       static_cast<float>(scale));
   check_cuda(cudaGetLastError(), "cp_ring_attention_forward_kernel");
-  return out;
+  return {out, lse};
 }
 
 std::vector<torch::Tensor> cp_ring_attention_cuda_backward(const torch::Tensor& grad_out,
@@ -527,10 +486,35 @@ std::vector<torch::Tensor> cp_ring_attention_cuda_backward(const torch::Tensor& 
                                                            int64_t original_sequence_length,
                                                            int64_t shard_size,
                                                            double scale) {
+  const auto forward = cp_ring_attention_cuda_forward_with_lse(
+      query_local, key_ring, value_ring, key_begin_positions, query_begin, original_sequence_length, shard_size, scale);
+  return cp_ring_attention_cuda_backward_with_lse(grad_out,
+                                                 query_local,
+                                                 key_ring,
+                                                 value_ring,
+                                                 forward.at(1),
+                                                 key_begin_positions,
+                                                 query_begin,
+                                                 original_sequence_length,
+                                                 shard_size,
+                                                 scale);
+}
+
+std::vector<torch::Tensor> cp_ring_attention_cuda_backward_with_lse(const torch::Tensor& grad_out,
+                                                                    const torch::Tensor& query_local,
+                                                                    const torch::Tensor& key_ring,
+                                                                    const torch::Tensor& value_ring,
+                                                                    const torch::Tensor& query_lse,
+                                                                    const std::vector<int64_t>& key_begin_positions,
+                                                                    int64_t query_begin,
+                                                                    int64_t original_sequence_length,
+                                                                    int64_t shard_size,
+                                                                    double scale) {
   require_f32_cuda_contiguous(grad_out, "grad_out");
   require_f32_cuda_contiguous(query_local, "query_local");
   require_f32_cuda_contiguous(key_ring, "key_ring");
   require_f32_cuda_contiguous(value_ring, "value_ring");
+  require_f32_cuda_contiguous_lse(query_lse, query_local, "query_lse");
   validate_shapes(query_local, key_ring, value_ring, key_begin_positions, query_begin, original_sequence_length, shard_size);
   if (grad_out.dim() != 4 || grad_out.size(0) != query_local.size(0) || grad_out.size(1) != query_local.size(1) ||
       grad_out.size(2) != query_local.size(2) || grad_out.size(3) != value_ring.size(3)) {
@@ -555,6 +539,7 @@ std::vector<torch::Tensor> cp_ring_attention_cuda_backward(const torch::Tensor& 
       query_local.data_ptr<float>(),
       key_ring.data_ptr<float>(),
       value_ring.data_ptr<float>(),
+      query_lse.data_ptr<float>(),
       positions.data_ptr<int64_t>(),
       dq.data_ptr<float>(),
       static_cast<int>(B),
@@ -576,6 +561,7 @@ std::vector<torch::Tensor> cp_ring_attention_cuda_backward(const torch::Tensor& 
       query_local.data_ptr<float>(),
       key_ring.data_ptr<float>(),
       value_ring.data_ptr<float>(),
+      query_lse.data_ptr<float>(),
       positions.data_ptr<int64_t>(),
       dk.data_ptr<float>(),
       dv.data_ptr<float>(),

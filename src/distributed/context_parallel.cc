@@ -240,14 +240,16 @@ class ContextParallelRingAttentionRecomputeFunction final
     ctx->saved_data["original_sequence_length"] = original_sequence_length;
     ctx->saved_data["shard_size"] = shard_size;
     ctx->saved_data["scale"] = scale;
-    ctx->save_for_backward({query_local, key_ring, value_ring, key_begin_positions});
     const auto positions = vector_from_cpu_i64_tensor(key_begin_positions);
     if (cp_attention_cuda_available() && query_local.is_cuda() && key_ring.is_cuda() && value_ring.is_cuda() &&
         query_local.scalar_type() == torch::kFloat32 && key_ring.scalar_type() == torch::kFloat32 &&
         value_ring.scalar_type() == torch::kFloat32) {
-      return cp_ring_attention_cuda_forward(
+      auto out_lse = cp_ring_attention_cuda_forward_with_lse(
           query_local, key_ring, value_ring, positions, query_begin, original_sequence_length, shard_size, scale);
+      ctx->save_for_backward({query_local, key_ring, value_ring, key_begin_positions, out_lse.at(1)});
+      return out_lse.at(0);
     }
+    ctx->save_for_backward({query_local, key_ring, value_ring, key_begin_positions});
     return streaming_attention_from_ring_blocks(query_local,
                                                 key_ring,
                                                 value_ring,
@@ -271,15 +273,26 @@ class ContextParallelRingAttentionRecomputeFunction final
         saved.at(0).scalar_type() == torch::kFloat32 && saved.at(1).scalar_type() == torch::kFloat32 &&
         saved.at(2).scalar_type() == torch::kFloat32 && grad_outputs.at(0).is_cuda() &&
         grad_outputs.at(0).scalar_type() == torch::kFloat32) {
-      auto grads = cp_ring_attention_cuda_backward(grad_outputs.at(0).contiguous(),
-                                                   saved.at(0).contiguous(),
-                                                   saved.at(1).contiguous(),
-                                                   saved.at(2).contiguous(),
-                                                   key_begin_positions,
-                                                   query_begin,
-                                                   original_sequence_length,
-                                                   shard_size,
-                                                   scale);
+      auto grads = saved.size() > 4 && saved.at(4).defined()
+                       ? cp_ring_attention_cuda_backward_with_lse(grad_outputs.at(0).contiguous(),
+                                                                  saved.at(0).contiguous(),
+                                                                  saved.at(1).contiguous(),
+                                                                  saved.at(2).contiguous(),
+                                                                  saved.at(4).contiguous(),
+                                                                  key_begin_positions,
+                                                                  query_begin,
+                                                                  original_sequence_length,
+                                                                  shard_size,
+                                                                  scale)
+                       : cp_ring_attention_cuda_backward(grad_outputs.at(0).contiguous(),
+                                                         saved.at(0).contiguous(),
+                                                         saved.at(1).contiguous(),
+                                                         saved.at(2).contiguous(),
+                                                         key_begin_positions,
+                                                         query_begin,
+                                                         original_sequence_length,
+                                                         shard_size,
+                                                         scale);
       return {grads.at(0), grads.at(1), grads.at(2), torch::Tensor(), torch::Tensor(), torch::Tensor(), torch::Tensor(),
               torch::Tensor()};
     }
