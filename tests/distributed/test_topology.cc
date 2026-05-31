@@ -458,6 +458,46 @@ void test_context_parallel_causal_attention() {
               torch::allclose(stream_v1.grad(), stream_dense_v.grad().narrow(2, 3, 3), 1.0e-5, 1.0e-5),
           "CP streaming value block 1 gradient matches dense");
 
+  auto recompute_q = q.narrow(2, 0, 3).contiguous().set_requires_grad(true);
+  auto recompute_k0 = k.narrow(2, 0, 3).contiguous();
+  auto recompute_k1 = k.narrow(2, 3, 3).contiguous();
+  auto recompute_v0 = v.narrow(2, 0, 3).contiguous();
+  auto recompute_v1 = v.narrow(2, 3, 3).contiguous();
+  auto recompute_k_ring = torch::cat({recompute_k0, recompute_k1}, 2).set_requires_grad(true);
+  auto recompute_v_ring = torch::cat({recompute_v0, recompute_v1}, 2).set_requires_grad(true);
+  auto recompute_dense_q = q.detach().clone().set_requires_grad(true);
+  auto recompute_dense_k = k.detach().clone().set_requires_grad(true);
+  auto recompute_dense_v = v.detach().clone().set_requires_grad(true);
+  auto recompute_dense_local =
+      cverl::distributed::context_parallel_causal_attention(recompute_dense_q.narrow(2, 0, 3).contiguous(),
+                                                            recompute_dense_k,
+                                                            recompute_dense_v,
+                                                            0,
+                                                            scale);
+  recompute_dense_local.sum().backward();
+  auto recompute_out = cverl::distributed::context_parallel_causal_attention_ring_blocks_recompute(
+      recompute_q, recompute_k_ring, recompute_v_ring, {0, 3}, 0, 6, 3, scale);
+  require(torch::allclose(recompute_out, dense.narrow(2, 0, 3), 1.0e-5, 1.0e-5),
+          "CP recompute ring attention forward matches dense");
+  recompute_out.sum().backward();
+  require(recompute_q.grad().defined() &&
+              torch::allclose(recompute_q.grad(), recompute_dense_q.grad().narrow(2, 0, 3), 1.0e-5, 1.0e-5),
+          "CP recompute ring attention query gradient matches dense");
+  require(recompute_k_ring.grad().defined() &&
+              torch::allclose(
+                  recompute_k_ring.grad().narrow(2, 0, 3), recompute_dense_k.grad().narrow(2, 0, 3), 1.0e-5, 1.0e-5),
+          "CP recompute ring attention key block 0 gradient matches dense");
+  require(torch::allclose(
+              recompute_k_ring.grad().narrow(2, 3, 3), recompute_dense_k.grad().narrow(2, 3, 3), 1.0e-5, 1.0e-5),
+          "CP recompute ring attention key block 1 gradient matches dense");
+  require(recompute_v_ring.grad().defined() &&
+              torch::allclose(
+                  recompute_v_ring.grad().narrow(2, 0, 3), recompute_dense_v.grad().narrow(2, 0, 3), 1.0e-5, 1.0e-5),
+          "CP recompute ring attention value block 0 gradient matches dense");
+  require(torch::allclose(
+              recompute_v_ring.grad().narrow(2, 3, 3), recompute_dense_v.grad().narrow(2, 3, 3), 1.0e-5, 1.0e-5),
+          "CP recompute ring attention value block 1 gradient matches dense");
+
   auto ring_x0 = k.narrow(2, 0, 3).contiguous().set_requires_grad(true);
   auto ring_zero = torch::zeros_like(k.narrow(2, 0, 3).transpose(0, 2).contiguous());
   PrecomputedAllGatherCollectives ring_exchange_collectives(

@@ -227,9 +227,13 @@ Current code exposes the distributed shape directly:
   same order as the CP ring schedule. The current ring-exchange path obtains
   those blocks through grouped `send_recv` and has an autograd wrapper that
   sends owner-gradient blocks around the reverse ring so K/V owners receive
-  accumulated gradients without all-gather. Full industrial CP training still
-  needs a fused CUDA ring-attention kernel and a lower-latency reduce-scatter
-  ring schedule to replace the current per-owner ring accumulation.
+  accumulated gradients without all-gather. Ring-exchanged KV attention now
+  uses a recompute-autograd path: forward saves Q/K/V inputs and block
+  metadata, not per-block score/probability tensors; backward recomputes the
+  streaming attention and returns gradients to the ring-exchange owner-gradient
+  path. Full industrial CP training still needs a fused CUDA ring-attention
+  kernel and a lower-latency reduce-scatter ring schedule to replace the
+  current per-owner ring accumulation.
 - `qwen3_5_pp_tp_ppo_trainer`: accepts DP/PP/CP/TP topology dimensions and
   records all four axes in metrics and checkpoint manifests. For `CP>1,TP=1`,
   PP stages now pass local sequence shards, Qwen range forward keeps
@@ -255,8 +259,8 @@ WORLD_SIZE=4 CUDA_VISIBLE_DEVICES=0,1,2,3 examples/run_cp_attention_nccl_smoke.s
 CPU regression coverage includes:
 
 - `test_distributed_topology`: CP topology, padded sequence sharding,
-  streaming causal attention math, CP=3 ring exchange owner-gradient
-  accumulation, and gather/ring-exchange KV gradient checks.
+  streaming and recompute ring-attention math, CP=3 ring exchange
+  owner-gradient accumulation, and gather/ring-exchange KV gradient checks.
 - `test_qwen3_5_cp_forward`: synthetic Qwen3.5 full-attention layer with
   deterministic weights, validating that CP rank-local forward shards match
   the corresponding dense forward slices.

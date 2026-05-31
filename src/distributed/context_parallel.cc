@@ -50,6 +50,48 @@ std::vector<int64_t> group_vector_from_tensor(const torch::Tensor& tensor) {
   return group;
 }
 
+torch::Tensor vector_to_cpu_i64_tensor(const std::vector<int64_t>& values) {
+  return torch::tensor(values, torch::TensorOptions().dtype(torch::kLong).device(torch::kCPU));
+}
+
+std::vector<int64_t> vector_from_cpu_i64_tensor(const torch::Tensor& tensor) {
+  auto cpu = tensor.to(torch::kCPU).contiguous();
+  std::vector<int64_t> values;
+  values.reserve(static_cast<size_t>(cpu.numel()));
+  auto accessor = cpu.accessor<int64_t, 1>();
+  for (int64_t i = 0; i < cpu.numel(); ++i) {
+    values.push_back(accessor[i]);
+  }
+  return values;
+}
+
+torch::Tensor streaming_attention_from_ring_blocks(const torch::Tensor& query_local,
+                                                   const torch::Tensor& key_ring,
+                                                   const torch::Tensor& value_ring,
+                                                   const std::vector<int64_t>& key_begin_positions,
+                                                   int64_t query_begin,
+                                                   int64_t original_sequence_length,
+                                                   int64_t shard_size,
+                                                   double scale) {
+  if (shard_size <= 0) {
+    throw std::invalid_argument("CP ring attention shard_size must be positive");
+  }
+  if (key_ring.size(2) != value_ring.size(2) ||
+      key_ring.size(2) < shard_size * static_cast<int64_t>(key_begin_positions.size())) {
+    throw std::invalid_argument("CP ring attention KV ring shape does not match block metadata");
+  }
+  std::vector<torch::Tensor> key_blocks;
+  std::vector<torch::Tensor> value_blocks;
+  key_blocks.reserve(key_begin_positions.size());
+  value_blocks.reserve(key_begin_positions.size());
+  for (size_t i = 0; i < key_begin_positions.size(); ++i) {
+    key_blocks.push_back(key_ring.narrow(2, static_cast<int64_t>(i) * shard_size, shard_size).contiguous());
+    value_blocks.push_back(value_ring.narrow(2, static_cast<int64_t>(i) * shard_size, shard_size).contiguous());
+  }
+  return context_parallel_causal_attention_streaming_blocks(
+      query_local, key_blocks, value_blocks, key_begin_positions, query_begin, original_sequence_length, scale);
+}
+
 class ContextParallelGatherFunction final
     : public torch::autograd::Function<ContextParallelGatherFunction> {
  public:
@@ -169,6 +211,58 @@ class ContextParallelRingExchangeFunction final
       local = local.transpose(0, dim).contiguous();
     }
     return {local, torch::Tensor(), torch::Tensor(), torch::Tensor(), torch::Tensor()};
+  }
+};
+
+class ContextParallelRingAttentionRecomputeFunction final
+    : public torch::autograd::Function<ContextParallelRingAttentionRecomputeFunction> {
+ public:
+  static torch::Tensor forward(torch::autograd::AutogradContext* ctx,
+                               torch::Tensor query_local,
+                               torch::Tensor key_ring,
+                               torch::Tensor value_ring,
+                               torch::Tensor key_begin_positions,
+                               int64_t query_begin,
+                               int64_t original_sequence_length,
+                               int64_t shard_size,
+                               double scale) {
+    require_attention_tensor(query_local, "query_local");
+    require_attention_tensor(key_ring, "key_ring");
+    require_attention_tensor(value_ring, "value_ring");
+    ctx->saved_data["query_begin"] = query_begin;
+    ctx->saved_data["original_sequence_length"] = original_sequence_length;
+    ctx->saved_data["shard_size"] = shard_size;
+    ctx->saved_data["scale"] = scale;
+    ctx->save_for_backward({query_local, key_ring, value_ring, key_begin_positions});
+    return streaming_attention_from_ring_blocks(query_local,
+                                                key_ring,
+                                                value_ring,
+                                                vector_from_cpu_i64_tensor(key_begin_positions),
+                                                query_begin,
+                                                original_sequence_length,
+                                                shard_size,
+                                                scale);
+  }
+
+  static torch::autograd::tensor_list backward(torch::autograd::AutogradContext* ctx,
+                                               torch::autograd::tensor_list grad_outputs) {
+    auto saved = ctx->get_saved_variables();
+    const int64_t query_begin = ctx->saved_data["query_begin"].toInt();
+    const int64_t original_sequence_length = ctx->saved_data["original_sequence_length"].toInt();
+    const int64_t shard_size = ctx->saved_data["shard_size"].toInt();
+    const double scale = ctx->saved_data["scale"].toDouble();
+    const auto key_begin_positions = vector_from_cpu_i64_tensor(saved.at(3));
+
+    torch::AutoGradMode enable_grad(true);
+    auto query = saved.at(0).detach().set_requires_grad(true);
+    auto key = saved.at(1).detach().set_requires_grad(true);
+    auto value = saved.at(2).detach().set_requires_grad(true);
+    auto out = streaming_attention_from_ring_blocks(
+        query, key, value, key_begin_positions, query_begin, original_sequence_length, shard_size, scale);
+    auto grads = torch::autograd::grad(
+        {out}, {query, key, value}, {grad_outputs.at(0).contiguous()}, false, false, true);
+    return {grads.at(0), grads.at(1), grads.at(2), torch::Tensor(), torch::Tensor(), torch::Tensor(), torch::Tensor(),
+            torch::Tensor()};
   }
 };
 
@@ -443,6 +537,29 @@ torch::Tensor context_parallel_causal_attention_streaming_blocks(
   return out;
 }
 
+torch::Tensor context_parallel_causal_attention_ring_blocks_recompute(
+    const torch::Tensor& query_local,
+    const torch::Tensor& key_ring,
+    const torch::Tensor& value_ring,
+    const std::vector<int64_t>& key_begin_positions,
+    int64_t query_begin,
+    int64_t original_sequence_length,
+    int64_t shard_size,
+    double scale) {
+  if (key_begin_positions.empty()) {
+    throw std::invalid_argument("CP recompute ring attention requires at least one KV block");
+  }
+  auto positions = vector_to_cpu_i64_tensor(key_begin_positions);
+  return ContextParallelRingAttentionRecomputeFunction::apply(query_local.contiguous(),
+                                                              key_ring.contiguous(),
+                                                              value_ring.contiguous(),
+                                                              positions,
+                                                              query_begin,
+                                                              original_sequence_length,
+                                                              shard_size,
+                                                              scale);
+}
+
 torch::Tensor context_parallel_causal_attention_gather_kv(const torch::Tensor& query_local,
                                                           const torch::Tensor& key_local,
                                                           const torch::Tensor& value_local,
@@ -553,11 +670,7 @@ torch::Tensor context_parallel_causal_attention_ring_exchange_kv(const torch::Te
       context_parallel_ring_exchange_autograd(value_local.contiguous(), collectives, context_group, context_rank, 2)
           .contiguous();
   const auto schedule = context_parallel_ring_schedule(context_group, context_group.at(static_cast<size_t>(context_rank)));
-  std::vector<torch::Tensor> key_blocks;
-  std::vector<torch::Tensor> value_blocks;
   std::vector<int64_t> key_begin_positions;
-  key_blocks.reserve(schedule.size());
-  value_blocks.reserve(schedule.size());
   key_begin_positions.reserve(schedule.size());
   for (size_t i = 0; i < schedule.size(); ++i) {
     const int64_t rank_index = context_parallel_group_index(context_group, schedule[i].kv_rank);
@@ -565,12 +678,10 @@ torch::Tensor context_parallel_causal_attention_ring_exchange_kv(const torch::Te
     if (begin >= original_sequence_length) {
       continue;
     }
-    key_blocks.push_back(key_ring.narrow(2, static_cast<int64_t>(i) * shard, shard).contiguous());
-    value_blocks.push_back(value_ring.narrow(2, static_cast<int64_t>(i) * shard, shard).contiguous());
     key_begin_positions.push_back(begin);
   }
-  return context_parallel_causal_attention_streaming_blocks(
-      query_local, key_blocks, value_blocks, key_begin_positions, context_rank * shard, original_sequence_length, scale);
+  return context_parallel_causal_attention_ring_blocks_recompute(
+      query_local, key_ring, value_ring, key_begin_positions, context_rank * shard, original_sequence_length, shard, scale);
 }
 
 }  // namespace cverl::distributed
