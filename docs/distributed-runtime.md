@@ -245,10 +245,13 @@ Current code exposes the distributed shape directly:
   `dq/dk/dv`, instead of recomputing that scalar inside every KV-row CTA. For
   Qwen-sized heads (`D,V<=128`), the CUDA `dk/dv` CTA computes each
   query-key score and `dot(grad_out, value_key)` once, then shares those
-  scalars across D/V lanes for the local KV row. Full industrial CP training
-  still needs multi-row tile/shared-memory accumulation, while the NCCL backend
-  now caches subgroup communicators with `ncclCommSplit` so CP groups can use the
-  reduce-scatter path directly when the installed NCCL version supports it.
+  scalars across D/V lanes for the local KV row. The CUDA path accepts fp32,
+  fp16, and bf16 Q/K/V/grad tensors while keeping LSE and scalar reductions in
+  fp32, so Qwen bf16 CP training does not have to fall back to eager attention.
+  Full industrial CP training still needs multi-row tile/shared-memory
+  accumulation, while the NCCL backend now caches subgroup communicators with
+  `ncclCommSplit` so CP groups can use the reduce-scatter path directly when
+  the installed NCCL version supports it.
 - `qwen3_5_pp_tp_ppo_trainer`: accepts DP/PP/CP/TP topology dimensions and
   records all four axes in metrics and checkpoint manifests. For `CP>1,TP=1`,
   PP stages now pass local sequence shards, Qwen range forward keeps
@@ -271,7 +274,12 @@ Current code exposes the distributed shape directly:
 The next efficiency step is replacing the eager CP exchange paths with fused
 ring-attention and recurrent-state/ring CUDA kernels, using a lower-latency
 backward reduce-scatter schedule, and grouping PP send/recv plus TP/DP/CP
-collectives into larger scheduled communication batches.
+collectives into larger scheduled communication batches. Reuse candidates
+should be preferred over local kernels where they cover the needed abstraction:
+NVIDIA TransformerEngine is the first target for production fp8/bf16/fp16
+Transformer building blocks, fused normalization/linear paths, and scaling
+metadata once the C++ ABI and tensor ownership can be integrated cleanly with
+cverl's PP/TP/CP scheduler.
 
 Run the CP/NCCL smoke on a multi-GPU node with:
 

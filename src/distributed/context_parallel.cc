@@ -37,6 +37,10 @@ void require_attention_tensor(const torch::Tensor& tensor, const char* name) {
   }
 }
 
+bool is_cuda_cp_attention_dtype(torch::ScalarType dtype) {
+  return dtype == torch::kFloat32 || dtype == torch::kFloat16 || dtype == torch::kBFloat16;
+}
+
 torch::Tensor group_tensor_from_vector(const std::vector<int64_t>& group) {
   return torch::tensor(group, torch::TensorOptions().dtype(torch::kLong).device(torch::kCPU));
 }
@@ -242,8 +246,9 @@ class ContextParallelRingAttentionRecomputeFunction final
     ctx->saved_data["scale"] = scale;
     const auto positions = vector_from_cpu_i64_tensor(key_begin_positions);
     if (cp_attention_cuda_available() && query_local.is_cuda() && key_ring.is_cuda() && value_ring.is_cuda() &&
-        query_local.scalar_type() == torch::kFloat32 && key_ring.scalar_type() == torch::kFloat32 &&
-        value_ring.scalar_type() == torch::kFloat32) {
+        is_cuda_cp_attention_dtype(query_local.scalar_type()) &&
+        key_ring.scalar_type() == query_local.scalar_type() &&
+        value_ring.scalar_type() == query_local.scalar_type()) {
       auto out_lse = cp_ring_attention_cuda_forward_with_lse(
           query_local, key_ring, value_ring, positions, query_begin, original_sequence_length, shard_size, scale);
       ctx->save_for_backward({query_local, key_ring, value_ring, key_begin_positions, out_lse.at(1)});
@@ -270,9 +275,10 @@ class ContextParallelRingAttentionRecomputeFunction final
     const auto key_begin_positions = vector_from_cpu_i64_tensor(saved.at(3));
 
     if (cp_attention_cuda_available() && saved.at(0).is_cuda() && saved.at(1).is_cuda() && saved.at(2).is_cuda() &&
-        saved.at(0).scalar_type() == torch::kFloat32 && saved.at(1).scalar_type() == torch::kFloat32 &&
-        saved.at(2).scalar_type() == torch::kFloat32 && grad_outputs.at(0).is_cuda() &&
-        grad_outputs.at(0).scalar_type() == torch::kFloat32) {
+        is_cuda_cp_attention_dtype(saved.at(0).scalar_type()) &&
+        saved.at(1).scalar_type() == saved.at(0).scalar_type() &&
+        saved.at(2).scalar_type() == saved.at(0).scalar_type() && grad_outputs.at(0).is_cuda() &&
+        grad_outputs.at(0).scalar_type() == saved.at(0).scalar_type()) {
       auto grads = saved.size() > 4 && saved.at(4).defined()
                        ? cp_ring_attention_cuda_backward_with_lse(grad_outputs.at(0).contiguous(),
                                                                   saved.at(0).contiguous(),
