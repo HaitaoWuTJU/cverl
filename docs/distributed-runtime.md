@@ -131,6 +131,8 @@ The runtime config separates memory decisions from model code:
 - Flat sharded AdamW keeps grad-norm math on device and transfers one compact
   norm tensor to host per step. Avoid splitting this back into separate
   `Tensor::item()` calls on local norm, global norm, and clipped norm.
+- Non-flat AdamW exposes tensor-valued grad norm helpers so the PP/TP trainer
+  can pack local sq norm, global sq norm, and local norm into one host transfer.
 - Flat DP optimizer skips reduce-scatter and parameter all-gather when
   `DP=1`; PP/TP-only runs should not pay for degenerate DP collectives.
 - DP flat optimizer checkpoints default to shard-only format: each DP rank

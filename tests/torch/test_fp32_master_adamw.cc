@@ -49,6 +49,12 @@ int main() {
         optimizer.main_grad_parameters()[0].pow(2).sum().item<double>();
     const double tiny_grad_sq = optimizer.grad_l2_norm_sq();
     require(std::abs(tiny_grad_sq - expected_tiny_grad_sq) < 1.0e-10, "grad_l2_norm_sq before scaling");
+    require_allclose(optimizer.grad_l2_norm_sq_tensor(),
+                     torch::tensor({static_cast<float>(expected_tiny_grad_sq)}, torch::kFloat32),
+                     "grad_l2_norm_sq_tensor before scaling");
+    require_allclose(optimizer.grad_norm_sum_tensor(),
+                     optimizer.main_grad_parameters()[0].norm().reshape({1}),
+                     "grad_norm_sum_tensor before scaling");
     optimizer.scale_gradients(0.5);
     require(std::abs(optimizer.grad_l2_norm_sq() - expected_tiny_grad_sq * 0.25) < 1.0e-10,
             "grad_l2_norm_sq after scaling");

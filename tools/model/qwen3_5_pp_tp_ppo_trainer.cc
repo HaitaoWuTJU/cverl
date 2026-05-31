@@ -140,7 +140,7 @@ void zero_model_gradients(const std::vector<torch::Tensor>& params) {
   }
 }
 
-double grad_l2_norm_sq(const std::vector<torch::Tensor>& params) {
+torch::Tensor grad_l2_norm_sq_tensor(const std::vector<torch::Tensor>& params, torch::Device fallback_device) {
   torch::Tensor total;
   for (const auto& p : params) {
     if (!p.defined() || !p.grad().defined()) {
@@ -155,10 +155,13 @@ double grad_l2_norm_sq(const std::vector<torch::Tensor>& params) {
       total = total + term.to(total.device());
     }
   }
-  return total.defined() ? total.item<double>() : 0.0;
+  if (total.defined()) {
+    return total.to(torch::kFloat32).reshape({1});
+  }
+  return torch::zeros({1}, torch::TensorOptions().device(fallback_device).dtype(torch::kFloat32));
 }
 
-double grad_norm_sum(const std::vector<torch::Tensor>& params) {
+torch::Tensor grad_norm_sum_tensor(const std::vector<torch::Tensor>& params, torch::Device fallback_device) {
   torch::Tensor total;
   for (const auto& p : params) {
     if (!p.defined() || !p.grad().defined()) {
@@ -173,7 +176,10 @@ double grad_norm_sum(const std::vector<torch::Tensor>& params) {
       total = total + term.to(total.device());
     }
   }
-  return total.defined() ? total.item<double>() : 0.0;
+  if (total.defined()) {
+    return total.to(torch::kFloat32).reshape({1});
+  }
+  return torch::zeros({1}, torch::TensorOptions().device(fallback_device).dtype(torch::kFloat32));
 }
 
 void scale_model_gradients(const std::vector<torch::Tensor>& params, double scale) {
@@ -1793,18 +1799,26 @@ int main(int argc, char** argv) {
             params, dp_comm, dp_group.ranks, true, dp_grad_bucket_bytes);
       }
       if (!flat_step_done) {
-        local_grad_norm_sq =
-            dp_flat_shard_optimizer
-                ? flat_gradient_shard.pow(2).sum().item<double>()
-                : (dp_shard_optimizer ? grad_l2_norm_sq(params) : optimizer.grad_l2_norm_sq());
         auto grad_sq_tensor =
-            torch::tensor({local_grad_norm_sq}, torch::TensorOptions().device(device).dtype(torch::kFloat32));
+            dp_flat_shard_optimizer
+                ? flat_gradient_shard.pow(2).sum().to(torch::kFloat32).reshape({1})
+                : (dp_shard_optimizer ? grad_l2_norm_sq_tensor(params, device) : optimizer.grad_l2_norm_sq_tensor());
+        auto local_norm_tensor =
+            dp_flat_shard_optimizer
+                ? flat_gradient_shard.norm().to(torch::kFloat32).reshape({1})
+                : (dp_shard_optimizer ? grad_norm_sum_tensor(params, device) : optimizer.grad_norm_sum_tensor());
         auto global_grad_sq_tensor =
             dp_flat_shard_optimizer
                 ? full_comm.all_reduce(grad_sq_tensor.contiguous(), cverl::distributed::ReduceOp::Sum, full_ranks)
                 : model_comm.all_reduce(
                       grad_sq_tensor.contiguous(), cverl::distributed::ReduceOp::Sum, full_group(model_parallel_size));
-        global_grad_norm = std::sqrt(static_cast<double>(global_grad_sq_tensor.cpu()[0].item<float>()));
+        auto grad_metrics =
+            torch::cat({grad_sq_tensor.contiguous(), global_grad_sq_tensor.contiguous(), local_norm_tensor.contiguous()},
+                       0)
+                .to(torch::kCPU)
+                .contiguous();
+        local_grad_norm_sq = static_cast<double>(grad_metrics[0].item<float>());
+        global_grad_norm = std::sqrt(static_cast<double>(grad_metrics[1].item<float>()));
         if (max_grad_norm > 0.0 && std::isfinite(global_grad_norm) && global_grad_norm > max_grad_norm) {
           grad_clip_scale = max_grad_norm / (global_grad_norm + 1.0e-6);
           if (dp_flat_shard_optimizer) {
@@ -1815,10 +1829,7 @@ int main(int argc, char** argv) {
             optimizer.scale_gradients(grad_clip_scale);
           }
         }
-        local_grad_norm =
-            dp_flat_shard_optimizer
-                ? flat_gradient_shard.norm().item<double>()
-                : (dp_shard_optimizer ? grad_norm_sum(params) : optimizer.grad_norm_sum());
+        local_grad_norm = static_cast<double>(grad_metrics[2].item<float>()) * grad_clip_scale;
       }
       if (!skip_optimizer_step) {
         if (!dp_flat_shard_optimizer) {
