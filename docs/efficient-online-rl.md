@@ -38,10 +38,11 @@ Implemented foundation:
 - NCCL test coverage inside `test_nccl_collectives`
 - NCCL rollout batch test coverage inside `test_nccl_gpu_batch_transport`
 
-`NCCLGpuBatchSender` sends one descriptor header followed by dtype-coalesced
-GPU slabs. A typical PPO rollout batch has int64 token/group IDs and float
-mask/logprob/reward/advantage tensors, so the data plane uses header + int64
-slab + float slab instead of one NCCL message per tensor.
+`NCCLGpuBatchSender` sends one descriptor header followed by direct per-tensor
+GPU payloads by default. This avoids building temporary dtype slabs for
+prompt/response token IDs, masks, logprobs, rewards, and advantages. Set
+`CVERL_GPU_BATCH_NCCL_MODE=slab` to coalesce by dtype when fewer NCCL messages
+are more important than avoiding temporary GPU copies.
 
 `gsm8k_grpo_trainer` may still export HF checkpoints for debugging or offline
 inspection, but checkpoint reload is not the intended online parameter-update

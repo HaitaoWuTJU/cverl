@@ -1,16 +1,25 @@
 #include "cverl/rollout/nccl_gpu_batch_transport.h"
 
+#include <cstdlib>
 #include <stdexcept>
+#include <string>
+#include <utility>
 #include <vector>
 
 namespace cverl::rollout {
 namespace {
 
 constexpr int64_t kMagic = 0x4356524c42415443LL;  // CVRLBATC
-constexpr int64_t kVersion = 1;
+constexpr int64_t kVersion = 2;
 constexpr int64_t kMaxTensors = 8;
 constexpr int64_t kWordsPerTensor = 8;  // kind,dtype,ndim,shape[0..3],reserved
-constexpr int64_t kHeaderWords = 8 + kMaxTensors * kWordsPerTensor;
+constexpr int64_t kHeaderPrefixWords = 9;
+constexpr int64_t kHeaderWords = kHeaderPrefixWords + kMaxTensors * kWordsPerTensor;
+
+enum class NcclBatchPayloadMode : int64_t {
+  SlabByDType = 0,
+  DirectTensor = 1,
+};
 
 bool tensor_defined(const torch::Tensor& t) {
   return t.defined() && t.numel() > 0;
@@ -24,6 +33,21 @@ void require_cuda_payload(const torch::Tensor& tensor, const char* name) {
   if (!tensor.defined() || !tensor.is_cuda() || !tensor.is_contiguous()) {
     throw std::invalid_argument(std::string(name) + " must be a contiguous CUDA tensor");
   }
+}
+
+NcclBatchPayloadMode payload_mode_from_env() {
+  const char* env = std::getenv("CVERL_GPU_BATCH_NCCL_MODE");
+  if (env == nullptr || *env == '\0') {
+    return NcclBatchPayloadMode::DirectTensor;
+  }
+  const std::string mode(env);
+  if (mode == "direct" || mode == "tensor" || mode == "per_tensor") {
+    return NcclBatchPayloadMode::DirectTensor;
+  }
+  if (mode == "slab" || mode == "dtype_slab" || mode == "coalesced") {
+    return NcclBatchPayloadMode::SlabByDType;
+  }
+  throw std::invalid_argument("CVERL_GPU_BATCH_NCCL_MODE must be direct|tensor|per_tensor|slab|dtype_slab|coalesced");
 }
 
 void add_desc(std::vector<GpuRolloutTensorDescriptor>* out,
@@ -92,7 +116,9 @@ void set_tensor_for_kind(GpuRolloutBatch* batch, GpuRolloutTensorKind kind, torc
   throw std::invalid_argument("unknown rollout tensor kind");
 }
 
-torch::Tensor pack_header(const GpuRolloutBatchDescriptor& desc, int device_index) {
+torch::Tensor pack_header(const GpuRolloutBatchDescriptor& desc,
+                          int device_index,
+                          NcclBatchPayloadMode payload_mode) {
   if (static_cast<int64_t>(desc.tensors.size()) > kMaxTensors) {
     throw std::invalid_argument("too many tensors in GpuRolloutBatchDescriptor");
   }
@@ -105,10 +131,11 @@ torch::Tensor pack_header(const GpuRolloutBatchDescriptor& desc, int device_inde
   p[4] = desc.prompt_len;
   p[5] = desc.response_len;
   p[6] = desc.weight_version;
-  p[7] = static_cast<int64_t>(desc.tensors.size());
+  p[7] = static_cast<int64_t>(payload_mode);
+  p[8] = static_cast<int64_t>(desc.tensors.size());
   for (size_t i = 0; i < desc.tensors.size(); ++i) {
     const auto& t = desc.tensors[i];
-    const size_t off = 8 + i * kWordsPerTensor;
+    const size_t off = kHeaderPrefixWords + i * kWordsPerTensor;
     p[off + 0] = static_cast<int64_t>(t.kind);
     p[off + 1] = static_cast<int64_t>(t.dtype);
     p[off + 2] = static_cast<int64_t>(t.shape.size());
@@ -122,7 +149,7 @@ torch::Tensor pack_header(const GpuRolloutBatchDescriptor& desc, int device_inde
   return cpu.to(torch::Device(torch::kCUDA, device_index), /*non_blocking=*/false).contiguous();
 }
 
-GpuRolloutBatchDescriptor unpack_header(const torch::Tensor& header) {
+std::pair<GpuRolloutBatchDescriptor, NcclBatchPayloadMode> unpack_header(const torch::Tensor& header) {
   auto cpu = header.to(torch::kCPU).contiguous();
   const auto* p = cpu.data_ptr<int64_t>();
   if (p[0] != kMagic || p[1] != kVersion) {
@@ -134,13 +161,18 @@ GpuRolloutBatchDescriptor unpack_header(const torch::Tensor& header) {
   desc.prompt_len = p[4];
   desc.response_len = p[5];
   desc.weight_version = p[6];
-  const int64_t n = p[7];
+  const auto payload_mode = static_cast<NcclBatchPayloadMode>(p[7]);
+  if (payload_mode != NcclBatchPayloadMode::SlabByDType &&
+      payload_mode != NcclBatchPayloadMode::DirectTensor) {
+    throw std::runtime_error("invalid NCCL GPU rollout batch payload mode");
+  }
+  const int64_t n = p[8];
   if (n < 0 || n > kMaxTensors) {
     throw std::runtime_error("invalid tensor count in NCCL GPU rollout batch header");
   }
   desc.tensors.reserve(static_cast<size_t>(n));
   for (int64_t i = 0; i < n; ++i) {
-    const size_t off = 8 + static_cast<size_t>(i) * kWordsPerTensor;
+    const size_t off = kHeaderPrefixWords + static_cast<size_t>(i) * kWordsPerTensor;
     GpuRolloutTensorDescriptor t;
     t.kind = static_cast<GpuRolloutTensorKind>(p[off + 0]);
     t.dtype = static_cast<GpuIpcDType>(p[off + 1]);
@@ -154,7 +186,7 @@ GpuRolloutBatchDescriptor unpack_header(const torch::Tensor& header) {
     }
     desc.tensors.push_back(std::move(t));
   }
-  return desc;
+  return {std::move(desc), payload_mode};
 }
 
 std::vector<GpuIpcDType> rollout_dtype_order() {
@@ -241,8 +273,17 @@ GpuRolloutBatchDescriptor describe_gpu_rollout_batch(const GpuRolloutBatch& batc
 void NCCLGpuBatchSender::send(const GpuRolloutBatch& batch, int64_t peer) {
   auto desc = describe_gpu_rollout_batch(batch);
   int device = first_payload_device(batch, desc);
-  auto header = pack_header(desc, device);
+  const auto payload_mode = payload_mode_from_env();
+  auto header = pack_header(desc, device, payload_mode);
   comm_.send(header.contiguous(), peer);
+  if (payload_mode == NcclBatchPayloadMode::DirectTensor) {
+    for (const auto& t : desc.tensors) {
+      auto tensor = tensor_for_kind(batch, t.kind);
+      require_cuda_payload(tensor, "GpuRolloutBatch tensor");
+      comm_.send(tensor, peer);
+    }
+    return;
+  }
   for (GpuIpcDType dtype : rollout_dtype_order()) {
     if (!descriptor_has_dtype(desc, dtype)) {
       continue;
@@ -259,7 +300,20 @@ GpuRolloutBatch NCCLGpuBatchReceiver::recv(int64_t peer) {
                                       .dtype(torch::kInt64));
   auto header = comm_.recv_like(header_like.contiguous(), peer);
   GpuRolloutBatch batch;
-  batch.descriptor = unpack_header(header);
+  auto unpacked = unpack_header(header);
+  batch.descriptor = std::move(unpacked.first);
+  const auto payload_mode = unpacked.second;
+  if (payload_mode == NcclBatchPayloadMode::DirectTensor) {
+    for (const auto& t : batch.descriptor.tensors) {
+      auto like = torch::empty(t.shape,
+                               torch::TensorOptions()
+                                   .device(torch::Device(torch::kCUDA, device_index_))
+                                   .dtype(torch_dtype_from_gpu_ipc(t.dtype)));
+      auto tensor = comm_.recv_like(like.contiguous(), peer);
+      set_tensor_for_kind(&batch, t.kind, tensor);
+    }
+    return batch;
+  }
   for (GpuIpcDType dtype : rollout_dtype_order()) {
     int64_t total_numel = 0;
     for (const auto& t : batch.descriptor.tensors) {
