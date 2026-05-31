@@ -242,11 +242,12 @@ Current code exposes the distributed shape directly:
   and saves per-query log-sum-exp metadata for backward. CUDA `dq/dk/dv`
   backward uses that saved LSE instead of recomputing row max/sum. Backward now
   precomputes per-query `dot(grad_out, out)` once and shares it across
-  `dq/dk/dv`, instead of recomputing that scalar inside every KV-row CTA. The
-  first CUDA `dk/dv` backward still computes one KV row per CTA, so full
-  industrial CP training still needs tile/shared-memory optimization, while
-  the NCCL backend now caches subgroup communicators with `ncclCommSplit` so
-  CP groups can use the
+  `dq/dk/dv`, instead of recomputing that scalar inside every KV-row CTA. For
+  Qwen-sized heads (`D,V<=128`), the CUDA `dk/dv` CTA computes each
+  query-key score and `dot(grad_out, value_key)` once, then shares those
+  scalars across D/V lanes for the local KV row. Full industrial CP training
+  still needs multi-row tile/shared-memory accumulation, while the NCCL backend
+  now caches subgroup communicators with `ncclCommSplit` so CP groups can use the
   reduce-scatter path directly when the installed NCCL version supports it.
 - `qwen3_5_pp_tp_ppo_trainer`: accepts DP/PP/CP/TP topology dimensions and
   records all four axes in metrics and checkpoint manifests. For `CP>1,TP=1`,

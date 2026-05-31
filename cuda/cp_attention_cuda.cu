@@ -373,6 +373,71 @@ __global__ void cp_ring_attention_backward_kv_kernel(const float* __restrict__ g
     return;
   }
 
+  if (D <= blockDim.x && V <= blockDim.x) {
+    __shared__ float reduction[kCpAttentionThreads];
+    __shared__ float shared_score;
+    __shared__ float shared_dot_go_v;
+    __shared__ float grad_k_shared[kCpAttentionThreads];
+    __shared__ float grad_v_shared[kCpAttentionThreads];
+
+    if (threadIdx.x < D) {
+      grad_k_shared[threadIdx.x] = 0.0f;
+    }
+    if (threadIdx.x < V) {
+      grad_v_shared[threadIdx.x] = 0.0f;
+    }
+    __syncthreads();
+
+    for (int tq = 0; tq < Tq; ++tq) {
+      const int q_pos = query_begin + tq;
+      const float row_lse = lse[(b * H + h) * Tq + tq];
+      const bool valid = q_pos >= key_pos && q_pos < original_sequence_length && isfinite(row_lse);
+      const int q_base = q_bh_base + tq * D;
+      const int go_base = go_bh_base + tq * V;
+
+      float score_part = 0.0f;
+      if (valid && threadIdx.x < D) {
+        score_part = q[q_base + threadIdx.x] * k[k_base + threadIdx.x];
+      }
+      const float score = block_reduce_sum(score_part, reduction);
+      if (threadIdx.x == 0) {
+        shared_score = score;
+      }
+      __syncthreads();
+
+      float dot_part = 0.0f;
+      if (valid && threadIdx.x < V) {
+        dot_part = grad_out[go_base + threadIdx.x] * v[v_base + threadIdx.x];
+      }
+      const float dot_go_v = block_reduce_sum(dot_part, reduction);
+      if (threadIdx.x == 0) {
+        shared_dot_go_v = dot_go_v;
+      }
+      __syncthreads();
+
+      if (valid) {
+        const float prob = expf(shared_score * scale - row_lse);
+        if (threadIdx.x < D) {
+          const float dot_go_o = query_dot[(b * H + h) * Tq + tq];
+          grad_k_shared[threadIdx.x] +=
+              prob * (shared_dot_go_v - dot_go_o) * q[q_base + threadIdx.x] * scale;
+        }
+        if (threadIdx.x < V) {
+          grad_v_shared[threadIdx.x] += prob * grad_out[go_base + threadIdx.x];
+        }
+      }
+      __syncthreads();
+    }
+
+    if (threadIdx.x < D) {
+      dk[k_base + threadIdx.x] = grad_k_shared[threadIdx.x];
+    }
+    if (threadIdx.x < V) {
+      dv[v_base + threadIdx.x] = grad_v_shared[threadIdx.x];
+    }
+    return;
+  }
+
   for (int d = threadIdx.x; d < D; d += blockDim.x) {
     float grad_k = 0.0f;
     for (int tq = 0; tq < Tq; ++tq) {
