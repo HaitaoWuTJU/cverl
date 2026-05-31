@@ -419,6 +419,129 @@ __global__ void qwen_linear_attn_backward_kernel(const float* __restrict__ grad_
   }
 }
 
+__global__ void qwen_linear_attn_backward_tiled_kernel(const float* __restrict__ grad_out,
+                                                       const float* __restrict__ q,
+                                                       const float* __restrict__ k,
+                                                       const float* __restrict__ v,
+                                                       const float* __restrict__ beta,
+                                                       const float* __restrict__ g,
+                                                       const float* __restrict__ states,
+                                                       float* __restrict__ dq,
+                                                       float* __restrict__ dk,
+                                                       float* __restrict__ dv,
+                                                       float* __restrict__ dbeta,
+                                                       float* __restrict__ dg,
+                                                       int B,
+                                                       int H,
+                                                       int T,
+                                                       int K,
+                                                       int V,
+                                                       int value_tile) {
+  int bh = blockIdx.x;
+  int b = bh / H;
+  int h = bh - b * H;
+  const int tile_begin = blockIdx.y * value_tile;
+  const int tile_cols = value_tile < (V - tile_begin) ? value_tile : (V - tile_begin);
+  if (tile_cols <= 0) {
+    return;
+  }
+
+  extern __shared__ float shared[];
+  float* dstate = shared;
+  float* dspre = shared + K * tile_cols;
+  const int state_elems = K * tile_cols;
+  for (int idx = threadIdx.x; idx < state_elems * 2; idx += blockDim.x) {
+    shared[idx] = 0.0f;
+  }
+  __syncthreads();
+
+  const int q_base = (((b * H + h) * T) * K);
+  const int v_base = (((b * H + h) * T) * V);
+  const int scalar_base = ((b * H + h) * T);
+  const int state_base = ((((b * H + h) * T) * K) * V);
+  for (int t = T - 1; t >= 0; --t) {
+    const float et = expf(g[scalar_base + t]);
+
+    for (int kk = threadIdx.x; kk < K; kk += blockDim.x) {
+      float acc = 0.0f;
+      for (int local_j = 0; local_j < tile_cols; ++local_j) {
+        const int j = tile_begin + local_j;
+        acc += states[state_base + t * K * V + kk * V + j] * grad_out[v_base + t * V + j];
+      }
+      atomicAdd(&dq[q_base + t * K + kk], acc);
+    }
+    for (int idx = threadIdx.x; idx < state_elems; idx += blockDim.x) {
+      const int kk = idx / tile_cols;
+      const int local_j = idx - kk * tile_cols;
+      const int j = tile_begin + local_j;
+      dstate[idx] += q[q_base + t * K + kk] * grad_out[v_base + t * V + j];
+      dspre[idx] = dstate[idx];
+    }
+    __syncthreads();
+
+    for (int local_j = threadIdx.x; local_j < tile_cols; local_j += blockDim.x) {
+      const int j = tile_begin + local_j;
+      float ddelta = 0.0f;
+      for (int kk = 0; kk < K; ++kk) {
+        ddelta += dstate[kk * tile_cols + local_j] * k[q_base + t * K + kk];
+      }
+      dv[v_base + t * V + j] = ddelta * beta[scalar_base + t];
+    }
+    for (int kk = threadIdx.x; kk < K; kk += blockDim.x) {
+      float acc = 0.0f;
+      for (int local_j = 0; local_j < tile_cols; ++local_j) {
+        const int j = tile_begin + local_j;
+        const float s_prev = (t == 0) ? 0.0f : states[state_base + (t - 1) * K * V + kk * V + j];
+        const float s_pre = s_prev * et;
+        float kv = 0.0f;
+        for (int kk2 = 0; kk2 < K; ++kk2) {
+          const float sp = (t == 0) ? 0.0f : states[state_base + (t - 1) * K * V + kk2 * V + j] * et;
+          kv += sp * k[q_base + t * K + kk2];
+        }
+        const float delta = (v[v_base + t * V + j] - kv) * beta[scalar_base + t];
+        float ddelta = 0.0f;
+        for (int kk2 = 0; kk2 < K; ++kk2) {
+          ddelta += dstate[kk2 * tile_cols + local_j] * k[q_base + t * K + kk2];
+        }
+        acc += dstate[kk * tile_cols + local_j] * delta - s_pre * ddelta * beta[scalar_base + t];
+      }
+      atomicAdd(&dk[q_base + t * K + kk], acc);
+    }
+    if (threadIdx.x == 0) {
+      float db = 0.0f;
+      for (int local_j = 0; local_j < tile_cols; ++local_j) {
+        const int j = tile_begin + local_j;
+        float kv = 0.0f;
+        for (int kk = 0; kk < K; ++kk) {
+          const float s_prev = (t == 0) ? 0.0f : states[state_base + (t - 1) * K * V + kk * V + j];
+          kv += s_prev * et * k[q_base + t * K + kk];
+        }
+        float ddelta = 0.0f;
+        for (int kk = 0; kk < K; ++kk) {
+          ddelta += dstate[kk * tile_cols + local_j] * k[q_base + t * K + kk];
+        }
+        db += ddelta * (v[v_base + t * V + j] - kv);
+      }
+      atomicAdd(&dbeta[scalar_base + t], db);
+    }
+    __syncthreads();
+    for (int idx = threadIdx.x; idx < state_elems; idx += blockDim.x) {
+      const int kk = idx / tile_cols;
+      const int local_j = idx - kk * tile_cols;
+      const int j = tile_begin + local_j;
+      const float s_prev = (t == 0) ? 0.0f : states[state_base + (t - 1) * K * V + kk * V + j];
+      float ddelta = 0.0f;
+      for (int kk2 = 0; kk2 < K; ++kk2) {
+        ddelta += dstate[kk2 * tile_cols + local_j] * k[q_base + t * K + kk2];
+      }
+      dspre[idx] += -k[q_base + t * K + kk] * ddelta * beta[scalar_base + t];
+      dstate[idx] = dspre[idx] * et;
+      atomicAdd(&dg[scalar_base + t], dspre[idx] * s_prev * et);
+    }
+    __syncthreads();
+  }
+}
+
 __global__ void qwen_linear_attn_backward_recompute_kernel(const float* __restrict__ grad_out,
                                                            const float* __restrict__ q,
                                                            const float* __restrict__ k,
@@ -828,25 +951,27 @@ std::vector<torch::Tensor> qwen_linear_attention_cuda_backward(
   int T = static_cast<int>(query.size(2));
   int K = static_cast<int>(query.size(3));
   int V = static_cast<int>(value.size(3));
-  auto dq = torch::empty_like(query);
-  auto dk = torch::empty_like(key);
+  auto dq = torch::zeros_like(query);
+  auto dk = torch::zeros_like(key);
   auto dv = torch::empty_like(value);
   auto dbeta = torch::zeros_like(beta);
   auto dg = torch::zeros_like(g);
-  size_t shared = static_cast<size_t>(K) * static_cast<size_t>(V) * 2 * sizeof(float);
+  const int value_tile = value_tile_size(V);
+  const int value_tiles = (V + value_tile - 1) / value_tile;
+  size_t shared = static_cast<size_t>(K) * static_cast<size_t>(value_tile) * 2 * sizeof(float);
   if (shared > 192 * 1024) {
-    throw std::runtime_error("Qwen linear attention CUDA backward shared memory limit exceeded");
+    throw std::runtime_error("Qwen linear attention CUDA tiled backward shared memory limit exceeded");
   }
-  check_cuda(cudaFuncSetAttribute(qwen_linear_attn_backward_kernel,
+  check_cuda(cudaFuncSetAttribute(qwen_linear_attn_backward_tiled_kernel,
                                   cudaFuncAttributeMaxDynamicSharedMemorySize,
                                   static_cast<int>(shared)),
-             "cudaFuncSetAttribute backward");
-  qwen_linear_attn_backward_kernel<<<B * H, 256, shared>>>(
+             "cudaFuncSetAttribute tiled backward");
+  qwen_linear_attn_backward_tiled_kernel<<<dim3(B * H, value_tiles), 256, shared>>>(
       grad_out.data_ptr<float>(), query.data_ptr<float>(), key.data_ptr<float>(), value.data_ptr<float>(),
       beta.data_ptr<float>(), g.data_ptr<float>(), states.data_ptr<float>(), dq.data_ptr<float>(),
       dk.data_ptr<float>(), dv.data_ptr<float>(), dbeta.data_ptr<float>(), dg.data_ptr<float>(),
-      B, H, T, K, V);
-  check_cuda(cudaGetLastError(), "qwen_linear_attn_backward_kernel");
+      B, H, T, K, V, value_tile);
+  check_cuda(cudaGetLastError(), "qwen_linear_attn_backward_tiled_kernel");
   return {dq, dk, dv, dbeta, dg};
 }
 
