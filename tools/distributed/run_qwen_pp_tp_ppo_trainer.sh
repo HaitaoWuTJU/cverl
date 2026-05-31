@@ -25,6 +25,7 @@ ADVANTAGE_SCALE="${ADVANTAGE_SCALE:-1.0}"
 MASTER_WEIGHTS="${MASTER_WEIGHTS:-false}"
 DP_SHARD_OPTIMIZER="${DP_SHARD_OPTIMIZER:-false}"
 SKIP_OPTIMIZER_STEP="${SKIP_OPTIMIZER_STEP:-false}"
+MEASURE_PARAM_DELTA="${MEASURE_PARAM_DELTA:-false}"
 VARY_TOKENS_BY_STEP="${VARY_TOKENS_BY_STEP:-false}"
 JSONL_INPUT="${JSONL_INPUT:-}"
 ROLLOUT_JSON="${ROLLOUT_JSON:-}"
@@ -87,6 +88,7 @@ for ((rank = 0; rank < WORLD_SIZE; ++rank)); do
       --master-weights "${MASTER_WEIGHTS}" \
       --dp-shard-optimizer "${DP_SHARD_OPTIMIZER}" \
       --skip-optimizer-step "${SKIP_OPTIMIZER_STEP}" \
+      --measure-param-delta "${MEASURE_PARAM_DELTA}" \
       --vary-tokens-by-step "${VARY_TOKENS_BY_STEP}" \
       --jsonl-input "${JSONL_INPUT}" \
       --rollout-json "${ROLLOUT_JSON}" \

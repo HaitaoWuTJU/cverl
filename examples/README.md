@@ -19,6 +19,11 @@ Current examples:
   avoids vLLM sleep/wake phase switching. Use `ROLLOUT_BACKEND=oracle` for a
   deterministic reward-variance trainer smoke; default `vllm` uses real
   generation and may produce zero reward on tiny GSM8K samples.
+- `run_gsm8k_ppo_8gpu_h20.sh`: full 8-card GSM8K PPO trainer entry point.
+  It first writes rollout batches from GSM8K, then runs the Qwen PP/TP PPO
+  trainer on GPU0-7 with default `PP=4,TP=2`. The default
+  `ROLLOUT_BACKEND=oracle` guarantees reward variance for regression; set
+  `ROLLOUT_BACKEND=vllm` to consume real vLLM generations.
 
 Multi-GPU regression and benchmark entry points:
 
@@ -35,6 +40,10 @@ NCCL_SOCKET_IFNAME=eth1 CUDA_VISIBLE_DEVICES=0,1,2,3 \
 # running vLLM server, or oracle for a deterministic reward-variance check.
 ROLLOUT_BACKEND=oracle NCCL_SOCKET_IFNAME=eth1 CUDA_VISIBLE_DEVICES=0,1,2,3 \
   tools/distributed/run_rollout_to_pp_tp_ppo.sh ../models/Qwen3.5-0.8B
+
+# Full 8-card GSM8K PPO path, defaulting to deterministic oracle rollout.
+NCCL_SOCKET_IFNAME=bond1 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  examples/run_gsm8k_ppo_8gpu_h20.sh
 ```
 
 Useful distributed planning command:
