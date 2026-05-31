@@ -512,20 +512,20 @@ FlatAdamWStepResult flat_sharded_adamw_step(const std::vector<torch::Tensor>& pa
 
   FlatAdamWStepResult result;
   result.gradient_shard = std::move(grad_shard);
-  result.local_grad_norm_sq = result.gradient_shard.shard.pow(2).sum().item<double>();
-  auto grad_sq_tensor = torch::tensor(
-      {result.local_grad_norm_sq},
-      torch::TensorOptions().device(result.gradient_shard.shard.device()).dtype(torch::kFloat32));
+  auto grad_sq_tensor = result.gradient_shard.shard.pow(2).sum().to(torch::kFloat32).reshape({1});
   auto global_grad_sq_tensor =
       norm_collectives.all_reduce(grad_sq_tensor.contiguous(), ReduceOp::Sum, norm_group);
-  result.global_grad_norm =
-      std::sqrt(static_cast<double>(global_grad_sq_tensor.cpu()[0].item<float>()));
+  auto norm_metrics = torch::cat({grad_sq_tensor.contiguous(), global_grad_sq_tensor.contiguous()}, 0)
+                          .to(torch::kCPU)
+                          .contiguous();
+  result.local_grad_norm_sq = static_cast<double>(norm_metrics[0].item<float>());
+  result.global_grad_norm = std::sqrt(static_cast<double>(norm_metrics[1].item<float>()));
   if (max_grad_norm > 0.0 && std::isfinite(result.global_grad_norm) &&
       result.global_grad_norm > max_grad_norm) {
     result.grad_clip_scale = max_grad_norm / (result.global_grad_norm + 1.0e-6);
     result.gradient_shard.shard.mul_(result.grad_clip_scale);
   }
-  result.local_grad_norm = result.gradient_shard.shard.norm().item<double>();
+  result.local_grad_norm = std::sqrt(result.local_grad_norm_sq) * result.grad_clip_scale;
   optimizer.step(result.gradient_shard.shard);
   parameter_shard.shard.copy_(optimizer.parameter_shard());
   if (apply_parameters) {

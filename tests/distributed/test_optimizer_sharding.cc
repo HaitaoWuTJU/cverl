@@ -2,6 +2,7 @@
 #include "cverl/torch/fp32_master_adamw.h"
 
 #include <iostream>
+#include <cmath>
 #include <stdexcept>
 #include <vector>
 
@@ -91,6 +92,13 @@ class SliceCollectives final : public cverl::distributed::Collectives {
 
 void require(bool cond, const char* msg) {
   if (!cond) {
+    throw std::runtime_error(msg);
+  }
+}
+
+void require_near(double actual, double expected, double atol, const char* msg) {
+  if (std::abs(actual - expected) > atol) {
+    std::cerr << msg << "\nactual=" << actual << "\nexpected=" << expected << "\n";
     throw std::runtime_error(msg);
   }
 }
@@ -389,6 +397,34 @@ void test_flat_sharded_adamw_matches_dense() {
                    2.0e-5);
 }
 
+void test_flat_sharded_adamw_clipped_local_norm() {
+  cverl::torch_backend::Fp32MasterAdamWOptions opts;
+  opts.lr = 1.0e-4;
+  opts.beta1 = 0.9;
+  opts.beta2 = 0.95;
+  opts.eps = 1.0e-8;
+  opts.weight_decay = 0.0;
+  opts.use_master_weights = true;
+
+  auto p = torch::zeros({4}, torch::TensorOptions().dtype(torch::kBFloat16));
+  p.set_requires_grad(true);
+  p.mutable_grad() = torch::full({4}, 4.0, torch::TensorOptions().dtype(torch::kFloat32));
+  std::vector<torch::Tensor> params{p};
+
+  auto param_rank0 = cverl::distributed::flatten_parameter_shard(params, 2, 0);
+  cverl::torch_backend::FlatAdamW flat_rank0(param_rank0.shard, opts);
+  SliceCollectives comm0(0);
+  const double max_grad_norm = 1.0;
+  auto step = cverl::distributed::flat_sharded_adamw_step(
+      params, param_rank0, flat_rank0, comm0, {0, 1}, comm0, {0, 1}, max_grad_norm, false, true, false, 0);
+  require(step.grad_clip_scale < 1.0, "flat clipped step should reduce gradients");
+  require_near(step.local_grad_norm,
+               std::sqrt(step.local_grad_norm_sq) * step.grad_clip_scale,
+               1.0e-6,
+               "flat clipped local norm should come from unclipped norm and scale");
+  require_near(step.local_grad_norm, max_grad_norm, 1.0e-5, "flat clipped local norm should equal max norm");
+}
+
 }  // namespace
 
 int main() {
@@ -403,6 +439,7 @@ int main() {
     test_flat_gradient_shards();
     test_reduce_scatter_flat_gradient_shard();
     test_flat_sharded_adamw_matches_dense();
+    test_flat_sharded_adamw_clipped_local_norm();
     std::cout << "optimizer sharding tests passed\n";
     return 0;
   } catch (const std::exception& e) {

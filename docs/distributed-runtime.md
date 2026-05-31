@@ -120,6 +120,9 @@ The runtime config separates memory decisions from model code:
   through the same tiled checkpointed backward kernel with a zero initial
   checkpoint.
 - Sharded optimizer and sharded gradients enabled by default.
+- Flat sharded AdamW keeps grad-norm math on device and transfers one compact
+  norm tensor to host per step. Avoid splitting this back into separate
+  `Tensor::item()` calls on local norm, global norm, and clipped norm.
 - DP flat optimizer checkpoints default to shard-only format: each DP rank
   writes its flat parameter shard and Adam states, not a duplicate full
   parameter copy. Resume reconstructs local parameters with DP all-gather.
