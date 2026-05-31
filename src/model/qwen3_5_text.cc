@@ -8,6 +8,7 @@
 #include <fstream>
 #include <regex>
 #include <stdexcept>
+#include <tuple>
 
 #include <torch/nn/functional/conv.h>
 #include <torch/nn/functional/embedding.h>
@@ -192,17 +193,27 @@ int64_t linear_attention_chunk_size() {
   return value;
 }
 
-torch::Tensor linear_attention_chunked_recurrent(const torch::Tensor& query,
-                                                 const torch::Tensor& key,
-                                                 const torch::Tensor& value,
-                                                 const torch::Tensor& beta,
-                                                 const torch::Tensor& g,
-                                                 int64_t kd,
-                                                 int64_t vd) {
+std::tuple<torch::Tensor, torch::Tensor> linear_attention_chunked_recurrent_with_state(const torch::Tensor& query,
+                                                                                       const torch::Tensor& key,
+                                                                                       const torch::Tensor& value,
+                                                                                       const torch::Tensor& beta,
+                                                                                       const torch::Tensor& g,
+                                                                                       const torch::Tensor& initial_state,
+                                                                                       int64_t kd,
+                                                                                       int64_t vd) {
   const int64_t bsz = query.size(0);
   const int64_t heads = query.size(1);
   const int64_t seq = query.size(2);
-  auto state = torch::zeros({bsz, heads, kd, vd}, torch::TensorOptions().dtype(torch::kFloat32).device(query.device()));
+  auto state = initial_state.defined()
+                   ? initial_state.to(torch::kFloat32).contiguous()
+                   : torch::zeros({bsz, heads, kd, vd},
+                                  torch::TensorOptions().dtype(torch::kFloat32).device(query.device()));
+  if (state.sizes() != torch::IntArrayRef({bsz, heads, kd, vd})) {
+    throw std::invalid_argument("linear attention initial state shape mismatch");
+  }
+  if (seq == 0) {
+    return {torch::empty({bsz, heads, 0, vd}, query.options().dtype(torch::kFloat32)), state};
+  }
   std::vector<torch::Tensor> chunk_outputs;
   const int64_t chunk_size = linear_attention_chunk_size();
   chunk_outputs.reserve(static_cast<size_t>((seq + chunk_size - 1) / chunk_size));
@@ -224,7 +235,18 @@ torch::Tensor linear_attention_chunked_recurrent(const torch::Tensor& query,
     }
     chunk_outputs.push_back(torch::stack(outs, 2));
   }
-  return torch::cat(chunk_outputs, 2);
+  return {torch::cat(chunk_outputs, 2), state};
+}
+
+torch::Tensor linear_attention_chunked_recurrent(const torch::Tensor& query,
+                                                 const torch::Tensor& key,
+                                                 const torch::Tensor& value,
+                                                 const torch::Tensor& beta,
+                                                 const torch::Tensor& g,
+                                                 int64_t kd,
+                                                 int64_t vd) {
+  return std::get<0>(
+      linear_attention_chunked_recurrent_with_state(query, key, value, beta, g, torch::Tensor(), kd, vd));
 }
 
 bool use_cuda_linear_attention_kernel(const torch::Tensor& query, int64_t kd, int64_t vd) {
@@ -383,6 +405,17 @@ torch::Tensor linear_attention_recurrent(const torch::Tensor& query,
     return QwenLinearAttentionCudaFunction::apply(query, key, value, beta, g);
   }
   return linear_attention_chunked_recurrent(query, key, value, beta, g, kd, vd);
+}
+
+std::tuple<torch::Tensor, torch::Tensor> linear_attention_recurrent_with_state(const torch::Tensor& query,
+                                                                               const torch::Tensor& key,
+                                                                               const torch::Tensor& value,
+                                                                               const torch::Tensor& beta,
+                                                                               const torch::Tensor& g,
+                                                                               const torch::Tensor& initial_state,
+                                                                               int64_t kd,
+                                                                               int64_t vd) {
+  return linear_attention_chunked_recurrent_with_state(query, key, value, beta, g, initial_state, kd, vd);
 }
 
 std::string layer_prefix(int64_t layer_idx) {
@@ -837,15 +870,39 @@ torch::Tensor Qwen35TextModel::linear_attention_context_parallel(const torch::Te
   beta = beta.transpose(1, 2).contiguous().to(torch::kFloat32);
   g = g.transpose(1, 2).contiguous().to(torch::kFloat32);
 
-  auto core_global = linear_attention_recurrent(query, key, value, beta, g, kd, vd)
-                         .transpose(1, 2)
-                         .contiguous()
-                         .reshape({bsz, original_sequence_length, value_dim});
-  auto core = distributed::context_parallel_slice_padded(core_global, context_rank, context_group.world_size, 1, 0.0)
-                  .reshape({bsz * seq_local * vh, vd});
+  const auto range = distributed::context_parallel_sequence_range(
+      original_sequence_length, context_rank, context_group.world_size);
+  torch::Tensor initial_state;
+  if (range.begin > 0) {
+    initial_state = std::get<1>(linear_attention_recurrent_with_state(query.narrow(2, 0, range.begin).contiguous(),
+                                                                      key.narrow(2, 0, range.begin).contiguous(),
+                                                                      value.narrow(2, 0, range.begin).contiguous(),
+                                                                      beta.narrow(2, 0, range.begin).contiguous(),
+                                                                      g.narrow(2, 0, range.begin).contiguous(),
+                                                                      torch::Tensor(),
+                                                                      kd,
+                                                                      vd));
+  }
+  auto query_local = distributed::context_parallel_slice_padded(query, context_rank, context_group.world_size, 2, 0.0);
+  auto key_local = distributed::context_parallel_slice_padded(key, context_rank, context_group.world_size, 2, 0.0);
+  auto value_local = distributed::context_parallel_slice_padded(value, context_rank, context_group.world_size, 2, 0.0);
+  auto beta_local_scan =
+      distributed::context_parallel_slice_padded(beta, context_rank, context_group.world_size, 2, 0.0);
+  auto g_local = distributed::context_parallel_slice_padded(g, context_rank, context_group.world_size, 2, 0.0);
+  auto core_local = std::get<0>(linear_attention_recurrent_with_state(query_local.contiguous(),
+                                                                      key_local.contiguous(),
+                                                                      value_local.contiguous(),
+                                                                      beta_local_scan.contiguous(),
+                                                                      g_local.contiguous(),
+                                                                      initial_state,
+                                                                      kd,
+                                                                      vd))
+                        .transpose(1, 2)
+                        .contiguous()
+                        .reshape({bsz * seq_local * vh, vd});
   auto zg = distributed::context_parallel_slice_padded(z, context_rank, context_group.world_size, 1, 0.0)
                 .reshape({bsz * seq_local * vh, vd});
-  core = rms_norm_gated(core, zg, weight(p + "norm.weight")).reshape({bsz, seq_local, value_dim});
+  auto core = rms_norm_gated(core_local, zg, weight(p + "norm.weight")).reshape({bsz, seq_local, value_dim});
   return dense(core, weight(p + "out_proj.weight"));
 }
 

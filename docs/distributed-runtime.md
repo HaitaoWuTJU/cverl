@@ -247,11 +247,15 @@ Current code exposes the distributed shape directly:
   PP stages now pass local sequence shards, Qwen range forward keeps
   RMSNorm/MLP/projections local, full attention runs local-Q plus differentiable
   CP ring-exchanged K/V blocks, linear attention exchanges projected QKV/Z/B/A
-  activations in rank order instead of gathering hidden states, and the final
-  PPO logprob slice gathers hidden with autograd so gradients reduce-scatter
-  back to owner shards. Qwen CP accepts either group-local rank ids or real
-  global ranks in the CP group and resolves shard/RoPE/ring scheduling through
-  the group-local index. `TP>1` with `CP>1` is intentionally rejected until
+  activations in rank order instead of gathering hidden states, then runs the
+  recurrent core only over the local token shard with an explicit initial
+  state. Today that initial state is produced by prefix replay on the local
+  rank; the next CP efficiency step is replacing that replay with inter-rank
+  state carry / scan. The final PPO logprob slice gathers hidden with autograd
+  so gradients reduce-scatter back to owner shards. Qwen CP accepts either
+  group-local rank ids or real global ranks in the CP group and resolves
+  shard/RoPE/ring scheduling through the group-local index. `TP>1` with
+  `CP>1` is intentionally rejected until
   TP-sharded CP attention and MLP are fused into one Megatron-style execution
   path.
 
