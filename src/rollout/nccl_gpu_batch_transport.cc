@@ -1,7 +1,7 @@
 #include "cverl/rollout/nccl_gpu_batch_transport.h"
 
 #include <stdexcept>
-#include <unordered_map>
+#include <vector>
 
 namespace cverl::rollout {
 namespace {
@@ -157,12 +157,60 @@ GpuRolloutBatchDescriptor unpack_header(const torch::Tensor& header) {
   return desc;
 }
 
-torch::Tensor empty_from_desc(const GpuRolloutTensorDescriptor& desc, int device_index) {
-  return torch::empty(desc.shape,
-                      torch::TensorOptions()
-                          .device(torch::Device(torch::kCUDA, device_index))
-                          .dtype(torch_dtype_from_gpu_ipc(desc.dtype)))
-      .contiguous();
+std::vector<GpuIpcDType> rollout_dtype_order() {
+  return {
+      GpuIpcDType::Int64,
+      GpuIpcDType::Float32,
+      GpuIpcDType::BFloat16,
+      GpuIpcDType::Float16,
+      GpuIpcDType::UInt8,
+  };
+}
+
+bool descriptor_has_dtype(const GpuRolloutBatchDescriptor& desc, GpuIpcDType dtype) {
+  for (const auto& t : desc.tensors) {
+    if (t.dtype == dtype) {
+      return true;
+    }
+  }
+  return false;
+}
+
+int64_t descriptor_numel(const GpuRolloutTensorDescriptor& desc) {
+  int64_t out = 1;
+  for (int64_t dim : desc.shape) {
+    out *= dim;
+  }
+  return out;
+}
+
+torch::Tensor pack_dtype_slab(const GpuRolloutBatch& batch, const GpuRolloutBatchDescriptor& desc, GpuIpcDType dtype) {
+  std::vector<torch::Tensor> pieces;
+  for (const auto& t : desc.tensors) {
+    if (t.dtype != dtype) {
+      continue;
+    }
+    auto tensor = tensor_for_kind(batch, t.kind);
+    require_cuda_payload(tensor, "GpuRolloutBatch tensor");
+    pieces.push_back(tensor.reshape({-1}));
+  }
+  if (pieces.empty()) {
+    return {};
+  }
+  if (pieces.size() == 1) {
+    return pieces[0].contiguous();
+  }
+  return torch::cat(pieces, 0).contiguous();
+}
+
+int first_payload_device(const GpuRolloutBatch& batch, const GpuRolloutBatchDescriptor& desc) {
+  for (const auto& t : desc.tensors) {
+    auto tensor = tensor_for_kind(batch, t.kind);
+    if (tensor.defined()) {
+      return tensor.get_device();
+    }
+  }
+  return 0;
 }
 
 }  // namespace
@@ -192,11 +240,15 @@ GpuRolloutBatchDescriptor describe_gpu_rollout_batch(const GpuRolloutBatch& batc
 
 void NCCLGpuBatchSender::send(const GpuRolloutBatch& batch, int64_t peer) {
   auto desc = describe_gpu_rollout_batch(batch);
-  int device = batch.prompt_ids.defined() ? batch.prompt_ids.get_device() : 0;
+  int device = first_payload_device(batch, desc);
   auto header = pack_header(desc, device);
   comm_.send(header.contiguous(), peer);
-  for (const auto& t : desc.tensors) {
-    comm_.send(tensor_for_kind(batch, t.kind).contiguous(), peer);
+  for (GpuIpcDType dtype : rollout_dtype_order()) {
+    if (!descriptor_has_dtype(desc, dtype)) {
+      continue;
+    }
+    auto slab = pack_dtype_slab(batch, desc, dtype);
+    comm_.send(slab.contiguous(), peer);
   }
 }
 
@@ -208,10 +260,31 @@ GpuRolloutBatch NCCLGpuBatchReceiver::recv(int64_t peer) {
   auto header = comm_.recv_like(header_like.contiguous(), peer);
   GpuRolloutBatch batch;
   batch.descriptor = unpack_header(header);
-  for (const auto& t : batch.descriptor.tensors) {
-    auto like = empty_from_desc(t, device_index_);
-    auto received = comm_.recv_like(like, peer);
-    set_tensor_for_kind(&batch, t.kind, received);
+  for (GpuIpcDType dtype : rollout_dtype_order()) {
+    int64_t total_numel = 0;
+    for (const auto& t : batch.descriptor.tensors) {
+      if (t.dtype == dtype) {
+        total_numel += descriptor_numel(t);
+      }
+    }
+    if (total_numel == 0) {
+      continue;
+    }
+    auto slab_like = torch::empty({total_numel},
+                                  torch::TensorOptions()
+                                      .device(torch::Device(torch::kCUDA, device_index_))
+                                      .dtype(torch_dtype_from_gpu_ipc(dtype)));
+    auto slab = comm_.recv_like(slab_like.contiguous(), peer);
+    int64_t offset = 0;
+    for (const auto& t : batch.descriptor.tensors) {
+      if (t.dtype != dtype) {
+        continue;
+      }
+      const int64_t numel = descriptor_numel(t);
+      auto tensor = slab.narrow(0, offset, numel).view(t.shape);
+      set_tensor_for_kind(&batch, t.kind, tensor);
+      offset += numel;
+    }
   }
   return batch;
 }

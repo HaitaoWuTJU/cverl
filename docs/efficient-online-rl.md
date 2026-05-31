@@ -30,10 +30,18 @@ Implemented foundation:
 - `cverl::rollout::PolicyRolloutWorker`
 - `cverl::rollout::DynamicRolloutWorker`
 - `cverl::rollout::synchronize_rollout_actor_weights`
+- `cverl::rollout::NCCLGpuBatchSender`
+- `cverl::rollout::NCCLGpuBatchReceiver`
 - CPU unit test: `test_weight_sync`
 - CPU unit test: `test_rollout_worker`
 - plugin loader unit test: `test_plugin_worker`
 - NCCL test coverage inside `test_nccl_collectives`
+- NCCL rollout batch test coverage inside `test_nccl_gpu_batch_transport`
+
+`NCCLGpuBatchSender` sends one descriptor header followed by dtype-coalesced
+GPU slabs. A typical PPO rollout batch has int64 token/group IDs and float
+mask/logprob/reward/advantage tensors, so the data plane uses header + int64
+slab + float slab instead of one NCCL message per tensor.
 
 `gsm8k_grpo_trainer` may still export HF checkpoints for debugging or offline
 inspection, but checkpoint reload is not the intended online parameter-update
