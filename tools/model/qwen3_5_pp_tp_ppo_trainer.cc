@@ -599,7 +599,8 @@ void save_rank_flat_checkpoint(const std::string& checkpoint_dir,
                                const std::vector<std::string>& param_names,
                                const std::vector<torch::Tensor>& params,
                                const cverl::distributed::FlatParameterShard& flat_param_shard,
-                               const cverl::torch_backend::FlatAdamW& optimizer) {
+                               const cverl::torch_backend::FlatAdamW& optimizer,
+                               bool save_model_params) {
   if (checkpoint_dir.empty()) {
     return;
   }
@@ -616,8 +617,10 @@ void save_rank_flat_checkpoint(const std::string& checkpoint_dir,
   }
 
   torch::serialize::OutputArchive archive;
-  for (size_t i = 0; i < params.size(); ++i) {
-    archive.write("param_" + std::to_string(i), params[i].detach().to(torch::kCPU));
+  if (save_model_params) {
+    for (size_t i = 0; i < params.size(); ++i) {
+      archive.write("param_" + std::to_string(i), params[i].detach().to(torch::kCPU));
+    }
   }
   archive.write("flat_param_shard", optimizer.parameter_shard().detach().to(torch::kCPU));
   archive.write("flat_exp_avg", optimizer.exp_avg().detach().to(torch::kCPU));
@@ -641,6 +644,7 @@ void save_rank_flat_checkpoint(const std::string& checkpoint_dir,
   rank_meta["param_file"] = rank_file;
   rank_meta["optimizer_step"] = optimizer.step_count();
   rank_meta["optimizer_kind"] = "FlatAdamW";
+  rank_meta["model_parameters_saved"] = save_model_params;
   rank_meta["optimizer_param_indices"] = full_index_list(params.size());
   rank_meta["flat_parameter_shard"] = {
       {"original_numel", flat_param_shard.original_numel},
@@ -656,7 +660,9 @@ void save_rank_flat_checkpoint(const std::string& checkpoint_dir,
     item["name"] = param_names[i];
     item["dtype"] = c10::toString(params[i].scalar_type());
     item["shape"] = std::vector<int64_t>(params[i].sizes().begin(), params[i].sizes().end());
-    item["checkpoint_key"] = "param_" + std::to_string(i);
+    if (save_model_params) {
+      item["checkpoint_key"] = "param_" + std::to_string(i);
+    }
     rank_meta["parameters"].push_back(std::move(item));
   }
   write_json_atomic(step_dir / rank_meta_file, rank_meta);
@@ -725,16 +731,19 @@ void write_flat_checkpoint_manifest(const std::string& checkpoint_dir,
                                     int64_t dp_size,
                                     int64_t pp_size,
                                     int64_t tp_size,
-                                    const cverl::torch_backend::FlatAdamW& optimizer) {
+                                    const cverl::torch_backend::FlatAdamW& optimizer,
+                                    bool save_model_params) {
   if (checkpoint_dir.empty()) {
     return;
   }
   const auto step_dir = std::filesystem::path(checkpoint_dir) / checkpoint_step_name(step);
   nlohmann::json manifest;
   manifest["step"] = step + 1;
-  manifest["format"] = "cverl_pp_tp_rank_local_checkpoint_v3";
+  manifest["format"] =
+      save_model_params ? "cverl_pp_tp_rank_local_checkpoint_v3" : "cverl_pp_tp_flat_shard_checkpoint_v4";
   manifest["complete"] = true;
   manifest["optimizer_kind"] = "FlatAdamW";
+  manifest["model_parameters_saved"] = save_model_params;
   manifest["world_size"] = world_size;
   manifest["data_parallel"] = dp_size;
   manifest["pipeline_parallel"] = pp_size;
@@ -955,12 +964,14 @@ int64_t load_rank_flat_checkpoint(const std::string& checkpoint_path,
   }
 
   int64_t manifest_step = rank_meta.value("optimizer_step", 0);
+  bool model_parameters_saved = rank_meta.value("model_parameters_saved", true);
   if (std::filesystem::exists(manifest_path)) {
     nlohmann::json manifest;
     std::ifstream in(manifest_path);
     in >> manifest;
     const std::string format = manifest.value("format", std::string{});
-    if (format != "cverl_pp_tp_rank_local_checkpoint_v3" ||
+    if ((format != "cverl_pp_tp_rank_local_checkpoint_v3" &&
+         format != "cverl_pp_tp_flat_shard_checkpoint_v4") ||
         manifest.value("optimizer_kind", std::string{}) != "FlatAdamW") {
       throw std::runtime_error("unsupported resume flat checkpoint format");
     }
@@ -968,12 +979,13 @@ int64_t load_rank_flat_checkpoint(const std::string& checkpoint_path,
       throw std::runtime_error("resume flat checkpoint manifest is not marked complete");
     }
     manifest_step = manifest.at("optimizer").at("step").get<int64_t>();
+    model_parameters_saved = manifest.value("model_parameters_saved", format == "cverl_pp_tp_rank_local_checkpoint_v3");
   }
 
   const std::string rank_file = rank_meta.value("param_file", "rank_" + std::to_string(global_rank) + ".pt");
   torch::serialize::InputArchive archive;
   archive.load_from((step_dir / rank_file).string());
-  {
+  if (model_parameters_saved) {
     torch::NoGradGuard no_grad;
     for (size_t i = 0; i < params.size(); ++i) {
       torch::Tensor param;
@@ -1429,6 +1441,8 @@ int main(int argc, char** argv) {
     const int64_t jsonl_max_examples = arg_i64(argc, argv, "--jsonl-max-examples", 16);
     const std::string checkpoint_dir = arg_str(argc, argv, "--checkpoint-dir", "");
     const int64_t checkpoint_every = arg_i64(argc, argv, "--checkpoint-every", 0);
+    const bool flat_checkpoint_save_model_params =
+        arg_bool(argc, argv, "--flat-checkpoint-save-model-params", false);
     const std::string resume_checkpoint = arg_str(argc, argv, "--resume-checkpoint", "");
     const std::string metrics_csv = arg_str(argc, argv, "--metrics-csv", "");
     const auto dtype = parse_dtype(arg_str(argc, argv, "--dtype", "bfloat16"));
@@ -1571,6 +1585,7 @@ int main(int argc, char** argv) {
     int64_t start_step = 0;
     if (!resume_checkpoint.empty()) {
       if (dp_flat_shard_optimizer) {
+        const int64_t dp_bucket_numel = std::max<int64_t>(1, dp_grad_bucket_bytes / 4);
         start_step = load_rank_flat_checkpoint(resume_checkpoint,
                                                global_rank,
                                                info.data_rank,
@@ -1581,6 +1596,8 @@ int main(int argc, char** argv) {
                                                flat_param_shard,
                                                *flat_optimizer);
         flat_param_shard.shard.copy_(flat_optimizer->parameter_shard());
+        cverl::distributed::all_gather_apply_flat_parameter_shard_bucketed(
+            flat_param_shard, dp_comm, dp_group.ranks, params, dp_bucket_numel);
       } else {
         start_step = load_rank_checkpoint(resume_checkpoint,
                                           global_rank,
@@ -1846,7 +1863,8 @@ int main(int argc, char** argv) {
                                     param_names,
                                     params,
                                     flat_param_shard,
-                                    *flat_optimizer);
+                                    *flat_optimizer,
+                                    flat_checkpoint_save_model_params);
         } else {
           save_rank_checkpoint(checkpoint_dir,
                                step,
@@ -1867,7 +1885,14 @@ int main(int argc, char** argv) {
         full_comm.barrier();
         if (global_rank == 0) {
           if (dp_flat_shard_optimizer) {
-            write_flat_checkpoint_manifest(checkpoint_dir, step, world_size, dp_size, pp_size, tp_size, *flat_optimizer);
+            write_flat_checkpoint_manifest(checkpoint_dir,
+                                           step,
+                                           world_size,
+                                           dp_size,
+                                           pp_size,
+                                           tp_size,
+                                           *flat_optimizer,
+                                           flat_checkpoint_save_model_params);
           } else {
             write_checkpoint_manifest(checkpoint_dir, step, world_size, dp_size, pp_size, tp_size, optimizer);
           }
@@ -1954,6 +1979,7 @@ int main(int argc, char** argv) {
                   << " response_len=" << response_len
                   << " master_weights=" << (use_master_weights ? "true" : "false")
                   << " dp_shard_optimizer=" << (dp_shard_optimizer ? "true" : "false")
+                  << " flat_checkpoint_save_model_params=" << (flat_checkpoint_save_model_params ? "true" : "false")
                   << " optimizer_params=" << optimizer_param_indices.size()
                   << " total_params=" << params.size()
                   << " dp_grad_bucket_mb=" << dp_grad_bucket_mb

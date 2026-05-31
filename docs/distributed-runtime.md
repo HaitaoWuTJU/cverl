@@ -107,6 +107,11 @@ The runtime config separates memory decisions from model code:
   through the same tiled checkpointed backward kernel with a zero initial
   checkpoint.
 - Sharded optimizer and sharded gradients enabled by default.
+- DP flat optimizer checkpoints default to shard-only format: each DP rank
+  writes its flat parameter shard and Adam states, not a duplicate full
+  parameter copy. Resume reconstructs local parameters with DP all-gather.
+  `--flat-checkpoint-save-model-params true` keeps the older debug-friendly
+  full-parameter rank checkpoint format.
 - CPU offload is available as a policy switch, not a default. It saves memory
   but usually costs throughput.
 
