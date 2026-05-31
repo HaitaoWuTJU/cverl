@@ -452,14 +452,13 @@ FlatParameterShard reduce_scatter_flat_gradient_shard_bucketed(
 
   for (int64_t shard_offset = 0; shard_offset < shard_size; shard_offset += shard_bucket_numel) {
     const int64_t chunk = std::min(shard_bucket_numel, shard_size - shard_offset);
-    std::vector<torch::Tensor> input_segments;
-    input_segments.reserve(static_cast<size_t>(data_parallel));
+    auto input = torch::empty({chunk * data_parallel}, options);
     for (int64_t rank = 0; rank < data_parallel; ++rank) {
       const int64_t global_begin = rank * shard_size + shard_offset;
-      input_segments.push_back(flat_tensor_range_padded(
-          gradients, original_numel, padded_numel, global_begin, chunk, options));
+      auto segment = flat_tensor_range_padded(
+          gradients, original_numel, padded_numel, global_begin, chunk, options);
+      input.narrow(0, rank * chunk, chunk).copy_(segment);
     }
-    auto input = torch::cat(input_segments, 0).contiguous();
     auto reduced =
         collectives.reduce_scatter(input, average ? ReduceOp::Mean : ReduceOp::Sum, data_group, 0).contiguous();
     if (reduced.dim() != 1 || reduced.numel() != chunk) {
