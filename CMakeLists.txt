@@ -141,6 +141,7 @@ add_library(cverl STATIC
   src/data/hf_dataset.cc
   src/distributed/collectives.cc
   src/distributed/context_parallel.cc
+  src/distributed/optimizer_sharding.cc
   src/distributed/parallel_ops.cc
   src/distributed/pipeline.cc
   src/distributed/topology.cc
@@ -389,6 +390,11 @@ if (CVERL_BUILD_TESTS)
   target_link_libraries(test_parallel_ops PRIVATE cverl)
   target_compile_options(test_parallel_ops PRIVATE ${TORCH_CXX_FLAGS})
   cverl_register_test(test_parallel_ops)
+
+  add_executable(test_optimizer_sharding tests/distributed/test_optimizer_sharding.cc)
+  target_link_libraries(test_optimizer_sharding PRIVATE cverl)
+  target_compile_options(test_optimizer_sharding PRIVATE ${TORCH_CXX_FLAGS})
+  cverl_register_test(test_optimizer_sharding)
 
   add_executable(test_weight_sync tests/distributed/test_weight_sync.cc)
   target_link_libraries(test_weight_sync PRIVATE cverl)

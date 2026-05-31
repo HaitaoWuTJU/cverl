@@ -20,6 +20,7 @@ DP_GRAD_BUCKET_MB="${DP_GRAD_BUCKET_MB:-25}"
 TP_GRAD_BUCKET_MB="${TP_GRAD_BUCKET_MB:-${DP_GRAD_BUCKET_MB}}"
 ADVANTAGE_SCALE="${ADVANTAGE_SCALE:-1.0}"
 MASTER_WEIGHTS="${MASTER_WEIGHTS:-false}"
+DP_SHARD_OPTIMIZER="${DP_SHARD_OPTIMIZER:-false}"
 SKIP_OPTIMIZER_STEP="${SKIP_OPTIMIZER_STEP:-false}"
 VARY_TOKENS_BY_STEP="${VARY_TOKENS_BY_STEP:-false}"
 JSONL_INPUT="${JSONL_INPUT:-}"
@@ -78,6 +79,7 @@ for ((rank = 0; rank < WORLD_SIZE; ++rank)); do
       --tp-grad-bucket-mb "${TP_GRAD_BUCKET_MB}" \
       --advantage-scale "${ADVANTAGE_SCALE}" \
       --master-weights "${MASTER_WEIGHTS}" \
+      --dp-shard-optimizer "${DP_SHARD_OPTIMIZER}" \
       --skip-optimizer-step "${SKIP_OPTIMIZER_STEP}" \
       --vary-tokens-by-step "${VARY_TOKENS_BY_STEP}" \
       --jsonl-input "${JSONL_INPUT}" \

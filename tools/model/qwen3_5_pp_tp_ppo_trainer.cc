@@ -15,9 +15,11 @@
 
 #include "cverl/data/hf_dataset.h"
 #include "cverl/distributed/nccl_collectives.h"
+#include "cverl/distributed/optimizer_sharding.h"
 #include "cverl/distributed/parallel_ops.h"
 #include "cverl/distributed/pipeline.h"
 #include "cverl/distributed/topology.h"
+#include "cverl/distributed/weight_sync.h"
 #include "cverl/model/hf_model_loader.h"
 #include "cverl/model/qwen3_5_text.h"
 #include "cverl/reward/gsm8k.h"
@@ -92,6 +94,101 @@ std::vector<torch::Tensor> clone_params(const std::vector<torch::Tensor>& params
     out.push_back(p.detach().clone());
   }
   return out;
+}
+
+std::vector<int64_t> full_index_list(size_t size) {
+  std::vector<int64_t> out;
+  out.reserve(size);
+  for (size_t i = 0; i < size; ++i) {
+    out.push_back(static_cast<int64_t>(i));
+  }
+  return out;
+}
+
+std::vector<int64_t> param_index_to_optimizer_position(size_t param_count,
+                                                       const std::vector<int64_t>& optimizer_param_indices) {
+  std::vector<int64_t> out(param_count, -1);
+  for (size_t i = 0; i < optimizer_param_indices.size(); ++i) {
+    const int64_t param_index = optimizer_param_indices[i];
+    if (param_index < 0 || param_index >= static_cast<int64_t>(param_count)) {
+      throw std::runtime_error("optimizer parameter index out of range");
+    }
+    out[static_cast<size_t>(param_index)] = static_cast<int64_t>(i);
+  }
+  return out;
+}
+
+std::vector<torch::Tensor> select_params(const std::vector<torch::Tensor>& params,
+                                         const std::vector<int64_t>& indices) {
+  std::vector<torch::Tensor> out;
+  out.reserve(indices.size());
+  for (int64_t index : indices) {
+    if (index < 0 || index >= static_cast<int64_t>(params.size())) {
+      throw std::runtime_error("parameter selection index out of range");
+    }
+    out.push_back(params[static_cast<size_t>(index)]);
+  }
+  return out;
+}
+
+void zero_model_gradients(const std::vector<torch::Tensor>& params) {
+  torch::NoGradGuard no_grad;
+  for (const auto& p : params) {
+    if (p.defined() && p.grad().defined()) {
+      p.mutable_grad().zero_();
+    }
+  }
+}
+
+double grad_l2_norm_sq(const std::vector<torch::Tensor>& params) {
+  double out = 0.0;
+  for (const auto& p : params) {
+    if (!p.defined() || !p.grad().defined()) {
+      continue;
+    }
+    out += p.grad().detach().to(torch::kFloat32).pow(2).sum().item<double>();
+  }
+  return out;
+}
+
+double grad_norm_sum(const std::vector<torch::Tensor>& params) {
+  double out = 0.0;
+  for (const auto& p : params) {
+    if (!p.defined() || !p.grad().defined()) {
+      continue;
+    }
+    out += p.grad().detach().to(torch::kFloat32).norm().item<double>();
+  }
+  return out;
+}
+
+void scale_model_gradients(const std::vector<torch::Tensor>& params, double scale) {
+  torch::NoGradGuard no_grad;
+  for (const auto& p : params) {
+    if (p.defined() && p.grad().defined()) {
+      p.mutable_grad().mul_(scale);
+    }
+  }
+}
+
+void broadcast_dp_sharded_optimizer_parameters(const std::vector<std::string>& param_names,
+                                               const std::vector<torch::Tensor>& params,
+                                               const std::vector<int64_t>& owner_by_param,
+                                               cverl::distributed::Collectives& dp_comm,
+                                               const std::vector<int64_t>& dp_ranks,
+                                               int64_t bucket_bytes) {
+  if (param_names.size() != params.size() || owner_by_param.size() != params.size()) {
+    throw std::runtime_error("DP sharded optimizer broadcast metadata size mismatch");
+  }
+  for (int64_t owner : dp_ranks) {
+    std::vector<cverl::distributed::ParameterView> owned;
+    for (size_t i = 0; i < params.size(); ++i) {
+      if (owner_by_param[i] == owner) {
+        owned.push_back(cverl::distributed::ParameterView{param_names[i], params[i]});
+      }
+    }
+    cverl::distributed::broadcast_parameters_from_root(owned, dp_comm, owner, dp_ranks, bucket_bytes);
+  }
 }
 
 bool layer_index_from_weight_name(const std::string& name, int64_t* layer_index) {
@@ -401,7 +498,8 @@ void save_rank_checkpoint(const std::string& checkpoint_dir,
                           int64_t layer_end,
                           const std::vector<std::string>& param_names,
                           const std::vector<torch::Tensor>& params,
-                          const cverl::torch_backend::Fp32MasterAdamW& optimizer) {
+                          const cverl::torch_backend::Fp32MasterAdamW& optimizer,
+                          const std::vector<int64_t>& optimizer_param_indices) {
   if (checkpoint_dir.empty()) {
     return;
   }
@@ -415,10 +513,20 @@ void save_rank_checkpoint(const std::string& checkpoint_dir,
   const auto& master_params = optimizer.master_parameters();
   const auto& exp_avg = optimizer.exp_avg();
   const auto& exp_avg_sq = optimizer.exp_avg_sq();
+  if (exp_avg.size() != optimizer_param_indices.size() ||
+      exp_avg_sq.size() != optimizer_param_indices.size() ||
+      (use_master_weights && master_params.size() != optimizer_param_indices.size())) {
+    throw std::runtime_error("checkpoint optimizer state/index size mismatch");
+  }
+  const auto param_to_optim_pos = param_index_to_optimizer_position(params.size(), optimizer_param_indices);
   torch::serialize::OutputArchive archive;
-  const auto& source = use_master_weights ? master_params : params;
-  for (size_t i = 0; i < source.size(); ++i) {
-    archive.write("param_" + std::to_string(i), source[i].detach().to(torch::kCPU));
+  for (size_t i = 0; i < params.size(); ++i) {
+    const int64_t optim_pos = param_to_optim_pos[i];
+    const torch::Tensor& source =
+        (use_master_weights && optim_pos >= 0) ? master_params[static_cast<size_t>(optim_pos)] : params[i];
+    archive.write("param_" + std::to_string(i), source.detach().to(torch::kCPU));
+  }
+  for (size_t i = 0; i < optimizer_param_indices.size(); ++i) {
     archive.write("optim_exp_avg_" + std::to_string(i), exp_avg[i].detach().to(torch::kCPU));
     archive.write("optim_exp_avg_sq_" + std::to_string(i), exp_avg_sq[i].detach().to(torch::kCPU));
   }
@@ -441,6 +549,7 @@ void save_rank_checkpoint(const std::string& checkpoint_dir,
   rank_meta["param_file"] = rank_file;
   rank_meta["optimizer_step"] = optimizer.step_count();
   rank_meta["use_master_weights"] = use_master_weights;
+  rank_meta["optimizer_param_indices"] = optimizer_param_indices;
   rank_meta["parameters"] = nlohmann::json::array();
   for (size_t i = 0; i < params.size(); ++i) {
     nlohmann::json item;
@@ -449,8 +558,12 @@ void save_rank_checkpoint(const std::string& checkpoint_dir,
     item["dtype"] = c10::toString(params[i].scalar_type());
     item["shape"] = std::vector<int64_t>(params[i].sizes().begin(), params[i].sizes().end());
     item["checkpoint_key"] = "param_" + std::to_string(i);
-    item["optimizer_exp_avg_key"] = "optim_exp_avg_" + std::to_string(i);
-    item["optimizer_exp_avg_sq_key"] = "optim_exp_avg_sq_" + std::to_string(i);
+    const int64_t optim_pos = param_to_optim_pos[i];
+    item["optimizer_position"] = optim_pos;
+    if (optim_pos >= 0) {
+      item["optimizer_exp_avg_key"] = "optim_exp_avg_" + std::to_string(optim_pos);
+      item["optimizer_exp_avg_sq_key"] = "optim_exp_avg_sq_" + std::to_string(optim_pos);
+    }
     rank_meta["parameters"].push_back(std::move(item));
   }
   write_json_atomic(step_dir / rank_meta_file, rank_meta);
@@ -517,7 +630,8 @@ int64_t load_rank_checkpoint(const std::string& checkpoint_path,
                              int64_t tp_rank,
                              const std::vector<std::string>& param_names,
                              std::vector<torch::Tensor>& params,
-                             cverl::torch_backend::Fp32MasterAdamW& optimizer) {
+                             cverl::torch_backend::Fp32MasterAdamW& optimizer,
+                             const std::vector<int64_t>& optimizer_param_indices) {
   if (checkpoint_path.empty()) {
     return 0;
   }
@@ -563,6 +677,15 @@ int64_t load_rank_checkpoint(const std::string& checkpoint_path,
       throw std::runtime_error("resume checkpoint parameter shape mismatch for " + param_names[i]);
     }
   }
+  std::vector<int64_t> checkpoint_optimizer_indices;
+  if (rank_meta.contains("optimizer_param_indices")) {
+    checkpoint_optimizer_indices = rank_meta.at("optimizer_param_indices").get<std::vector<int64_t>>();
+  } else {
+    checkpoint_optimizer_indices = full_index_list(params.size());
+  }
+  if (checkpoint_optimizer_indices != optimizer_param_indices) {
+    throw std::runtime_error("resume checkpoint optimizer shard assignment mismatch");
+  }
 
   int64_t manifest_step = rank_meta.value("optimizer_step", 0);
   if (std::filesystem::exists(manifest_path)) {
@@ -584,14 +707,23 @@ int64_t load_rank_checkpoint(const std::string& checkpoint_path,
   std::vector<torch::Tensor> checkpoint_params;
   std::vector<torch::Tensor> exp_avg;
   std::vector<torch::Tensor> exp_avg_sq;
-  checkpoint_params.reserve(params.size());
-  exp_avg.reserve(params.size());
-  exp_avg_sq.reserve(params.size());
-  for (size_t i = 0; i < params.size(); ++i) {
+  checkpoint_params.reserve(optimizer_param_indices.size());
+  exp_avg.reserve(optimizer_param_indices.size());
+  exp_avg_sq.reserve(optimizer_param_indices.size());
+  {
+    torch::NoGradGuard no_grad;
+    for (size_t i = 0; i < params.size(); ++i) {
+      torch::Tensor param;
+      archive.read("param_" + std::to_string(i), param);
+      params[i].copy_(param.detach().to(params[i].device(), params[i].scalar_type()));
+    }
+  }
+  for (size_t i = 0; i < optimizer_param_indices.size(); ++i) {
+    const int64_t param_index = optimizer_param_indices[i];
     torch::Tensor param;
     torch::Tensor m;
     torch::Tensor v;
-    archive.read("param_" + std::to_string(i), param);
+    archive.read("param_" + std::to_string(param_index), param);
     archive.read("optim_exp_avg_" + std::to_string(i), m);
     archive.read("optim_exp_avg_sq_" + std::to_string(i), v);
     checkpoint_params.push_back(param);
@@ -1020,6 +1152,7 @@ int main(int argc, char** argv) {
     const int64_t tp_grad_bucket_mb = arg_i64(argc, argv, "--tp-grad-bucket-mb", dp_grad_bucket_mb);
     const double advantage_scale = arg_f64(argc, argv, "--advantage-scale", 1.0);
     const bool use_master_weights = arg_bool(argc, argv, "--master-weights", false);
+    const bool dp_shard_optimizer = arg_bool(argc, argv, "--dp-shard-optimizer", false);
     const bool skip_optimizer_step = arg_bool(argc, argv, "--skip-optimizer-step", false);
     const bool vary_tokens_by_step = arg_bool(argc, argv, "--vary-tokens-by-step", false);
     const std::string jsonl_input = arg_str(argc, argv, "--jsonl-input", "");
@@ -1146,6 +1279,20 @@ int main(int argc, char** argv) {
       params.push_back(tensor);
       param_names.push_back(name);
     }
+    std::vector<int64_t> param_bytes;
+    param_bytes.reserve(params.size());
+    for (const auto& p : params) {
+      param_bytes.push_back(p.numel() * static_cast<int64_t>(p.element_size()));
+    }
+    std::vector<int64_t> dp_optimizer_owner_by_param(params.size(), 0);
+    if (dp_shard_optimizer) {
+      dp_optimizer_owner_by_param = cverl::distributed::greedy_parameter_owner_by_size(param_bytes, dp_size);
+    }
+    const auto optimizer_param_indices =
+        dp_shard_optimizer
+            ? cverl::distributed::owned_parameter_indices(dp_optimizer_owner_by_param, info.data_rank)
+            : full_index_list(params.size());
+    auto optimizer_params = select_params(params, optimizer_param_indices);
     cverl::torch_backend::Fp32MasterAdamWOptions optim_options;
     optim_options.lr = lr;
     optim_options.beta1 = 0.9;
@@ -1153,7 +1300,7 @@ int main(int argc, char** argv) {
     optim_options.eps = 1.0e-8;
     optim_options.weight_decay = 0.01;
     optim_options.use_master_weights = use_master_weights;
-    cverl::torch_backend::Fp32MasterAdamW optimizer(params, optim_options);
+    cverl::torch_backend::Fp32MasterAdamW optimizer(optimizer_params, optim_options);
     int64_t start_step = 0;
     if (!resume_checkpoint.empty()) {
       start_step = load_rank_checkpoint(resume_checkpoint,
@@ -1163,7 +1310,8 @@ int main(int argc, char** argv) {
                                         info.tensor_rank,
                                         param_names,
                                         params,
-                                        optimizer);
+                                        optimizer,
+                                        optimizer_param_indices);
       if (start_step > steps) {
         throw std::runtime_error("resume checkpoint step is greater than requested --steps");
       }
@@ -1174,10 +1322,13 @@ int main(int argc, char** argv) {
     bool trainer_ok = true;
 
     for (int64_t step = start_step; step < steps; ++step) {
+      zero_model_gradients(params);
       optimizer.zero_grad();
-      auto param_before = use_master_weights
-                              ? cverl::torch_backend::clone_detached(optimizer.master_parameters())
-                              : clone_params(params);
+      auto param_before = clone_params(params);
+      auto optimizer_param_before =
+          (!dp_shard_optimizer && use_master_weights)
+              ? cverl::torch_backend::clone_detached(optimizer.master_parameters())
+              : std::vector<torch::Tensor>{};
       std::unordered_map<int64_t, torch::Tensor> stage_inputs;
       std::unordered_map<int64_t, torch::Tensor> stage_outputs;
       double loss_sum = 0.0;
@@ -1311,7 +1462,8 @@ int main(int argc, char** argv) {
       sync_tp_replicated_gradients(param_names, params, tp_group, tp_grad_bucket_bytes);
       cverl::distributed::data_parallel_sync_gradients(
           params, dp_comm, dp_group.ranks, true, dp_grad_bucket_bytes);
-      const double local_grad_norm_sq = optimizer.grad_l2_norm_sq();
+      const double local_grad_norm_sq =
+          dp_shard_optimizer ? grad_l2_norm_sq(params) : optimizer.grad_l2_norm_sq();
       auto grad_sq_tensor =
           torch::tensor({local_grad_norm_sq}, torch::TensorOptions().device(device).dtype(torch::kFloat32));
       auto global_grad_sq_tensor =
@@ -1322,18 +1474,32 @@ int main(int argc, char** argv) {
       double grad_clip_scale = 1.0;
       if (max_grad_norm > 0.0 && std::isfinite(global_grad_norm) && global_grad_norm > max_grad_norm) {
         grad_clip_scale = max_grad_norm / (global_grad_norm + 1.0e-6);
-        optimizer.scale_gradients(grad_clip_scale);
+        if (dp_shard_optimizer) {
+          scale_model_gradients(params, grad_clip_scale);
+        } else {
+          optimizer.scale_gradients(grad_clip_scale);
+        }
       }
-      const double local_grad_norm = optimizer.grad_norm_sum();
+      const double local_grad_norm =
+          dp_shard_optimizer ? grad_norm_sum(params) : optimizer.grad_norm_sum();
       if (!skip_optimizer_step) {
         optimizer.step();
+        if (dp_shard_optimizer) {
+          broadcast_dp_sharded_optimizer_parameters(param_names,
+                                                    params,
+                                                    dp_optimizer_owner_by_param,
+                                                    dp_comm,
+                                                    dp_group.ranks,
+                                                    dp_grad_bucket_bytes);
+        }
       }
       const double local_param_delta =
           skip_optimizer_step
               ? 0.0
-              : (use_master_weights ? cverl::torch_backend::parameter_delta_sum(
-                                          param_before, optimizer.master_parameters())
-                                    : cverl::torch_backend::parameter_delta_sum(param_before, params));
+              : ((!dp_shard_optimizer && use_master_weights)
+                     ? cverl::torch_backend::parameter_delta_sum(
+                           optimizer_param_before, optimizer.master_parameters())
+                     : cverl::torch_backend::parameter_delta_sum(param_before, params));
       if (checkpoint_every > 0 && (step + 1) % checkpoint_every == 0) {
         save_rank_checkpoint(checkpoint_dir,
                              step,
@@ -1348,7 +1514,8 @@ int main(int argc, char** argv) {
                              range.end,
                              param_names,
                              params,
-                             optimizer);
+                             optimizer,
+                             optimizer_param_indices);
         full_comm.barrier();
         if (global_rank == 0) {
           write_checkpoint_manifest(checkpoint_dir, step, world_size, dp_size, pp_size, tp_size, optimizer);
@@ -1435,6 +1602,9 @@ int main(int argc, char** argv) {
                   << " prompt_len=" << prompt_len
                   << " response_len=" << response_len
                   << " master_weights=" << (use_master_weights ? "true" : "false")
+                  << " dp_shard_optimizer=" << (dp_shard_optimizer ? "true" : "false")
+                  << " optimizer_params=" << optimizer_param_indices.size()
+                  << " total_params=" << params.size()
                   << " dp_grad_bucket_mb=" << dp_grad_bucket_mb
                   << " tp_grad_bucket_mb=" << tp_grad_bucket_mb
                   << " resumed_from_step=" << start_step

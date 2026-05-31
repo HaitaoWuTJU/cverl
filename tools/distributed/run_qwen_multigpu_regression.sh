@@ -45,9 +45,10 @@ run_case() {
   local pp="$3"
   local tp="$4"
   local micro_batches="$5"
+  local dp_shard_optimizer="${6:-false}"
   local log="${OUT_DIR}/${name}.log"
 
-  echo "running ${name}: DP=${dp} PP=${pp} TP=${tp} micro_batches=${micro_batches} steps=${STEPS}"
+  echo "running ${name}: DP=${dp} PP=${pp} TP=${tp} micro_batches=${micro_batches} dp_shard_optimizer=${dp_shard_optimizer} steps=${STEPS}"
   (
     cd "${ROOT_DIR}"
     NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME}" \
@@ -69,6 +70,7 @@ run_case() {
     JSONL_INPUT="${JSONL_INPUT}" \
     JSONL_MAX_EXAMPLES="${JSONL_MAX_EXAMPLES}" \
     TOKENIZER_JSON="${TOKENIZER_JSON}" \
+    DP_SHARD_OPTIMIZER="${dp_shard_optimizer}" \
     SKIP_OPTIMIZER_STEP=false \
       tools/distributed/run_qwen_pp_tp_ppo_trainer.sh "${MODEL_DIR}"
   ) | tee "${log}"
@@ -115,5 +117,6 @@ fi
 run_case "qwen_pp2_tp2_ppo_5step" 1 2 2 2
 run_case "qwen_pp4_tp1_ppo_5step" 1 4 1 4
 run_case "qwen_dp2_pp1_tp2_ppo_5step" 2 1 2 1
+run_case "qwen_dp2_pp1_tp2_sharded_optim_5step" 2 1 2 1 true
 
 echo "multi-GPU Qwen PPO regression passed"
