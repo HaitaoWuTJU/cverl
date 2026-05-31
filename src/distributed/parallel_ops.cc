@@ -39,12 +39,18 @@ void flush_grad_bucket(std::vector<GradBucketEntry>* bucket,
     return;
   }
 
-  std::vector<torch::Tensor> flat_grads;
-  flat_grads.reserve(bucket->size());
-  for (const auto& entry : *bucket) {
-    flat_grads.push_back(entry.grad.contiguous().view({entry.numel}));
+  torch::Tensor flat;
+  if (bucket->size() == 1) {
+    const auto& entry = bucket->front();
+    flat = entry.grad.contiguous().view({entry.numel});
+  } else {
+    std::vector<torch::Tensor> flat_grads;
+    flat_grads.reserve(bucket->size());
+    for (const auto& entry : *bucket) {
+      flat_grads.push_back(entry.grad.contiguous().view({entry.numel}));
+    }
+    flat = torch::cat(flat_grads, 0).contiguous();
   }
-  auto flat = torch::cat(flat_grads, 0).contiguous();
   auto synced = collectives.all_reduce(flat, average ? ReduceOp::Mean : ReduceOp::Sum, data_group).contiguous();
   int64_t offset = 0;
   for (const auto& entry : *bucket) {
@@ -67,19 +73,27 @@ void flush_grad_reduce_scatter_bucket(std::vector<GradBucketEntry>* bucket,
     throw std::invalid_argument("data_parallel_reduce_scatter_gradients requires non-empty data group");
   }
 
-  std::vector<torch::Tensor> flat_grads;
-  flat_grads.reserve(bucket->size());
   int64_t original_numel = 0;
   GradientReduceScatterBucket meta;
   meta.parameter_indices.reserve(bucket->size());
   meta.parameter_numels.reserve(bucket->size());
   for (const auto& entry : *bucket) {
-    flat_grads.push_back(entry.grad.contiguous().view({entry.numel}));
     original_numel += entry.numel;
     meta.parameter_indices.push_back(entry.parameter_index);
     meta.parameter_numels.push_back(entry.numel);
   }
-  auto flat = torch::cat(flat_grads, 0).contiguous();
+  torch::Tensor flat;
+  if (bucket->size() == 1) {
+    const auto& entry = bucket->front();
+    flat = entry.grad.contiguous().view({entry.numel});
+  } else {
+    std::vector<torch::Tensor> flat_grads;
+    flat_grads.reserve(bucket->size());
+    for (const auto& entry : *bucket) {
+      flat_grads.push_back(entry.grad.contiguous().view({entry.numel}));
+    }
+    flat = torch::cat(flat_grads, 0).contiguous();
+  }
   const int64_t group_size = static_cast<int64_t>(data_group.size());
   const int64_t remainder = flat.numel() % group_size;
   const int64_t pad = remainder == 0 ? 0 : group_size - remainder;

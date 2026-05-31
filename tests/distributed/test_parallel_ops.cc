@@ -12,6 +12,8 @@ class CountingCollectives final : public cverl::distributed::Collectives {
  public:
   int64_t all_reduce_calls = 0;
   int64_t reduce_scatter_calls = 0;
+  int64_t last_all_reduce_numel = 0;
+  int64_t last_reduce_scatter_numel = 0;
 
   int64_t rank() const override { return 0; }
   int64_t world_size() const override { return 1; }
@@ -32,6 +34,7 @@ class CountingCollectives final : public cverl::distributed::Collectives {
                            const std::vector<int64_t>& group) override {
     require_group(group);
     ++all_reduce_calls;
+    last_all_reduce_numel = input.numel();
     return input.clone();
   }
 
@@ -48,6 +51,7 @@ class CountingCollectives final : public cverl::distributed::Collectives {
                                int64_t /*dim*/) override {
     require_group(group);
     ++reduce_scatter_calls;
+    last_reduce_scatter_numel = input.numel();
     return input.clone();
   }
 
@@ -210,6 +214,9 @@ void test_dp_sync_bucketed() {
   if (collectives.all_reduce_calls != 1) {
     throw std::runtime_error("bucketed dp sync should use one all_reduce for same dtype/device");
   }
+  if (collectives.last_all_reduce_numel != p0.numel() + p1.numel() + p2.numel()) {
+    throw std::runtime_error("bucketed dp sync all_reduce numel mismatch");
+  }
   require_allclose(p0.grad(), g0, "bucketed dp sync p0");
   require_allclose(p1.grad(), g1, "bucketed dp sync p1");
   require_allclose(p2.grad(), g2, "bucketed dp sync p2");
@@ -218,6 +225,9 @@ void test_dp_sync_bucketed() {
   cverl::distributed::data_parallel_sync_gradients({p0, p1, p2}, collectives, {0}, true, 16);
   if (collectives.all_reduce_calls <= 1) {
     throw std::runtime_error("small dp sync bucket should split all_reduce calls");
+  }
+  if (collectives.last_all_reduce_numel != p2.numel()) {
+    throw std::runtime_error("single-entry dp sync bucket should all_reduce only that tensor");
   }
 }
 
@@ -237,6 +247,9 @@ void test_dp_reduce_scatter_bucketed_single_process() {
   if (collectives.reduce_scatter_calls != 1 || buckets.size() != 1) {
     throw std::runtime_error("reduce-scatter gradients should use one bucket for same dtype/device");
   }
+  if (collectives.last_reduce_scatter_numel != p0.numel() + p1.numel() + p2.numel()) {
+    throw std::runtime_error("reduce-scatter gradient bucket numel mismatch");
+  }
   require_allclose(buckets[0].shard, torch::cat({g0, g1, g2}, 0), "reduce-scatter flat shard");
   if (buckets[0].original_numel != g0.numel() + g1.numel() + g2.numel() ||
       buckets[0].padded_numel != buckets[0].original_numel) {
@@ -252,6 +265,9 @@ void test_dp_reduce_scatter_bucketed_single_process() {
       {p0, p1, p2}, collectives, {0}, true, 16);
   if (collectives.reduce_scatter_calls <= 1 || buckets.size() <= 1) {
     throw std::runtime_error("small reduce-scatter bucket should split calls");
+  }
+  if (collectives.last_reduce_scatter_numel != p2.numel()) {
+    throw std::runtime_error("single-entry reduce-scatter bucket should reduce only that tensor");
   }
 }
 
