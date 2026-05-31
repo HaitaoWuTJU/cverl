@@ -253,6 +253,11 @@ void test_dp_sync_bucketed() {
   if (collectives.last_all_reduce_numel != p2.numel()) {
     throw std::runtime_error("single-entry dp sync bucket should all_reduce only that tensor");
   }
+
+  CountingCollectives outside_rank(3, 2);
+  require_throws([&]() {
+    cverl::distributed::data_parallel_sync_gradients({p0}, outside_rank, {0, 1}, true, 1024);
+  }, "multi-rank dp sync should reject rank outside data group before collectives");
 }
 
 void test_dp_reduce_scatter_bucketed_single_process() {
@@ -293,6 +298,12 @@ void test_dp_reduce_scatter_bucketed_single_process() {
   if (collectives.last_reduce_scatter_numel != 0) {
     throw std::runtime_error("single-rank reduce-scatter should keep default last numel");
   }
+
+  CountingCollectives outside_rank(3, 2);
+  require_throws([&]() {
+    (void)cverl::distributed::data_parallel_reduce_scatter_gradients(
+        {p0}, outside_rank, {0, 1}, true, 1024);
+  }, "multi-rank reduce-scatter should reject rank outside data group before collectives");
 }
 
 void test_single_process_collectives_validation() {

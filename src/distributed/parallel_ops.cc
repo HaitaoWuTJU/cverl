@@ -16,6 +16,18 @@ void validate_group(const ParallelGroup& group) {
   }
 }
 
+void require_rank_in_group(int64_t rank, const std::vector<int64_t>& group, const char* name) {
+  if (group.empty()) {
+    throw std::invalid_argument(std::string(name) + " requires non-empty data group");
+  }
+  for (int64_t member : group) {
+    if (member == rank) {
+      return;
+    }
+  }
+  throw std::invalid_argument(std::string(name) + " collectives rank is not in data group");
+}
+
 torch::Tensor dense_linear(const torch::Tensor& input, const torch::Tensor& weight) {
   auto x = input.scalar_type() == weight.scalar_type() ? input : input.to(weight.scalar_type());
   return torch::matmul(x, weight.transpose(0, 1));
@@ -191,13 +203,8 @@ void data_parallel_sync_gradients(const std::vector<torch::Tensor>& parameters,
   if (bucket_bytes <= 0) {
     throw std::invalid_argument("data_parallel_sync_gradients bucket_bytes must be positive");
   }
-  if (data_group.empty()) {
-    throw std::invalid_argument("data_parallel_sync_gradients requires non-empty data group");
-  }
+  require_rank_in_group(collectives.rank(), data_group, "data_parallel_sync_gradients");
   if (data_group.size() == 1) {
-    if (data_group[0] != collectives.rank()) {
-      throw std::invalid_argument("data_parallel_sync_gradients collectives rank is not in data group");
-    }
     return;
   }
   std::vector<GradBucketEntry> bucket;
@@ -242,12 +249,7 @@ std::vector<GradientReduceScatterBucket> data_parallel_reduce_scatter_gradients(
   if (bucket_bytes <= 0) {
     throw std::invalid_argument("data_parallel_reduce_scatter_gradients bucket_bytes must be positive");
   }
-  if (data_group.empty()) {
-    throw std::invalid_argument("data_parallel_reduce_scatter_gradients requires non-empty data group");
-  }
-  if (data_group.size() == 1 && data_group[0] != collectives.rank()) {
-    throw std::invalid_argument("data_parallel_reduce_scatter_gradients collectives rank is not in data group");
-  }
+  require_rank_in_group(collectives.rank(), data_group, "data_parallel_reduce_scatter_gradients");
   std::vector<GradientReduceScatterBucket> out;
   std::vector<GradBucketEntry> bucket;
   bucket.reserve(parameters.size());
