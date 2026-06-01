@@ -1,4 +1,5 @@
 #include "cverl/model/qwen3_5_text.h"
+#include "cverl/distributed/expert_parallel.h"
 #include "cverl/model/qwen_linear_attention_cuda.h"
 
 #include <algorithm>
@@ -33,6 +34,24 @@ int64_t regex_i64(const std::string& text, const std::string& key, int64_t fallb
   std::regex pattern("\"" + key + "\"\\s*:\\s*([0-9]+)");
   if (std::regex_search(text, match, pattern)) {
     return std::stoll(match[1].str());
+  }
+  return fallback;
+}
+
+std::string regex_string(const std::string& text, const std::string& key, const std::string& fallback = {}) {
+  std::smatch match;
+  std::regex pattern("\"" + key + "\"\\s*:\\s*\"([^\"]*)\"");
+  if (std::regex_search(text, match, pattern)) {
+    return match[1].str();
+  }
+  return fallback;
+}
+
+bool regex_bool(const std::string& text, const std::string& key, bool fallback) {
+  std::smatch match;
+  std::regex pattern("\"" + key + "\"\\s*:\\s*(true|false)");
+  if (std::regex_search(text, match, pattern)) {
+    return match[1].str() == "true";
   }
   return fallback;
 }
@@ -502,8 +521,21 @@ torch::Tensor linear_attention_attach_final_state_carry(const torch::Tensor& loc
   return LinearAttentionFinalStateSendFunction::apply(local_output, final_state, collectives_addr, next_peer);
 }
 
-std::string layer_prefix(int64_t layer_idx) {
-  return "model.language_model.layers." + std::to_string(layer_idx) + ".";
+std::string layer_prefix(const Qwen35TextConfig& cfg, int64_t layer_idx) {
+  const char* root = cfg.is_qwen3_moe() ? "model.layers." : "model.language_model.layers.";
+  return std::string(root) + std::to_string(layer_idx) + ".";
+}
+
+std::string embed_weight_name(const Qwen35TextConfig& cfg) {
+  return cfg.is_qwen3_moe() ? "model.embed_tokens.weight" : "model.language_model.embed_tokens.weight";
+}
+
+std::string final_norm_weight_name(const Qwen35TextConfig& cfg) {
+  return cfg.is_qwen3_moe() ? "model.norm.weight" : "model.language_model.norm.weight";
+}
+
+std::string lm_head_weight_name(const Qwen35TextConfig& cfg) {
+  return (cfg.is_qwen3_moe() && !cfg.tie_word_embeddings) ? "lm_head.weight" : embed_weight_name(cfg);
 }
 
 }  // namespace
@@ -511,6 +543,7 @@ std::string layer_prefix(int64_t layer_idx) {
 Qwen35TextConfig load_qwen35_text_config(const std::string& model_dir) {
   std::string text = read_file(std::filesystem::path(model_dir) / "config.json");
   Qwen35TextConfig cfg;
+  cfg.model_type = regex_string(text, "model_type", "qwen3_5");
   cfg.vocab_size = regex_i64(text, "vocab_size", cfg.vocab_size);
   cfg.hidden_size = regex_i64(text, "hidden_size", cfg.hidden_size);
   cfg.num_hidden_layers = regex_i64(text, "num_hidden_layers", cfg.num_hidden_layers);
@@ -523,10 +556,23 @@ Qwen35TextConfig load_qwen35_text_config(const std::string& model_dir) {
   cfg.linear_num_key_heads = regex_i64(text, "linear_num_key_heads", cfg.linear_num_key_heads);
   cfg.linear_num_value_heads = regex_i64(text, "linear_num_value_heads", cfg.linear_num_value_heads);
   cfg.linear_conv_kernel_dim = regex_i64(text, "linear_conv_kernel_dim", cfg.linear_conv_kernel_dim);
+  cfg.moe_intermediate_size = regex_i64(text, "moe_intermediate_size", cfg.moe_intermediate_size);
+  cfg.num_experts = regex_i64(text, "num_experts", cfg.num_experts);
+  cfg.num_experts_per_tok = regex_i64(text, "num_experts_per_tok", cfg.num_experts_per_tok);
   cfg.rms_norm_eps = regex_f64(text, "rms_norm_eps", cfg.rms_norm_eps);
   cfg.rope_theta = regex_f64(text, "rope_theta", cfg.rope_theta);
   cfg.partial_rotary_factor = regex_f64(text, "partial_rotary_factor", cfg.partial_rotary_factor);
+  cfg.norm_topk_prob = regex_bool(text, "norm_topk_prob", cfg.norm_topk_prob);
+  cfg.tie_word_embeddings = regex_bool(text, "tie_word_embeddings", cfg.tie_word_embeddings);
   cfg.layer_types = parse_layer_types(text);
+  if (cfg.is_qwen3_moe()) {
+    cfg.partial_rotary_factor = 1.0;
+    cfg.layer_types.assign(static_cast<size_t>(cfg.num_hidden_layers), "full_attention");
+    if (cfg.moe_intermediate_size <= 0 || cfg.num_experts <= 0 || cfg.num_experts_per_tok <= 0) {
+      throw std::runtime_error("qwen3_moe config requires moe_intermediate_size/num_experts/num_experts_per_tok");
+    }
+    return cfg;
+  }
   if (cfg.layer_types.empty()) {
     cfg.layer_types.reserve(cfg.num_hidden_layers);
     for (int64_t i = 0; i < cfg.num_hidden_layers; ++i) {
@@ -558,14 +604,32 @@ std::vector<std::string> Qwen35TextModel::required_weight_names(int64_t max_laye
   int64_t layers = max_layers < 0 ? config_.num_hidden_layers
                                   : std::min(max_layers, config_.num_hidden_layers);
   std::vector<std::string> names;
-  names.reserve(static_cast<size_t>(8 + layers * 25));
-  names.emplace_back("model.language_model.embed_tokens.weight");
-  names.emplace_back("model.language_model.norm.weight");
+  names.reserve(static_cast<size_t>(8 + layers * (config_.is_qwen3_moe() ? (12 + config_.num_experts * 3) : 25)));
+  names.emplace_back(embed_weight_name(config_));
+  names.emplace_back(final_norm_weight_name(config_));
+  if (config_.is_qwen3_moe() && !config_.tie_word_embeddings) {
+    names.emplace_back("lm_head.weight");
+  }
   for (int64_t i = 0; i < layers; ++i) {
-    std::string p = layer_prefix(i);
+    std::string p = layer_prefix(config_, i);
     names.emplace_back(p + "input_layernorm.weight");
     names.emplace_back(p + "post_attention_layernorm.weight");
-    if (config_.layer_types.at(static_cast<size_t>(i)) == "full_attention") {
+    if (config_.is_qwen3_moe()) {
+      std::string sa = p + "self_attn.";
+      names.emplace_back(sa + "q_proj.weight");
+      names.emplace_back(sa + "k_proj.weight");
+      names.emplace_back(sa + "v_proj.weight");
+      names.emplace_back(sa + "o_proj.weight");
+      names.emplace_back(sa + "q_norm.weight");
+      names.emplace_back(sa + "k_norm.weight");
+      names.emplace_back(p + "mlp.gate.weight");
+      for (int64_t expert = 0; expert < config_.num_experts; ++expert) {
+        std::string ep = p + "mlp.experts." + std::to_string(expert) + ".";
+        names.emplace_back(ep + "gate_proj.weight");
+        names.emplace_back(ep + "up_proj.weight");
+        names.emplace_back(ep + "down_proj.weight");
+      }
+    } else if (config_.layer_types.at(static_cast<size_t>(i)) == "full_attention") {
       std::string sa = p + "self_attn.";
       names.emplace_back(sa + "q_proj.weight");
       names.emplace_back(sa + "k_proj.weight");
@@ -585,10 +649,12 @@ std::vector<std::string> Qwen35TextModel::required_weight_names(int64_t max_laye
       names.emplace_back(la + "norm.weight");
       names.emplace_back(la + "out_proj.weight");
     }
-    std::string mp = p + "mlp.";
-    names.emplace_back(mp + "gate_proj.weight");
-    names.emplace_back(mp + "up_proj.weight");
-    names.emplace_back(mp + "down_proj.weight");
+    if (!config_.is_qwen3_moe()) {
+      std::string mp = p + "mlp.";
+      names.emplace_back(mp + "gate_proj.weight");
+      names.emplace_back(mp + "up_proj.weight");
+      names.emplace_back(mp + "down_proj.weight");
+    }
   }
   return names;
 }
@@ -604,7 +670,7 @@ torch::Tensor Qwen35TextModel::weight(const std::string& name) {
 }
 
 torch::Tensor Qwen35TextModel::embed(const torch::Tensor& input_ids) {
-  auto emb = weight("model.language_model.embed_tokens.weight");
+  auto emb = weight(embed_weight_name(config_));
   auto ids = input_ids.to(torch::TensorOptions().dtype(torch::kLong).device(emb.device()));
   return torch::nn::functional::embedding(ids, emb);
 }
@@ -612,7 +678,8 @@ torch::Tensor Qwen35TextModel::embed(const torch::Tensor& input_ids) {
 torch::Tensor Qwen35TextModel::rms_norm(const torch::Tensor& x, const torch::Tensor& w) const {
   auto xf = x.to(torch::kFloat32);
   auto out = xf * torch::rsqrt((xf * xf).mean(-1, true) + config_.rms_norm_eps);
-  return (out * (1.0 + w.to(torch::kFloat32))).to(x.scalar_type());
+  auto scale = config_.is_qwen3_moe() ? w.to(torch::kFloat32) : (1.0 + w.to(torch::kFloat32));
+  return (out * scale).to(x.scalar_type());
 }
 
 torch::Tensor Qwen35TextModel::rms_norm_gated(const torch::Tensor& x,
@@ -670,16 +737,259 @@ std::pair<torch::Tensor, torch::Tensor> Qwen35TextModel::rotary_embeddings_range
 }
 
 torch::Tensor Qwen35TextModel::mlp(const torch::Tensor& x, int64_t layer_idx) {
-  std::string p = layer_prefix(layer_idx) + "mlp.";
+  std::string p = layer_prefix(config_, layer_idx) + "mlp.";
+  if (config_.is_qwen3_moe()) {
+    auto flat = x.reshape({-1, config_.hidden_size});
+    auto router_logits = dense(flat, weight(p + "gate.weight")).to(torch::kFloat32);
+    auto routing = torch::softmax(router_logits, -1);
+    auto topk = routing.topk(config_.num_experts_per_tok, -1, true, false);
+    auto topk_weights = std::get<0>(topk);
+    auto topk_indices = std::get<1>(topk);
+    if (config_.norm_topk_prob) {
+      topk_weights = topk_weights / topk_weights.sum(-1, true).clamp_min(1.0e-12);
+    }
+    auto out = torch::zeros_like(flat);
+    for (int64_t expert = 0; expert < config_.num_experts; ++expert) {
+      auto positions = torch::nonzero(topk_indices == expert);
+      if (positions.numel() == 0) {
+        continue;
+      }
+      auto token_indices = positions.index({Slice(), 0}).to(torch::TensorOptions().dtype(torch::kLong).device(flat.device()));
+      auto slot_indices = positions.index({Slice(), 1}).to(torch::TensorOptions().dtype(torch::kLong).device(flat.device()));
+      auto selected = flat.index_select(0, token_indices);
+      std::string ep = p + "experts." + std::to_string(expert) + ".";
+      auto gate = dense(selected, weight(ep + "gate_proj.weight"));
+      auto up = dense(selected, weight(ep + "up_proj.weight"));
+      auto expert_out = dense(torch::silu(gate) * up, weight(ep + "down_proj.weight"));
+      auto expert_weight = topk_weights.index({token_indices, slot_indices}).unsqueeze(-1).to(expert_out.scalar_type());
+      out.index_add_(0, token_indices, expert_out * expert_weight);
+    }
+    return out.reshape_as(x);
+  }
   auto gate = dense(x, weight(p + "gate_proj.weight"));
   auto up = dense(x, weight(p + "up_proj.weight"));
   return dense(torch::silu(gate) * up, weight(p + "down_proj.weight"));
 }
 
+torch::Tensor Qwen35TextModel::mlp_expert_parallel(const torch::Tensor& x,
+                                                   int64_t layer_idx,
+                                                   const distributed::ParallelGroup& tensor_group,
+                                                   const distributed::ParallelGroup& expert_group) {
+  if (!config_.is_qwen3_moe()) {
+    return mlp(x, layer_idx);
+  }
+  if (tensor_group.world_size <= 0 || tensor_group.rank < 0 || tensor_group.rank >= tensor_group.world_size) {
+    throw std::invalid_argument("Qwen3 MoE TP+EP MLP has invalid TP rank/world_size");
+  }
+
+  std::string p = layer_prefix(config_, layer_idx) + "mlp.";
+  auto flat = x.reshape({-1, config_.hidden_size});
+  auto router_logits = dense(flat, weight(p + "gate.weight")).to(torch::kFloat32);
+  auto routing = torch::softmax(router_logits, -1);
+  auto topk = routing.topk(config_.num_experts_per_tok, -1, true, false);
+  auto topk_weights = std::get<0>(topk);
+  auto topk_indices = std::get<1>(topk);
+  if (config_.norm_topk_prob) {
+    topk_weights = topk_weights / topk_weights.sum(-1, true).clamp_min(1.0e-12);
+  }
+  if (config_.moe_intermediate_size % tensor_group.world_size != 0) {
+    throw std::invalid_argument("Qwen3 MoE expert intermediate size must be divisible by TP size");
+  }
+  const int64_t intermediate_local = config_.moe_intermediate_size / tensor_group.world_size;
+
+  if (expert_group.world_size == 1) {
+    auto out = torch::zeros_like(flat);
+    for (int64_t expert = 0; expert < config_.num_experts; ++expert) {
+      auto positions = torch::nonzero(topk_indices == expert);
+      if (positions.numel() == 0) {
+        continue;
+      }
+      auto token_indices = positions.index({Slice(), 0}).to(torch::TensorOptions().dtype(torch::kLong).device(flat.device()));
+      auto slot_indices = positions.index({Slice(), 1}).to(torch::TensorOptions().dtype(torch::kLong).device(flat.device()));
+      auto selected = flat.index_select(0, token_indices);
+      std::string ep = p + "experts." + std::to_string(expert) + ".";
+      auto gate_weight = local_or_shard_dim(weight(ep + "gate_proj.weight"),
+                                            0,
+                                            config_.moe_intermediate_size,
+                                            tensor_group.rank,
+                                            tensor_group.world_size,
+                                            ep + "gate_proj.weight");
+      auto up_weight = local_or_shard_dim(weight(ep + "up_proj.weight"),
+                                          0,
+                                          config_.moe_intermediate_size,
+                                          tensor_group.rank,
+                                          tensor_group.world_size,
+                                          ep + "up_proj.weight");
+      auto down_weight = local_or_shard_dim(weight(ep + "down_proj.weight"),
+                                            1,
+                                            config_.moe_intermediate_size,
+                                            tensor_group.rank,
+                                            tensor_group.world_size,
+                                            ep + "down_proj.weight");
+      if (gate_weight.size(0) != intermediate_local || up_weight.size(0) != intermediate_local ||
+          down_weight.size(1) != intermediate_local) {
+        throw std::invalid_argument("Qwen3 MoE TP expert shard shape mismatch");
+      }
+      auto gate = dense(selected, gate_weight);
+      auto up = dense(selected, up_weight);
+      auto expert_out = dense(torch::silu(gate) * up, down_weight);
+      auto expert_weight = topk_weights.index({token_indices, slot_indices}).unsqueeze(-1).to(expert_out.scalar_type());
+      out.index_add_(0, token_indices, expert_out * expert_weight);
+    }
+    if (tensor_group.world_size > 1) {
+      out = all_reduce_sum_preserve_local_grad(out.contiguous(), tensor_group);
+    }
+    return out.reshape_as(x);
+  }
+
+  if (expert_group.collectives == nullptr) {
+    throw std::invalid_argument("Qwen3 MoE EP MLP requires collectives");
+  }
+  if (config_.num_experts % expert_group.world_size != 0) {
+    throw std::invalid_argument("Qwen3 MoE expert count must be divisible by EP size");
+  }
+  if (expert_group.rank < 0 || expert_group.rank >= expert_group.world_size) {
+    throw std::invalid_argument("invalid Qwen3 MoE EP rank");
+  }
+
+  const int64_t experts_per_rank = config_.num_experts / expert_group.world_size;
+  const int64_t expert_begin = expert_group.rank * experts_per_rank;
+  const int64_t expert_end = expert_begin + experts_per_rank;
+  const int64_t route_count = flat.size(0) * config_.num_experts_per_tok;
+  auto long_options = torch::TensorOptions().dtype(torch::kLong).device(flat.device());
+  auto token_indices =
+      torch::arange(0, flat.size(0), long_options).repeat_interleave(config_.num_experts_per_tok).contiguous();
+  auto expert_indices = topk_indices.reshape({route_count}).contiguous();
+  auto route_weights = topk_weights.reshape({route_count}).contiguous();
+  auto destination_ranks = torch::floor_divide(expert_indices, experts_per_rank).contiguous();
+  auto route_tokens = flat.index_select(0, token_indices);
+  auto dispatch = distributed::expert_parallel_dispatch_equal_capacity(
+      route_tokens.contiguous(), destination_ranks, *expert_group.collectives, expert_group.ranks);
+
+  const int64_t capacity = dispatch.capacity;
+  auto metadata_size = expert_group.world_size * capacity;
+  auto source_token_payload = torch::full({metadata_size}, -1, long_options);
+  auto expert_payload = torch::full({metadata_size}, -1, long_options);
+  auto weight_payload = torch::zeros({metadata_size}, route_weights.options());
+  if (capacity > 0) {
+    for (int64_t dest = 0; dest < expert_group.world_size; ++dest) {
+      auto positions =
+          torch::nonzero(destination_ranks == dest).flatten().to(torch::TensorOptions().dtype(torch::kLong).device(flat.device()));
+      const int64_t count = positions.numel();
+      if (count == 0) {
+        continue;
+      }
+      auto payload_indices =
+          torch::arange(dest * capacity, dest * capacity + count, torch::TensorOptions().dtype(torch::kLong).device(flat.device()));
+      source_token_payload.index_put_({payload_indices}, token_indices.index_select(0, positions));
+      expert_payload.index_put_({payload_indices}, expert_indices.index_select(0, positions));
+      weight_payload = weight_payload.index_add(0, payload_indices, route_weights.index_select(0, positions));
+    }
+  }
+
+  auto received_experts = expert_group.collectives->all_to_all(expert_payload.contiguous(), expert_group.ranks, 0)
+                              .contiguous();
+  auto local_return = torch::zeros_like(dispatch.received_tokens);
+  int64_t local_expert_capacity = 0;
+  std::vector<torch::Tensor> local_expert_positions;
+  local_expert_positions.reserve(static_cast<size_t>(experts_per_rank));
+  for (int64_t expert = expert_begin; expert < expert_end; ++expert) {
+    auto positions = torch::nonzero(received_experts == expert).flatten().to(long_options);
+    local_expert_capacity = std::max<int64_t>(local_expert_capacity, positions.numel());
+    local_expert_positions.push_back(positions);
+  }
+  if (local_expert_capacity > 0) {
+    std::vector<torch::Tensor> packed_indices_parts;
+    std::vector<torch::Tensor> return_indices_parts;
+    packed_indices_parts.reserve(static_cast<size_t>(experts_per_rank));
+    return_indices_parts.reserve(static_cast<size_t>(experts_per_rank));
+    for (int64_t local_expert = 0; local_expert < experts_per_rank; ++local_expert) {
+      const auto& positions = local_expert_positions.at(static_cast<size_t>(local_expert));
+      const int64_t count = positions.numel();
+      if (count == 0) {
+        continue;
+      }
+      packed_indices_parts.push_back(
+          torch::arange(local_expert * local_expert_capacity,
+                        local_expert * local_expert_capacity + count,
+                        long_options));
+      return_indices_parts.push_back(positions);
+    }
+
+    auto packed_indices = torch::cat(packed_indices_parts, 0).contiguous();
+    auto return_indices = torch::cat(return_indices_parts, 0).contiguous();
+    auto packed_flat = torch::zeros({experts_per_rank * local_expert_capacity, config_.hidden_size},
+                                    dispatch.received_tokens.options());
+    packed_flat = packed_flat.index_add(0, packed_indices, dispatch.received_tokens.index_select(0, return_indices));
+    auto packed_tokens = packed_flat.view({experts_per_rank, local_expert_capacity, config_.hidden_size});
+
+    std::vector<torch::Tensor> gate_weights;
+    std::vector<torch::Tensor> up_weights;
+    std::vector<torch::Tensor> down_weights;
+    gate_weights.reserve(static_cast<size_t>(experts_per_rank));
+    up_weights.reserve(static_cast<size_t>(experts_per_rank));
+    down_weights.reserve(static_cast<size_t>(experts_per_rank));
+    for (int64_t expert = expert_begin; expert < expert_end; ++expert) {
+      std::string ep = p + "experts." + std::to_string(expert) + ".";
+      gate_weights.push_back(local_or_shard_dim(weight(ep + "gate_proj.weight"),
+                                                0,
+                                                config_.moe_intermediate_size,
+                                                tensor_group.rank,
+                                                tensor_group.world_size,
+                                                ep + "gate_proj.weight"));
+      up_weights.push_back(local_or_shard_dim(weight(ep + "up_proj.weight"),
+                                              0,
+                                              config_.moe_intermediate_size,
+                                              tensor_group.rank,
+                                              tensor_group.world_size,
+                                              ep + "up_proj.weight"));
+      down_weights.push_back(local_or_shard_dim(weight(ep + "down_proj.weight"),
+                                                1,
+                                                config_.moe_intermediate_size,
+                                                tensor_group.rank,
+                                                tensor_group.world_size,
+                                                ep + "down_proj.weight"));
+    }
+
+    auto gate_stack = torch::stack(gate_weights, 0).contiguous();
+    auto up_stack = torch::stack(up_weights, 0).contiguous();
+    auto down_stack = torch::stack(down_weights, 0).contiguous();
+    if (gate_stack.size(1) != intermediate_local || up_stack.size(1) != intermediate_local ||
+        down_stack.size(2) != intermediate_local) {
+      throw std::invalid_argument("Qwen3 MoE TP expert shard shape mismatch");
+    }
+    auto gate = torch::bmm(packed_tokens, gate_stack.transpose(1, 2));
+    auto up = torch::bmm(packed_tokens, up_stack.transpose(1, 2));
+    auto expert_out = torch::bmm(torch::silu(gate) * up, down_stack.transpose(1, 2));
+    auto expert_out_flat = expert_out.reshape({experts_per_rank * local_expert_capacity, config_.hidden_size});
+    local_return = local_return.index_add(0, return_indices, expert_out_flat.index_select(0, packed_indices));
+  }
+
+  auto returned = distributed::expert_parallel_all_to_all_autograd(
+      local_return.contiguous(), *expert_group.collectives, expert_group.ranks, 0);
+  auto valid_positions = torch::nonzero(source_token_payload >= 0).flatten().to(long_options);
+  auto out = torch::zeros_like(flat);
+  if (valid_positions.numel() > 0) {
+    auto weighted = returned.index_select(0, valid_positions) *
+                    weight_payload.index_select(0, valid_positions).unsqueeze(-1).to(returned.scalar_type());
+    out.index_add_(0, source_token_payload.index_select(0, valid_positions), weighted);
+  }
+  if (tensor_group.world_size > 1) {
+    out = all_reduce_sum_preserve_local_grad(out.contiguous(), tensor_group);
+  }
+  return out.reshape_as(x);
+}
+
 torch::Tensor Qwen35TextModel::mlp_tensor_parallel(const torch::Tensor& x,
                                                    int64_t layer_idx,
                                                    const distributed::ParallelGroup& tensor_group) {
-  std::string p = layer_prefix(layer_idx) + "mlp.";
+  if (config_.is_qwen3_moe()) {
+    if (tensor_group.world_size != 1) {
+      throw std::invalid_argument("Qwen3 MoE TP/EP sparse MLP is not implemented yet; use TP=1 with PP/DP for SFT smoke");
+    }
+    return mlp(x, layer_idx);
+  }
+  std::string p = layer_prefix(config_, layer_idx) + "mlp.";
   auto gate_weight = local_or_shard_dim(
       weight(p + "gate_proj.weight"), 0, config_.intermediate_size, tensor_group.rank, tensor_group.world_size,
       p + "gate_proj.weight");
@@ -701,18 +1011,34 @@ torch::Tensor Qwen35TextModel::mlp_tensor_parallel(const torch::Tensor& x,
   return all_reduce_sum_preserve_local_grad(partial.contiguous(), tensor_group);
 }
 
+torch::Tensor Qwen35TextModel::mlp_tensor_expert_parallel(const torch::Tensor& x,
+                                                          int64_t layer_idx,
+                                                          const distributed::ParallelGroup& tensor_group,
+                                                          const distributed::ParallelGroup& expert_group) {
+  if (config_.is_qwen3_moe()) {
+    return mlp_expert_parallel(x, layer_idx, tensor_group, expert_group);
+  }
+  return mlp_tensor_parallel(x, layer_idx, tensor_group);
+}
+
 torch::Tensor Qwen35TextModel::full_attention(const torch::Tensor& x, int64_t layer_idx) {
-  std::string p = layer_prefix(layer_idx) + "self_attn.";
+  std::string p = layer_prefix(config_, layer_idx) + "self_attn.";
   int64_t b = x.size(0);
   int64_t s = x.size(1);
   int64_t h = config_.num_attention_heads;
   int64_t kvh = config_.num_key_value_heads;
   int64_t d = config_.head_dim;
 
-  auto qg = dense(x, weight(p + "q_proj.weight")).view({b, s, h, d * 2});
-  auto chunks = qg.chunk(2, -1);
-  auto q = rms_norm(chunks[0], weight(p + "q_norm.weight")).transpose(1, 2);
-  auto gate = chunks[1].reshape({b, s, h * d});
+  torch::Tensor q;
+  torch::Tensor gate;
+  if (config_.is_qwen3_moe()) {
+    q = rms_norm(dense(x, weight(p + "q_proj.weight")).view({b, s, h, d}), weight(p + "q_norm.weight")).transpose(1, 2);
+  } else {
+    auto qg = dense(x, weight(p + "q_proj.weight")).view({b, s, h, d * 2});
+    auto chunks = qg.chunk(2, -1);
+    q = rms_norm(chunks[0], weight(p + "q_norm.weight")).transpose(1, 2);
+    gate = chunks[1].reshape({b, s, h * d});
+  }
   auto k = rms_norm(dense(x, weight(p + "k_proj.weight")).view({b, s, kvh, d}), weight(p + "k_norm.weight")).transpose(1, 2);
   auto v = dense(x, weight(p + "v_proj.weight")).view({b, s, kvh, d}).transpose(1, 2);
 
@@ -734,7 +1060,10 @@ torch::Tensor Qwen35TextModel::full_attention(const torch::Tensor& x, int64_t la
   attn = attn.masked_fill(mask.unsqueeze(0).unsqueeze(0), -1.0e9);
   attn = torch::softmax(attn.to(torch::kFloat32), -1);
   auto out = torch::matmul(attn, v.to(torch::kFloat32)).transpose(1, 2).contiguous().reshape({b, s, h * d});
-  out = (out * torch::sigmoid(gate.to(torch::kFloat32))).to(x.scalar_type());
+  if (!config_.is_qwen3_moe()) {
+    out = out * torch::sigmoid(gate.to(torch::kFloat32));
+  }
+  out = out.to(x.scalar_type());
   return dense(out, weight(p + "o_proj.weight"));
 }
 
@@ -749,7 +1078,7 @@ torch::Tensor Qwen35TextModel::full_attention_context_parallel(const torch::Tens
   if (context_group.world_size > 1 && context_group.collectives == nullptr) {
     throw std::invalid_argument("Qwen3.5 CP full attention requires collectives");
   }
-  std::string p = layer_prefix(layer_idx) + "self_attn.";
+  std::string p = layer_prefix(config_, layer_idx) + "self_attn.";
   int64_t b = x.size(0);
   int64_t s_local = x.size(1);
   int64_t h = config_.num_attention_heads;
@@ -757,10 +1086,17 @@ torch::Tensor Qwen35TextModel::full_attention_context_parallel(const torch::Tens
   int64_t d = config_.head_dim;
   const int64_t query_begin = context_rank * s_local;
 
-  auto qg = dense(x, weight(p + "q_proj.weight")).view({b, s_local, h, d * 2});
-  auto chunks = qg.chunk(2, -1);
-  auto q = rms_norm(chunks[0], weight(p + "q_norm.weight")).transpose(1, 2);
-  auto gate = chunks[1].reshape({b, s_local, h * d});
+  torch::Tensor q;
+  torch::Tensor gate;
+  if (config_.is_qwen3_moe()) {
+    q = rms_norm(dense(x, weight(p + "q_proj.weight")).view({b, s_local, h, d}), weight(p + "q_norm.weight"))
+            .transpose(1, 2);
+  } else {
+    auto qg = dense(x, weight(p + "q_proj.weight")).view({b, s_local, h, d * 2});
+    auto chunks = qg.chunk(2, -1);
+    q = rms_norm(chunks[0], weight(p + "q_norm.weight")).transpose(1, 2);
+    gate = chunks[1].reshape({b, s_local, h * d});
+  }
   auto k = rms_norm(dense(x, weight(p + "k_proj.weight")).view({b, s_local, kvh, d}), weight(p + "k_norm.weight"))
                .transpose(1, 2);
   auto v = dense(x, weight(p + "v_proj.weight")).view({b, s_local, kvh, d}).transpose(1, 2);
@@ -788,14 +1124,20 @@ torch::Tensor Qwen35TextModel::full_attention_context_parallel(const torch::Tens
       original_sequence_length,
       1.0 / std::sqrt(static_cast<double>(d)));
   auto out = context_out.transpose(1, 2).contiguous().reshape({b, s_local, h * d});
-  out = (out * torch::sigmoid(gate.to(torch::kFloat32))).to(x.scalar_type());
+  if (!config_.is_qwen3_moe()) {
+    out = out * torch::sigmoid(gate.to(torch::kFloat32));
+  }
+  out = out.to(x.scalar_type());
   return dense(out, weight(p + "o_proj.weight"));
 }
 
 torch::Tensor Qwen35TextModel::full_attention_tensor_parallel(const torch::Tensor& x,
                                                               int64_t layer_idx,
                                                               const distributed::ParallelGroup& tensor_group) {
-  std::string p = layer_prefix(layer_idx) + "self_attn.";
+  if (config_.is_qwen3_moe() && tensor_group.world_size == 1) {
+    return full_attention(x, layer_idx);
+  }
+  std::string p = layer_prefix(config_, layer_idx) + "self_attn.";
   if (config_.num_attention_heads % tensor_group.world_size != 0) {
     throw std::invalid_argument("Qwen3.5 full attention TP requires num_attention_heads divisible by TP size");
   }
@@ -811,12 +1153,20 @@ torch::Tensor Qwen35TextModel::full_attention_tensor_parallel(const torch::Tenso
   int64_t kvh_local = kvh / tensor_group.world_size;
   int64_t d = config_.head_dim;
 
-  auto q_weight = local_or_shard_dim(
-      weight(p + "q_proj.weight"), 0, h * d * 2, tensor_group.rank, tensor_group.world_size, p + "q_proj.weight");
-  auto qg = dense(x, q_weight).view({b, s, h_local, d * 2});
-  auto chunks = qg.chunk(2, -1);
-  auto q = rms_norm(chunks[0], weight(p + "q_norm.weight")).transpose(1, 2);
-  auto gate = chunks[1].reshape({b, s, h_local * d});
+  torch::Tensor q;
+  torch::Tensor gate;
+  if (config_.is_qwen3_moe()) {
+    auto q_weight = local_or_shard_dim(
+        weight(p + "q_proj.weight"), 0, h * d, tensor_group.rank, tensor_group.world_size, p + "q_proj.weight");
+    q = rms_norm(dense(x, q_weight).view({b, s, h_local, d}), weight(p + "q_norm.weight")).transpose(1, 2);
+  } else {
+    auto q_weight = local_or_shard_dim(
+        weight(p + "q_proj.weight"), 0, h * d * 2, tensor_group.rank, tensor_group.world_size, p + "q_proj.weight");
+    auto qg = dense(x, q_weight).view({b, s, h_local, d * 2});
+    auto chunks = qg.chunk(2, -1);
+    q = rms_norm(chunks[0], weight(p + "q_norm.weight")).transpose(1, 2);
+    gate = chunks[1].reshape({b, s, h_local * d});
+  }
 
   auto k_weight = local_or_shard_dim(
       weight(p + "k_proj.weight"), 0, kvh * d, tensor_group.rank, tensor_group.world_size, p + "k_proj.weight");
@@ -843,7 +1193,10 @@ torch::Tensor Qwen35TextModel::full_attention_tensor_parallel(const torch::Tenso
   attn = attn.masked_fill(mask.unsqueeze(0).unsqueeze(0), -1.0e9);
   attn = torch::softmax(attn.to(torch::kFloat32), -1);
   auto local = torch::matmul(attn, v.to(torch::kFloat32)).transpose(1, 2).contiguous().reshape({b, s, h_local * d});
-  local = (local * torch::sigmoid(gate.to(torch::kFloat32))).to(x.scalar_type());
+  if (!config_.is_qwen3_moe()) {
+    local = local * torch::sigmoid(gate.to(torch::kFloat32));
+  }
+  local = local.to(x.scalar_type());
   auto o_weight_shard = local_or_shard_dim(
       weight(p + "o_proj.weight"), 1, h * d, tensor_group.rank, tensor_group.world_size, p + "o_proj.weight");
   auto partial = dense(local, o_weight_shard);
@@ -857,7 +1210,7 @@ torch::Tensor Qwen35TextModel::full_attention_tensor_parallel(const torch::Tenso
 }
 
 torch::Tensor Qwen35TextModel::linear_attention(const torch::Tensor& x, int64_t layer_idx) {
-  std::string p = layer_prefix(layer_idx) + "linear_attn.";
+  std::string p = layer_prefix(config_, layer_idx) + "linear_attn.";
   int64_t bsz = x.size(0);
   int64_t seq = x.size(1);
   int64_t kh = config_.linear_num_key_heads;
@@ -913,7 +1266,7 @@ torch::Tensor Qwen35TextModel::linear_attention_context_parallel(const torch::Te
   if (context_group.collectives == nullptr) {
     throw std::invalid_argument("Qwen3.5 CP linear attention requires collectives");
   }
-  std::string p = layer_prefix(layer_idx) + "linear_attn.";
+  std::string p = layer_prefix(config_, layer_idx) + "linear_attn.";
   int64_t bsz = x.size(0);
   int64_t seq_local = x.size(1);
   int64_t kh = config_.linear_num_key_heads;
@@ -985,7 +1338,7 @@ torch::Tensor Qwen35TextModel::linear_attention_context_parallel(const torch::Te
 torch::Tensor Qwen35TextModel::linear_attention_tensor_parallel(const torch::Tensor& x,
                                                                 int64_t layer_idx,
                                                                 const distributed::ParallelGroup& tensor_group) {
-  std::string p = layer_prefix(layer_idx) + "linear_attn.";
+  std::string p = layer_prefix(config_, layer_idx) + "linear_attn.";
   if (config_.linear_num_key_heads % tensor_group.world_size != 0 ||
       config_.linear_num_value_heads % tensor_group.world_size != 0) {
     throw std::invalid_argument("Qwen3.5 linear attention TP requires linear heads divisible by TP size");
@@ -1084,7 +1437,7 @@ torch::Tensor Qwen35TextModel::forward_hidden(const torch::Tensor& input_ids, in
   auto hidden = embed(input_ids);
   int64_t layers = max_layers < 0 ? config_.num_hidden_layers : std::min(max_layers, config_.num_hidden_layers);
   for (int64_t i = 0; i < layers; ++i) {
-    std::string p = layer_prefix(i);
+    std::string p = layer_prefix(config_, i);
     auto residual = hidden;
     hidden = rms_norm(hidden, weight(p + "input_layernorm.weight"));
     if (config_.layer_types.at(static_cast<size_t>(i)) == "full_attention") {
@@ -1097,7 +1450,7 @@ torch::Tensor Qwen35TextModel::forward_hidden(const torch::Tensor& input_ids, in
     hidden = rms_norm(hidden, weight(p + "post_attention_layernorm.weight"));
     hidden = residual + mlp(hidden, i);
   }
-  return rms_norm(hidden, weight("model.language_model.norm.weight"));
+  return rms_norm(hidden, weight(final_norm_weight_name(config_)));
 }
 
 torch::Tensor Qwen35TextModel::forward_hidden_context_parallel(const torch::Tensor& input_ids,
@@ -1124,6 +1477,24 @@ torch::Tensor Qwen35TextModel::forward_hidden_range_context_parallel(const torch
                                                                      const distributed::ParallelGroup& context_group,
                                                                      int64_t original_sequence_length,
                                                                      bool apply_final_norm) {
+  distributed::ParallelGroup expert_group;
+  return forward_hidden_range_context_expert_parallel(hidden_local,
+                                                      layer_begin,
+                                                      layer_end,
+                                                      context_group,
+                                                      expert_group,
+                                                      original_sequence_length,
+                                                      apply_final_norm);
+}
+
+torch::Tensor Qwen35TextModel::forward_hidden_range_context_expert_parallel(
+    const torch::Tensor& hidden_local,
+    int64_t layer_begin,
+    int64_t layer_end,
+    const distributed::ParallelGroup& context_group,
+    const distributed::ParallelGroup& expert_group,
+    int64_t original_sequence_length,
+    bool apply_final_norm) {
   if (layer_begin < 0 || layer_end < layer_begin || layer_end > config_.num_hidden_layers) {
     throw std::invalid_argument("invalid Qwen3.5 CP layer range");
   }
@@ -1131,7 +1502,7 @@ torch::Tensor Qwen35TextModel::forward_hidden_range_context_parallel(const torch
   if (context_group.world_size == 1) {
     auto out = hidden_local;
     for (int64_t i = layer_begin; i < layer_end; ++i) {
-      std::string p = layer_prefix(i);
+      std::string p = layer_prefix(config_, i);
       auto residual = out;
       out = rms_norm(out, weight(p + "input_layernorm.weight"));
       if (config_.layer_types.at(static_cast<size_t>(i)) == "full_attention") {
@@ -1142,16 +1513,16 @@ torch::Tensor Qwen35TextModel::forward_hidden_range_context_parallel(const torch
       out = residual + out;
       residual = out;
       out = rms_norm(out, weight(p + "post_attention_layernorm.weight"));
-      out = residual + mlp(out, i);
+      out = residual + mlp_tensor_expert_parallel(out, i, distributed::ParallelGroup{}, expert_group);
     }
-    return apply_final_norm ? rms_norm(out, weight("model.language_model.norm.weight")) : out;
+    return apply_final_norm ? rms_norm(out, weight(final_norm_weight_name(config_))) : out;
   }
   if (context_group.collectives == nullptr) {
     throw std::invalid_argument("Qwen3.5 CP layer range requires collectives");
   }
   auto out = hidden_local;
   for (int64_t i = layer_begin; i < layer_end; ++i) {
-    std::string p = layer_prefix(i);
+    std::string p = layer_prefix(config_, i);
     auto residual = out;
     out = rms_norm(out, weight(p + "input_layernorm.weight"));
     if (config_.layer_types.at(static_cast<size_t>(i)) == "full_attention") {
@@ -1162,10 +1533,10 @@ torch::Tensor Qwen35TextModel::forward_hidden_range_context_parallel(const torch
     out = residual + out;
     residual = out;
     out = rms_norm(out, weight(p + "post_attention_layernorm.weight"));
-    out = residual + mlp(out, i);
+    out = residual + mlp_tensor_expert_parallel(out, i, distributed::ParallelGroup{}, expert_group);
   }
   if (apply_final_norm) {
-    out = rms_norm(out, weight("model.language_model.norm.weight"));
+    out = rms_norm(out, weight(final_norm_weight_name(config_)));
   }
   return out;
 }
@@ -1176,7 +1547,7 @@ torch::Tensor Qwen35TextModel::token_embeddings(const torch::Tensor& input_ids) 
 
 torch::Tensor Qwen35TextModel::token_embeddings_tensor_parallel(const torch::Tensor& input_ids,
                                                                 const distributed::ParallelGroup& tensor_group) {
-  auto emb = weight("model.language_model.embed_tokens.weight");
+  auto emb = weight(embed_weight_name(config_));
   if (tensor_group.world_size == 1) {
     return embed(input_ids);
   }
@@ -1201,13 +1572,13 @@ torch::Tensor Qwen35TextModel::token_embeddings_tensor_parallel(const torch::Ten
 }
 
 torch::Tensor Qwen35TextModel::lm_head_logits(const torch::Tensor& hidden) {
-  return torch::matmul(hidden.to(torch::kFloat32), weight("model.language_model.embed_tokens.weight").to(torch::kFloat32).transpose(0, 1));
+  return torch::matmul(hidden.to(torch::kFloat32), weight(lm_head_weight_name(config_)).to(torch::kFloat32).transpose(0, 1));
 }
 
 torch::Tensor Qwen35TextModel::response_log_probs_tensor_parallel(const torch::Tensor& hidden,
                                                                   const torch::Tensor& response_ids,
                                                                   const distributed::ParallelGroup& tensor_group) {
-  auto emb = weight("model.language_model.embed_tokens.weight");
+  auto emb = weight(lm_head_weight_name(config_));
   if (tensor_group.world_size == 1) {
     return torch::log_softmax(torch::matmul(hidden.to(torch::kFloat32), emb.to(torch::kFloat32).transpose(0, 1)), -1)
         .gather(-1, response_ids.unsqueeze(-1))
@@ -1254,12 +1625,24 @@ torch::Tensor Qwen35TextModel::forward_hidden_range_tensor_parallel(const torch:
                                                                     int64_t layer_end,
                                                                     const distributed::ParallelGroup& tensor_group,
                                                                     bool apply_final_norm) {
+  distributed::ParallelGroup expert_group;
+  return forward_hidden_range_tensor_expert_parallel(
+      hidden, layer_begin, layer_end, tensor_group, expert_group, apply_final_norm);
+}
+
+torch::Tensor Qwen35TextModel::forward_hidden_range_tensor_expert_parallel(
+    const torch::Tensor& hidden,
+    int64_t layer_begin,
+    int64_t layer_end,
+    const distributed::ParallelGroup& tensor_group,
+    const distributed::ParallelGroup& expert_group,
+    bool apply_final_norm) {
   if (layer_begin < 0 || layer_end < layer_begin || layer_end > config_.num_hidden_layers) {
     throw std::invalid_argument("invalid Qwen3.5 layer range");
   }
   auto out = hidden;
   for (int64_t i = layer_begin; i < layer_end; ++i) {
-    std::string p = layer_prefix(i);
+    std::string p = layer_prefix(config_, i);
     auto residual = out;
     out = rms_norm(out, weight(p + "input_layernorm.weight"));
     if (config_.layer_types.at(static_cast<size_t>(i)) == "full_attention") {
@@ -1270,10 +1653,10 @@ torch::Tensor Qwen35TextModel::forward_hidden_range_tensor_parallel(const torch:
     out = residual + out;
     residual = out;
     out = rms_norm(out, weight(p + "post_attention_layernorm.weight"));
-    out = residual + mlp_tensor_parallel(out, i, tensor_group);
+    out = residual + mlp_tensor_expert_parallel(out, i, tensor_group, expert_group);
   }
   if (apply_final_norm) {
-    out = rms_norm(out, weight("model.language_model.norm.weight"));
+    out = rms_norm(out, weight(final_norm_weight_name(config_)));
   }
   return out;
 }

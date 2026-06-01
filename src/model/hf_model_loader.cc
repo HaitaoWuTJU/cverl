@@ -41,6 +41,9 @@ HfConfigSummary parse_config(const std::filesystem::path& path) {
   cfg.model_type = regex_string(text, "\"model_type\"\\s*:\\s*\"([^\"]+)\"");
   cfg.architecture = regex_string(text, "\"architectures\"\\s*:\\s*\\[\\s*\"([^\"]+)\"");
   cfg.dtype = regex_string(text, "\"dtype\"\\s*:\\s*\"([^\"]+)\"");
+  if (cfg.dtype.empty()) {
+    cfg.dtype = regex_string(text, "\"torch_dtype\"\\s*:\\s*\"([^\"]+)\"");
+  }
   cfg.vocab_size = regex_i64(text, R"("vocab_size"\s*:\s*([0-9]+))");
   cfg.hidden_size = regex_i64(text, R"("hidden_size"\s*:\s*([0-9]+))");
   cfg.num_hidden_layers = regex_i64(text, R"("num_hidden_layers"\s*:\s*([0-9]+))");

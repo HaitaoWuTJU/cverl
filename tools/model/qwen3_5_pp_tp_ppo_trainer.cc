@@ -1,3 +1,4 @@
+#include <array>
 #include <cstdlib>
 #include <cmath>
 #include <filesystem>
@@ -228,12 +229,20 @@ void broadcast_dp_sharded_optimizer_parameters(const std::vector<std::string>& p
 }
 
 bool layer_index_from_weight_name(const std::string& name, int64_t* layer_index) {
-  const std::string marker = "model.language_model.layers.";
-  const size_t pos = name.find(marker);
+  const std::array<std::string, 2> markers = {"model.language_model.layers.", "model.layers."};
+  size_t pos = std::string::npos;
+  size_t marker_size = 0;
+  for (const auto& marker : markers) {
+    pos = name.find(marker);
+    if (pos != std::string::npos) {
+      marker_size = marker.size();
+      break;
+    }
+  }
   if (pos == std::string::npos) {
     return false;
   }
-  const size_t begin = pos + marker.size();
+  const size_t begin = pos + marker_size;
   size_t end = begin;
   while (end < name.size() && name[end] >= '0' && name[end] <= '9') {
     ++end;
@@ -245,28 +254,67 @@ bool layer_index_from_weight_name(const std::string& name, int64_t* layer_index)
   return true;
 }
 
+bool moe_expert_index_from_weight_name(const std::string& name, int64_t* expert_index) {
+  const std::string marker = ".mlp.experts.";
+  const size_t pos = name.find(marker);
+  if (pos == std::string::npos) {
+    return false;
+  }
+  const size_t begin = pos + marker.size();
+  size_t end = begin;
+  while (end < name.size() && name[end] >= '0' && name[end] <= '9') {
+    ++end;
+  }
+  if (end == begin || end >= name.size() || name[end] != '.') {
+    throw std::runtime_error("invalid Qwen MoE expert weight name: " + name);
+  }
+  *expert_index = std::stoll(name.substr(begin, end - begin));
+  return true;
+}
+
+bool ep_rank_owns_expert(int64_t expert, const cverl::Qwen35TextConfig& cfg, int64_t ep_rank, int64_t ep_size) {
+  if (ep_size == 1) {
+    return true;
+  }
+  if (!cfg.is_qwen3_moe()) {
+    return true;
+  }
+  if (cfg.num_experts <= 0 || cfg.num_experts % ep_size != 0) {
+    throw std::runtime_error("Qwen3 MoE expert count must be divisible by EP size");
+  }
+  const int64_t experts_per_rank = cfg.num_experts / ep_size;
+  return expert >= ep_rank * experts_per_rank && expert < (ep_rank + 1) * experts_per_rank;
+}
+
 std::vector<std::string> stage_required_weight_names(const cverl::Qwen35TextModel& model,
                                                      int64_t max_layers,
                                                      int64_t layer_begin,
                                                      int64_t layer_end,
                                                      bool is_first_stage,
-                                                     bool is_last_stage) {
+                                                     bool is_last_stage,
+                                                     int64_t ep_rank,
+                                                     int64_t ep_size) {
   std::vector<std::string> out;
   for (const auto& name : model.required_weight_names(max_layers)) {
     int64_t layer_index = -1;
     if (layer_index_from_weight_name(name, &layer_index)) {
       if (layer_index >= layer_begin && layer_index < layer_end) {
+        int64_t expert_index = -1;
+        if (moe_expert_index_from_weight_name(name, &expert_index) &&
+            !ep_rank_owns_expert(expert_index, model.config(), ep_rank, ep_size)) {
+          continue;
+        }
         out.push_back(name);
       }
       continue;
     }
-    if (name == "model.language_model.embed_tokens.weight") {
-      if (is_first_stage || is_last_stage) {
+    if (name == "model.language_model.embed_tokens.weight" || name == "model.embed_tokens.weight") {
+      if (is_first_stage || (!model.config().is_qwen3_moe() && is_last_stage)) {
         out.push_back(name);
       }
       continue;
     }
-    if (name == "model.language_model.norm.weight") {
+    if (name == "model.language_model.norm.weight" || name == "model.norm.weight" || name == "lm_head.weight") {
       if (is_last_stage) {
         out.push_back(name);
       }
@@ -302,7 +350,8 @@ torch::Tensor qwen_megatron_tp_shard(const std::string& name,
   if (tp_size == 1) {
     return full.contiguous();
   }
-  if (name == "model.language_model.embed_tokens.weight") {
+  if (name == "model.language_model.embed_tokens.weight" || name == "model.embed_tokens.weight" ||
+      name == "lm_head.weight") {
     return shard_dim_if_needed(full, 0, tp_rank, tp_size);
   }
   int64_t layer = -1;
@@ -310,10 +359,15 @@ torch::Tensor qwen_megatron_tp_shard(const std::string& name,
     return full.contiguous();
   }
   if (name.find(".mlp.gate_proj.weight") != std::string::npos ||
-      name.find(".mlp.up_proj.weight") != std::string::npos) {
+      name.find(".mlp.up_proj.weight") != std::string::npos ||
+      (name.find(".mlp.experts.") != std::string::npos &&
+       (name.find(".gate_proj.weight") != std::string::npos ||
+        name.find(".up_proj.weight") != std::string::npos))) {
     return shard_dim_if_needed(full, 0, tp_rank, tp_size);
   }
-  if (name.find(".mlp.down_proj.weight") != std::string::npos) {
+  if (name.find(".mlp.down_proj.weight") != std::string::npos ||
+      (name.find(".mlp.experts.") != std::string::npos &&
+       name.find(".down_proj.weight") != std::string::npos)) {
     return shard_dim_if_needed(full, 1, tp_rank, tp_size);
   }
 
@@ -362,17 +416,23 @@ torch::Tensor qwen_megatron_tp_shard(const std::string& name,
 }
 
 bool qwen_tp_replicated_parameter(const std::string& name) {
-  if (name == "model.language_model.norm.weight") {
+  if (name == "model.language_model.norm.weight" || name == "model.norm.weight") {
     return true;
   }
   if (name.find("input_layernorm.weight") != std::string::npos ||
       name.find("post_attention_layernorm.weight") != std::string::npos ||
+      name.find(".mlp.gate.weight") != std::string::npos ||
       name.find(".self_attn.q_norm.weight") != std::string::npos ||
       name.find(".self_attn.k_norm.weight") != std::string::npos ||
       name.find(".linear_attn.norm.weight") != std::string::npos) {
     return true;
   }
   return false;
+}
+
+bool qwen_ep_replicated_parameter(const std::string& name) {
+  int64_t expert_index = -1;
+  return !moe_expert_index_from_weight_name(name, &expert_index);
 }
 
 std::vector<torch::Tensor> collect_tp_replicated_parameters(const std::vector<std::string>& names,
@@ -383,6 +443,20 @@ std::vector<torch::Tensor> collect_tp_replicated_parameters(const std::vector<st
   std::vector<torch::Tensor> replicated_params;
   for (size_t i = 0; i < params.size(); ++i) {
     if (qwen_tp_replicated_parameter(names[i])) {
+      replicated_params.push_back(params[i]);
+    }
+  }
+  return replicated_params;
+}
+
+std::vector<torch::Tensor> collect_ep_replicated_parameters(const std::vector<std::string>& names,
+                                                            const std::vector<torch::Tensor>& params) {
+  if (names.size() != params.size()) {
+    throw std::runtime_error("EP replicated parameter collection name/param size mismatch");
+  }
+  std::vector<torch::Tensor> replicated_params;
+  for (size_t i = 0; i < params.size(); ++i) {
+    if (qwen_ep_replicated_parameter(names[i])) {
       replicated_params.push_back(params[i]);
     }
   }
@@ -794,6 +868,8 @@ void write_checkpoint_manifest(const std::string& checkpoint_dir,
   manifest["pipeline_parallel"] = pp_size;
   manifest["context_parallel"] = cp_size;
   manifest["tensor_parallel"] = tp_size;
+  manifest["expert_parallel"] = training_config.value("expert_parallel", 1);
+  manifest["sequence_parallel"] = training_config.value("sequence_parallel", 1);
   manifest["training_config"] = training_config;
   manifest["optimizer"] = {
       {"type", "Fp32MasterAdamW"},
@@ -858,6 +934,8 @@ void write_flat_checkpoint_manifest(const std::string& checkpoint_dir,
   manifest["pipeline_parallel"] = pp_size;
   manifest["context_parallel"] = cp_size;
   manifest["tensor_parallel"] = tp_size;
+  manifest["expert_parallel"] = training_config.value("expert_parallel", 1);
+  manifest["sequence_parallel"] = training_config.value("sequence_parallel", 1);
   manifest["training_config"] = training_config;
   manifest["optimizer"] = {
       {"type", "FlatAdamW"},
@@ -901,8 +979,11 @@ nlohmann::json make_training_config_json(const std::string& dtype,
                                          int64_t dp_grad_bucket_mb,
                                          int64_t tp_grad_bucket_mb,
                                          int64_t micro_batches,
+                                         int64_t grad_accum_steps,
                                          int64_t layers,
                                          int64_t cp_size,
+                                         int64_t ep_size,
+                                         int64_t sp_size,
                                          int64_t prompt_len,
                                          int64_t response_len,
                                          double max_grad_norm,
@@ -921,8 +1002,12 @@ nlohmann::json make_training_config_json(const std::string& dtype,
   config["dp_grad_bucket_mb"] = dp_grad_bucket_mb;
   config["tp_grad_bucket_mb"] = tp_grad_bucket_mb;
   config["micro_batches"] = micro_batches;
+  config["grad_accum_steps"] = grad_accum_steps;
+  config["effective_micro_batches"] = micro_batches * grad_accum_steps;
   config["layers"] = layers;
   config["context_parallel"] = cp_size;
+  config["expert_parallel"] = ep_size;
+  config["sequence_parallel"] = sp_size;
   config["prompt_len"] = prompt_len;
   config["response_len"] = response_len;
   config["max_grad_norm"] = max_grad_norm;
@@ -1187,6 +1272,9 @@ void append_metrics_csv(const std::string& path,
                         int64_t cp_size,
                         int64_t tp_size,
                         int64_t micro_batches,
+                        int64_t grad_accum_steps,
+                        int64_t ep_size,
+                        int64_t sp_size,
                         int64_t layers,
                         int64_t prompt_len,
                         int64_t response_len,
@@ -1220,7 +1308,8 @@ void append_metrics_csv(const std::string& path,
   }
   std::ofstream out(path, std::ios::app);
   if (write_header) {
-    out << "step,dp,pp,cp,tp,micro_batches,layers,prompt_len,response_len,rollout_rows,"
+    out << "step,dp,pp,cp,tp,ep,sp,micro_batches,grad_accum_steps,effective_micro_batches,"
+        << "layers,prompt_len,response_len,rollout_rows,"
         << "dtype,dp_grad_comm_dtype,tp_grad_comm_dtype,master_weights,dp_shard_optimizer,"
         << "dp_flat_shard_optimizer,dp_grad_bucket_mb,tp_grad_bucket_mb,"
         << "mean_reward,success_rate,adv_abs_sum,loss_sum,kl_loss_sum,ppo_kl_sum,clipfrac_sum,"
@@ -1231,7 +1320,11 @@ void append_metrics_csv(const std::string& path,
       << pp_size << ","
       << cp_size << ","
       << tp_size << ","
+      << ep_size << ","
+      << sp_size << ","
       << micro_batches << ","
+      << grad_accum_steps << ","
+      << micro_batches * grad_accum_steps << ","
       << layers << ","
       << prompt_len << ","
       << response_len << ","
@@ -1525,6 +1618,64 @@ std::vector<torch::Tensor> load_jsonl_token_batches(const std::string& jsonl_pat
   return batches;
 }
 
+PpPpoBatch load_jsonl_sft_batch(const std::string& jsonl_path,
+                                const std::string& tokenizer_json,
+                                int64_t prompt_len,
+                                int64_t response_len,
+                                int64_t max_examples,
+                                torch::Device device) {
+  if (jsonl_path.empty()) {
+    throw std::runtime_error("SFT mode requires --jsonl-input");
+  }
+  cverl::data::JsonlDatasetOptions data_opts;
+  data_opts.path = jsonl_path;
+  data_opts.prompt_field = "prompt";
+  data_opts.answer_field = "answer";
+  data_opts.max_examples = max_examples;
+  auto examples = cverl::data::load_prompt_answer_jsonl(data_opts);
+  if (examples.empty()) {
+    throw std::runtime_error("SFT jsonl input produced no examples: " + jsonl_path);
+  }
+
+  std::vector<std::string> prompts;
+  std::vector<std::string> answers;
+  prompts.reserve(examples.size());
+  answers.reserve(examples.size());
+  cverl::rollout::RolloutResponse gold_response;
+  gold_response.sequences.reserve(examples.size());
+  for (size_t i = 0; i < examples.size(); ++i) {
+    prompts.push_back("Question: " + examples[i].prompt + "\nAnswer:");
+    answers.push_back(examples[i].answer);
+    cverl::rollout::RolloutSequence seq;
+    seq.prompt_index = i;
+    seq.sample_index = 0;
+    seq.text = examples[i].answer;
+    seq.finish_reason = "gold";
+    gold_response.sequences.push_back(std::move(seq));
+  }
+
+  cverl::text::HfBpeTokenizerOptions tok_opts;
+  tok_opts.tokenizer_json_path = tokenizer_json;
+  cverl::text::HfBpeTokenizer tokenizer(tok_opts);
+  cverl::reward::Gsm8kRewardOptions reward_opts;
+  reward_opts.method = cverl::reward::Gsm8kExtractionMethod::Flexible;
+  cverl::rollout::RolloutBatchOptions batch_opts;
+  batch_opts.max_prompt_tokens = prompt_len;
+  batch_opts.max_response_tokens = response_len;
+  auto batch =
+      cverl::rollout::build_gsm8k_rollout_batch(gold_response, prompts, answers, reward_opts, tokenizer, batch_opts);
+
+  PpPpoBatch out;
+  out.rows = batch.prompt_ids.size(0);
+  out.prompt_ids = batch.prompt_ids.to(device).contiguous();
+  out.response_ids = batch.response_ids.to(device).contiguous();
+  out.response_masks = batch.response_mask.to(device).contiguous();
+  out.advantages = out.response_masks.clone();
+  assign_rollout_batch_metrics(
+      out, batch.scalar_rewards.to(device), out.response_masks, reward_opts.correct_score - 1e-6);
+  return out;
+}
+
 torch::Tensor make_token_ids(int64_t seq_len,
                              int64_t micro_batch,
                              int64_t step,
@@ -1568,13 +1719,16 @@ int main(int argc, char** argv) {
     const int64_t pp_size = arg_i64(argc, argv, "--pp-size", 2);
     const int64_t cp_size = arg_i64(argc, argv, "--cp-size", 1);
     const int64_t tp_size = arg_i64(argc, argv, "--tp-size", 2);
-    const int64_t world_size = dp_size * pp_size * cp_size * tp_size;
+    const int64_t ep_size = arg_i64(argc, argv, "--ep-size", 1);
+    const int64_t sp_size = arg_i64(argc, argv, "--sp-size", 1);
+    const int64_t world_size = dp_size * pp_size * cp_size * tp_size * ep_size;
     const int64_t device_idx =
         arg_i64(argc, argv, "--device", std::getenv("LOCAL_RANK") ? std::stoll(std::getenv("LOCAL_RANK")) : global_rank);
     const int64_t layers = arg_i64(argc, argv, "--layers", 2);
     const int64_t prompt_len = arg_i64(argc, argv, "--prompt-len", 2);
     const int64_t response_len = arg_i64(argc, argv, "--response-len", 2);
     const int64_t micro_batches = arg_i64(argc, argv, "--micro-batches", pp_size);
+    const int64_t grad_accum_steps = arg_i64(argc, argv, "--grad-accum-steps", 1);
     const int64_t steps = arg_i64(argc, argv, "--steps", 1);
     const double lr = arg_f64(argc, argv, "--lr", 1.0e-8);
     const double clip_ratio = arg_f64(argc, argv, "--clip-ratio", 0.2);
@@ -1618,9 +1772,29 @@ int main(int argc, char** argv) {
     const auto dp_grad_comm_dtype = parse_optional_dtype(dp_grad_comm_dtype_arg);
     const auto tp_grad_comm_dtype = parse_optional_dtype(tp_grad_comm_dtype_arg);
     const std::string id_prefix = arg_str(argc, argv, "--id-prefix", "/tmp/cverl_qwen_pp_tp_ppo");
+    const std::string train_mode = arg_str(argc, argv, "--train-mode", "ppo");
+    const bool sft_mode = train_mode == "sft";
 
-    if (dp_size <= 0 || pp_size <= 0 || cp_size <= 0 || tp_size <= 0 || micro_batches <= 0 || steps <= 0) {
-      throw std::invalid_argument("dp-size, pp-size, cp-size, tp-size, micro-batches, and steps must be positive");
+    if (dp_size <= 0 || pp_size <= 0 || cp_size <= 0 || tp_size <= 0 || ep_size <= 0 || sp_size <= 0 ||
+        micro_batches <= 0 || grad_accum_steps <= 0 || steps <= 0) {
+      throw std::invalid_argument(
+          "dp-size, pp-size, cp-size, tp-size, ep-size, sp-size, micro-batches, grad-accum-steps, and steps must be "
+          "positive");
+    }
+    if (sp_size != 1) {
+      throw std::invalid_argument(
+          "Qwen PP/TP trainer does not yet implement sequence-parallel activation all-gather/reduce-scatter; use "
+          "--sp-size 1");
+    }
+    if (train_mode != "ppo" && train_mode != "sft") {
+      throw std::invalid_argument("--train-mode must be ppo or sft");
+    }
+    if (sft_mode && jsonl_input.empty()) {
+      throw std::invalid_argument("--train-mode sft requires --jsonl-input");
+    }
+    if (sft_mode && (!rollout_json.empty() || !rollout_dir.empty() || !rollout_ipc_json.empty() ||
+                     !rollout_ipc_dir.empty() || !rollout_nccl_id_file.empty())) {
+      throw std::invalid_argument("--train-mode sft consumes jsonl gold answers and cannot also consume rollout batches");
     }
     if (cp_size > 1 && tp_size > 1) {
       throw std::invalid_argument("Qwen3.5 PP trainer currently supports CP>1 only with TP=1");
@@ -1643,25 +1817,29 @@ int main(int argc, char** argv) {
     const torch::ScalarType flat_param_bucket_dtype = use_master_weights ? torch::kFloat32 : dtype;
     const int64_t dp_grad_bucket_numel = bucket_numel_for_bytes(dp_grad_bucket_bytes, dp_grad_bucket_dtype);
     const int64_t dp_param_bucket_numel = bucket_numel_for_bytes(dp_grad_bucket_bytes, flat_param_bucket_dtype);
-    const auto training_config = make_training_config_json(dtype_arg,
-                                                           dp_grad_comm_dtype_arg,
-                                                           tp_grad_comm_dtype_arg,
-                                                           dp_grad_bucket_mb,
-                                                           tp_grad_bucket_mb,
-                                                           micro_batches,
-                                                           layers,
-                                                           cp_size,
-                                                           prompt_len,
-                                                           response_len,
-                                                           max_grad_norm,
-                                                           clip_ratio,
-                                                           kl_coef,
-                                                           kl_penalty_arg,
-                                                           advantage_scale,
-                                                           use_master_weights,
-                                                           dp_shard_optimizer,
-                                                           dp_flat_shard_optimizer,
-                                                           flat_checkpoint_save_model_params);
+    auto training_config = make_training_config_json(dtype_arg,
+                                                     dp_grad_comm_dtype_arg,
+                                                     tp_grad_comm_dtype_arg,
+                                                     dp_grad_bucket_mb,
+                                                     tp_grad_bucket_mb,
+                                                     micro_batches,
+                                                     grad_accum_steps,
+                                                     layers,
+                                                     cp_size,
+                                                     ep_size,
+                                                     sp_size,
+                                                     prompt_len,
+                                                     response_len,
+                                                     max_grad_norm,
+                                                     clip_ratio,
+                                                     kl_coef,
+                                                     kl_penalty_arg,
+                                                     advantage_scale,
+                                                     use_master_weights,
+                                                     dp_shard_optimizer,
+                                                     dp_flat_shard_optimizer,
+                                                     flat_checkpoint_save_model_params);
+    training_config["train_mode"] = train_mode;
 
     const int64_t seq_len = prompt_len + response_len;
     const auto device = torch::Device(torch::kCUDA, static_cast<int>(device_idx));
@@ -1671,6 +1849,8 @@ int main(int argc, char** argv) {
     dims.pipeline_parallel = pp_size;
     dims.context_parallel = cp_size;
     dims.tensor_parallel = tp_size;
+    dims.expert_parallel = ep_size;
+    dims.sequence_parallel = sp_size;
     dims.micro_batches = micro_batches;
     cverl::distributed::ClusterSpec spec;
     spec.world_size = world_size;
@@ -1688,13 +1868,20 @@ int main(int argc, char** argv) {
     const std::string full_id_path = id_prefix + "_full.bin";
     const std::string tp_id_path = id_prefix + "_tp_dp" + std::to_string(info.data_rank) +
                                    "_pp" + std::to_string(info.pipeline_rank) + "_cp" +
-                                   std::to_string(info.context_rank) + ".bin";
+                                   std::to_string(info.context_rank) + "_ep" +
+                                   std::to_string(info.expert_rank) + ".bin";
     const std::string cp_id_path = id_prefix + "_cp_dp" + std::to_string(info.data_rank) +
                                    "_pp" + std::to_string(info.pipeline_rank) + "_tp" +
+                                   std::to_string(info.tensor_rank) + "_ep" +
+                                   std::to_string(info.expert_rank) + ".bin";
+    const std::string ep_id_path = id_prefix + "_ep_dp" + std::to_string(info.data_rank) +
+                                   "_pp" + std::to_string(info.pipeline_rank) + "_cp" +
+                                   std::to_string(info.context_rank) + "_tp" +
                                    std::to_string(info.tensor_rank) + ".bin";
     const std::string dp_id_path = id_prefix + "_dp_pp" + std::to_string(info.pipeline_rank) +
                                    "_cp" + std::to_string(info.context_rank) + "_tp" +
-                                   std::to_string(info.tensor_rank) + ".bin";
+                                   std::to_string(info.tensor_rank) + "_ep" +
+                                   std::to_string(info.expert_rank) + ".bin";
     const std::string model_id_path = id_prefix + "_model_dp" + std::to_string(info.data_rank) + ".bin";
     if (global_rank == 0) {
       cverl::distributed::write_nccl_unique_id_file(full_id_path, cverl::distributed::create_nccl_unique_id());
@@ -1705,16 +1892,20 @@ int main(int argc, char** argv) {
     if (info.context_rank == 0) {
       cverl::distributed::write_nccl_unique_id_file(cp_id_path, cverl::distributed::create_nccl_unique_id());
     }
+    if (info.expert_rank == 0) {
+      cverl::distributed::write_nccl_unique_id_file(ep_id_path, cverl::distributed::create_nccl_unique_id());
+    }
     if (info.data_rank == 0) {
       cverl::distributed::write_nccl_unique_id_file(dp_id_path, cverl::distributed::create_nccl_unique_id());
     }
-    if (info.pipeline_rank == 0 && info.context_rank == 0 && info.tensor_rank == 0) {
+    if (info.pipeline_rank == 0 && info.context_rank == 0 && info.tensor_rank == 0 && info.expert_rank == 0) {
       cverl::distributed::write_nccl_unique_id_file(model_id_path, cverl::distributed::create_nccl_unique_id());
     }
 
     auto full_id = cverl::distributed::read_nccl_unique_id_file(full_id_path);
     auto tp_id = cverl::distributed::read_nccl_unique_id_file(tp_id_path);
     auto cp_id = cverl::distributed::read_nccl_unique_id_file(cp_id_path);
+    auto ep_id = cverl::distributed::read_nccl_unique_id_file(ep_id_path);
     auto dp_id = cverl::distributed::read_nccl_unique_id_file(dp_id_path);
     auto model_id = cverl::distributed::read_nccl_unique_id_file(model_id_path);
     cverl::distributed::NcclCollectives full_comm(
@@ -1723,16 +1914,20 @@ int main(int argc, char** argv) {
         info.tensor_rank, tp_size, static_cast<int>(device_idx), tp_id, nccl_sync_after_collective);
     cverl::distributed::NcclCollectives cp_comm(
         info.context_rank, cp_size, static_cast<int>(device_idx), cp_id, nccl_sync_after_collective);
+    cverl::distributed::NcclCollectives ep_comm(
+        info.expert_rank, ep_size, static_cast<int>(device_idx), ep_id, nccl_sync_after_collective);
     cverl::distributed::NcclCollectives dp_comm(
         info.data_rank, dp_size, static_cast<int>(device_idx), dp_id, nccl_sync_after_collective);
-    const int64_t model_parallel_size = pp_size * cp_size * tp_size;
+    const int64_t model_parallel_size = pp_size * cp_size * tp_size * ep_size;
     const int64_t model_parallel_rank =
-        (info.pipeline_rank * cp_size + info.context_rank) * tp_size + info.tensor_rank;
+        ((info.pipeline_rank * cp_size + info.context_rank) * tp_size + info.tensor_rank) * ep_size +
+        info.expert_rank;
     cverl::distributed::NcclCollectives model_comm(
         model_parallel_rank, model_parallel_size, static_cast<int>(device_idx), model_id, nccl_sync_after_collective);
     const auto model_parallel_ranks = full_group(model_parallel_size);
     cverl::distributed::ParallelGroup tp_group{info.tensor_rank, tp_size, full_group(tp_size), &tp_comm};
     cverl::distributed::ParallelGroup cp_group{info.context_rank, cp_size, full_group(cp_size), &cp_comm};
+    cverl::distributed::ParallelGroup ep_group{info.expert_rank, ep_size, full_group(ep_size), &ep_comm};
     cverl::distributed::ParallelGroup dp_group{info.data_rank, dp_size, full_group(dp_size), &dp_comm};
     std::unique_ptr<cverl::distributed::NcclCollectives> rollout_data_comm;
     if (!rollout_nccl_id_file.empty()) {
@@ -1755,12 +1950,25 @@ int main(int argc, char** argv) {
     cverl::HfModelLoader loader(model_dir);
     cverl::Qwen35TextModel model(std::move(loader));
     model.to(device);
+    if (ep_size > 1) {
+      if (!model.config().is_qwen3_moe()) {
+        throw std::invalid_argument("EP>1 requires a Qwen3 MoE model");
+      }
+      if (model.config().num_experts % ep_size != 0) {
+        throw std::invalid_argument("Qwen3 MoE expert count must be divisible by EP size");
+      }
+    }
     const auto jsonl_batches =
-        load_jsonl_token_batches(jsonl_input, tokenizer_json, seq_len, jsonl_max_examples, device);
+        sft_mode ? std::vector<torch::Tensor>{}
+                 : load_jsonl_token_batches(jsonl_input, tokenizer_json, seq_len, jsonl_max_examples, device);
+    PpPpoBatch sft_batch;
+    if (sft_mode) {
+      sft_batch = load_jsonl_sft_batch(jsonl_input, tokenizer_json, prompt_len, response_len, jsonl_max_examples, device);
+    }
     std::vector<torch::Tensor> params;
     std::vector<std::string> param_names;
     const auto rank_weight_names = stage_required_weight_names(
-        model, layers, range.begin, range.end, peers.is_first_stage, peers.is_last_stage);
+        model, layers, range.begin, range.end, peers.is_first_stage, peers.is_last_stage, info.expert_rank, ep_size);
     for (const auto& name : rank_weight_names) {
       auto full_tensor = model.loader().load_tensor(name).to(dtype);
       auto tensor = qwen_megatron_tp_shard(name, full_tensor, model.config(), info.tensor_rank, tp_size)
@@ -1777,6 +1985,7 @@ int main(int argc, char** argv) {
       param_bytes.push_back(p.numel() * static_cast<int64_t>(p.element_size()));
     }
     const auto tp_replicated_params = collect_tp_replicated_parameters(param_names, params);
+    const auto ep_replicated_params = collect_ep_replicated_parameters(param_names, params);
     std::vector<int64_t> dp_optimizer_owner_by_param(params.size(), 0);
     if (dp_shard_optimizer) {
       dp_optimizer_owner_by_param = cverl::distributed::greedy_parameter_owner_by_size(param_bytes, dp_size);
@@ -1872,7 +2081,12 @@ int main(int argc, char** argv) {
       const std::string rollout_path = rollout_json_path_for_step(rollout_json, rollout_dir, step);
       const std::string rollout_ipc_path = rollout_ipc_path_for_step(rollout_ipc_json, rollout_ipc_dir, step);
       const PpPpoBatch* active_rollout = nullptr;
-      if (rollout_data_comm != nullptr) {
+      if (sft_mode) {
+        active_rollout = &sft_batch;
+        mean_reward = sft_batch.mean_reward;
+        success_rate = sft_batch.success_rate;
+        adv_abs_sum = sft_batch.adv_abs_sum;
+      } else if (rollout_data_comm != nullptr) {
         if (peers.is_first_stage || peers.is_last_stage) {
           cverl::rollout::NCCLGpuBatchReceiver receiver(*rollout_data_comm, static_cast<int>(device_idx));
           auto gpu_batch = receiver.recv(rollout_nccl_source_rank);
@@ -1901,13 +2115,24 @@ int main(int argc, char** argv) {
         adv_abs_sum = rollout_batch.adv_abs_sum;
       }
 
-      for (const auto& action : schedule) {
+      for (int64_t accum_step = 0; accum_step < grad_accum_steps; ++accum_step) {
+        for (auto& slot : stage_inputs) {
+          slot = torch::Tensor();
+        }
+        for (auto& slot : stage_outputs) {
+          slot = torch::Tensor();
+        }
+
+        for (const auto& action : schedule) {
         if (action.op == cverl::distributed::PipelineScheduleOp::Forward) {
           torch::Tensor input;
           if (peers.is_first_stage) {
+            const int64_t batch_micro_batch =
+                ((step * grad_accum_steps + accum_step) * micro_batches + action.micro_batch) * dp_size * ep_size +
+                info.data_rank * ep_size + info.expert_rank;
             auto ids = make_token_ids(
                 seq_len,
-                action.micro_batch,
+                batch_micro_batch,
                 step,
                 vary_tokens_by_step,
                 prompt_len,
@@ -1928,10 +2153,10 @@ int main(int argc, char** argv) {
             stage_inputs[static_cast<size_t>(action.micro_batch)] = input;
           }
           auto output = cp_size > 1
-                            ? model.forward_hidden_range_context_parallel(
-                                  input, range.begin, range.end, cp_group, seq_len, peers.is_last_stage)
-                            : model.forward_hidden_range_tensor_parallel(
-                                  input, range.begin, range.end, tp_group, peers.is_last_stage);
+                            ? model.forward_hidden_range_context_expert_parallel(
+                                  input, range.begin, range.end, cp_group, ep_group, seq_len, peers.is_last_stage)
+                            : model.forward_hidden_range_tensor_expert_parallel(
+                                  input, range.begin, range.end, tp_group, ep_group, peers.is_last_stage);
           stage_outputs[static_cast<size_t>(action.micro_batch)] = output;
           if (!peers.is_last_stage) {
             full_comm.send(output.contiguous(), peers.next_rank);
@@ -1943,13 +2168,16 @@ int main(int argc, char** argv) {
           }
           if (peers.is_last_stage) {
             torch::Tensor response_ids;
+            const int64_t batch_micro_batch =
+                ((step * grad_accum_steps + accum_step) * micro_batches + action.micro_batch) * dp_size * ep_size +
+                info.data_rank * ep_size + info.expert_rank;
             if (active_rollout != nullptr) {
-              const int64_t idx = action.micro_batch % active_rollout->rows;
+              const int64_t idx = batch_micro_batch % active_rollout->rows;
               response_ids = rollout_response_row(*active_rollout, idx, prompt_len, response_len);
             } else {
               auto ids = make_token_ids(
                   seq_len,
-                  action.micro_batch,
+                  batch_micro_batch,
                   step,
                   vary_tokens_by_step,
                   prompt_len,
@@ -1968,11 +2196,11 @@ int main(int argc, char** argv) {
             }
             auto response_hidden = scoring_hidden.slice(1, prompt_len - 1, prompt_len + response_len - 1);
             auto log_probs = model.response_log_probs_tensor_parallel(response_hidden, response_ids, tp_group);
-            torch::Tensor old_log_probs = log_probs.detach();
             torch::Tensor advantages;
             torch::Tensor response_mask;
+            torch::Tensor old_log_probs;
             if (active_rollout != nullptr) {
-              const int64_t idx = action.micro_batch % active_rollout->rows;
+              const int64_t idx = batch_micro_batch % active_rollout->rows;
               advantages = rollout_row(active_rollout->advantages, idx, response_len);
               response_mask = rollout_row(active_rollout->response_masks, idx, response_len);
               if (active_rollout->old_log_probs.defined()) {
@@ -1982,34 +2210,46 @@ int main(int argc, char** argv) {
               advantages = torch::ones_like(log_probs) * advantage_scale;
               response_mask = torch::ones_like(log_probs);
             }
-            auto loss = cverl::torch_backend::ppo_clipped_loss(
-                old_log_probs,
-                log_probs,
-                advantages,
-                response_mask,
-                clip_ratio,
-                -1.0,
-                -1.0,
-                3.0,
-                CVERL_LOSS_AGG_TOKEN_MEAN);
-            torch::Tensor total_loss = loss.pg_loss;
+            torch::Tensor total_loss;
+            torch::Tensor ppo_kl_metric = torch::zeros({}, log_probs.options());
+            torch::Tensor clipfrac_metric = torch::zeros({}, log_probs.options());
+            if (sft_mode) {
+              total_loss = -cverl::torch_backend::masked_mean(log_probs, response_mask);
+            } else {
+              if (!old_log_probs.defined()) {
+                old_log_probs = log_probs.detach();
+              }
+              auto loss = cverl::torch_backend::ppo_clipped_loss(
+                  old_log_probs,
+                  log_probs,
+                  advantages,
+                  response_mask,
+                  clip_ratio,
+                  -1.0,
+                  -1.0,
+                  3.0,
+                  CVERL_LOSS_AGG_TOKEN_MEAN);
+              total_loss = loss.pg_loss;
+              ppo_kl_metric = loss.ppo_kl;
+              clipfrac_metric = loss.pg_clipfrac;
+            }
             torch::Tensor kl_loss = torch::zeros({}, total_loss.options());
             if (kl_coef > 0.0) {
               if (active_rollout == nullptr || !active_rollout->ref_log_probs.defined()) {
                 throw std::runtime_error("--kl-coef > 0 requires ref_log_probs in rollout batch");
               }
-              const int64_t idx = action.micro_batch % active_rollout->rows;
+              const int64_t idx = batch_micro_batch % active_rollout->rows;
               auto ref_log_probs = rollout_row(active_rollout->ref_log_probs, idx, response_len);
               auto kl_token = cverl::torch_backend::kl_penalty(log_probs, ref_log_probs, kl_penalty_mode);
               kl_loss = cverl::torch_backend::masked_mean(kl_token, response_mask);
               total_loss = total_loss + kl_coef * kl_loss;
             }
-            auto scaled_loss = total_loss / static_cast<double>(micro_batches);
+            auto scaled_loss = total_loss / static_cast<double>(micro_batches * grad_accum_steps);
             auto backward_loss = cp_size > 1 ? scaled_loss / static_cast<double>(cp_size) : scaled_loss;
             loss_sum_tensor.add_(scaled_loss.detach().to(torch::kFloat32));
             kl_loss_sum_tensor.add_(kl_loss.detach().to(torch::kFloat32));
-            kl_sum_tensor.add_(loss.ppo_kl.detach().to(torch::kFloat32));
-            clipfrac_sum_tensor.add_(loss.pg_clipfrac.detach().to(torch::kFloat32));
+            kl_sum_tensor.add_(ppo_kl_metric.detach().to(torch::kFloat32));
+            clipfrac_sum_tensor.add_(clipfrac_metric.detach().to(torch::kFloat32));
             backward_loss.backward();
           } else {
             auto grad = full_comm.recv_like(stage_output.contiguous(), peers.next_rank);
@@ -2027,12 +2267,14 @@ int main(int argc, char** argv) {
           stage_output = torch::Tensor();
         }
       }
+      }
 
       if (cp_size > 1) {
         cverl::distributed::data_parallel_sync_gradients(
             params, cp_comm, cp_group.ranks, false, dp_grad_bucket_bytes, dp_grad_comm_dtype);
       }
       sync_tp_replicated_gradients(tp_replicated_params, tp_group, tp_grad_bucket_bytes, tp_grad_comm_dtype);
+      sync_tp_replicated_gradients(ep_replicated_params, ep_group, tp_grad_bucket_bytes, tp_grad_comm_dtype);
       bool flat_step_done = false;
       double local_grad_norm_sq = 0.0;
       double global_grad_norm = 0.0;
@@ -2252,6 +2494,9 @@ int main(int argc, char** argv) {
                            cp_size,
                            tp_size,
                            micro_batches,
+                           grad_accum_steps,
+                           ep_size,
+                           sp_size,
                            layers,
                            prompt_len,
                            response_len,
@@ -2276,11 +2521,16 @@ int main(int argc, char** argv) {
                            reported_grad_clip_scale,
                            total_param_delta);
         std::cout << "step=" << step
+                  << " train_mode=" << train_mode
                   << " dp=" << dp_size
                   << " pp=" << pp_size
                   << " cp=" << cp_size
                   << " tp=" << tp_size
+                  << " ep=" << ep_size
+                  << " sp=" << sp_size
                   << " micro_batches=" << micro_batches
+                  << " grad_accum_steps=" << grad_accum_steps
+                  << " effective_micro_batches=" << (micro_batches * grad_accum_steps)
                   << " layers=" << layers
                   << " prompt_len=" << prompt_len
                   << " response_len=" << response_len
@@ -2298,7 +2548,7 @@ int main(int argc, char** argv) {
                   << " measure_param_delta=" << (measure_param_delta ? "true" : "false")
                   << " vary_tokens_by_step=" << (vary_tokens_by_step ? "true" : "false")
                   << " nccl_sync_after_collective=" << (nccl_sync_after_collective ? "true" : "false")
-                  << " jsonl_examples=" << jsonl_batches.size()
+                  << " jsonl_examples=" << (sft_mode ? sft_batch.rows : static_cast<int64_t>(jsonl_batches.size()))
                   << " rollout_rows=" << (active_rollout != nullptr ? active_rollout->rows : 0)
                   << " kl_coef=" << kl_coef
                   << " mean_reward=" << mean_reward
@@ -2327,13 +2577,21 @@ int main(int argc, char** argv) {
         std::filesystem::remove(id_prefix + "_model_dp" + std::to_string(d) + ".bin");
         for (int64_t pp = 0; pp < pp_size; ++pp) {
           for (int64_t cp = 0; cp < cp_size; ++cp) {
-            std::filesystem::remove(id_prefix + "_tp_dp" + std::to_string(d) + "_pp" +
-                                    std::to_string(pp) + "_cp" + std::to_string(cp) + ".bin");
             for (int64_t tp = 0; tp < tp_size; ++tp) {
-              std::filesystem::remove(id_prefix + "_cp_dp" + std::to_string(d) + "_pp" +
-                                      std::to_string(pp) + "_tp" + std::to_string(tp) + ".bin");
-              std::filesystem::remove(id_prefix + "_dp_pp" + std::to_string(pp) + "_cp" +
-                                      std::to_string(cp) + "_tp" + std::to_string(tp) + ".bin");
+              std::filesystem::remove(id_prefix + "_ep_dp" + std::to_string(d) + "_pp" +
+                                      std::to_string(pp) + "_cp" + std::to_string(cp) + "_tp" +
+                                      std::to_string(tp) + ".bin");
+              for (int64_t ep = 0; ep < ep_size; ++ep) {
+                std::filesystem::remove(id_prefix + "_tp_dp" + std::to_string(d) + "_pp" +
+                                        std::to_string(pp) + "_cp" + std::to_string(cp) + "_ep" +
+                                        std::to_string(ep) + ".bin");
+                std::filesystem::remove(id_prefix + "_cp_dp" + std::to_string(d) + "_pp" +
+                                        std::to_string(pp) + "_tp" + std::to_string(tp) + "_ep" +
+                                        std::to_string(ep) + ".bin");
+                std::filesystem::remove(id_prefix + "_dp_pp" + std::to_string(pp) + "_cp" +
+                                        std::to_string(cp) + "_tp" + std::to_string(tp) + "_ep" +
+                                        std::to_string(ep) + ".bin");
+              }
             }
           }
         }

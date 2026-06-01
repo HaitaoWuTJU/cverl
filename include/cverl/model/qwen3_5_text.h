@@ -15,6 +15,7 @@
 namespace cverl {
 
 struct Qwen35TextConfig {
+  std::string model_type;
   int64_t vocab_size = 248320;
   int64_t hidden_size = 1024;
   int64_t num_hidden_layers = 24;
@@ -27,10 +28,17 @@ struct Qwen35TextConfig {
   int64_t linear_num_key_heads = 16;
   int64_t linear_num_value_heads = 16;
   int64_t linear_conv_kernel_dim = 4;
+  int64_t moe_intermediate_size = 0;
+  int64_t num_experts = 0;
+  int64_t num_experts_per_tok = 0;
   double rms_norm_eps = 1e-6;
   double rope_theta = 10000000.0;
   double partial_rotary_factor = 0.25;
+  bool norm_topk_prob = false;
+  bool tie_word_embeddings = true;
   std::vector<std::string> layer_types;
+
+  bool is_qwen3_moe() const { return model_type == "qwen3_moe"; }
 };
 
 class Qwen35TextModel {
@@ -58,6 +66,13 @@ class Qwen35TextModel {
                                                       const distributed::ParallelGroup& context_group,
                                                       int64_t original_sequence_length,
                                                       bool apply_final_norm);
+  torch::Tensor forward_hidden_range_context_expert_parallel(const torch::Tensor& hidden_local,
+                                                             int64_t layer_begin,
+                                                             int64_t layer_end,
+                                                             const distributed::ParallelGroup& context_group,
+                                                             const distributed::ParallelGroup& expert_group,
+                                                             int64_t original_sequence_length,
+                                                             bool apply_final_norm);
   torch::Tensor forward_hidden_tensor_parallel(const torch::Tensor& input_ids,
                                                const distributed::ParallelGroup& tensor_group,
                                                int64_t max_layers = -1);
@@ -66,9 +81,19 @@ class Qwen35TextModel {
                                                      int64_t layer_end,
                                                      const distributed::ParallelGroup& tensor_group,
                                                      bool apply_final_norm);
+  torch::Tensor forward_hidden_range_tensor_expert_parallel(const torch::Tensor& hidden,
+                                                            int64_t layer_begin,
+                                                            int64_t layer_end,
+                                                            const distributed::ParallelGroup& tensor_group,
+                                                            const distributed::ParallelGroup& expert_group,
+                                                            bool apply_final_norm);
   torch::Tensor mlp_tensor_parallel(const torch::Tensor& x,
                                     int64_t layer_idx,
                                     const distributed::ParallelGroup& tensor_group);
+  torch::Tensor mlp_tensor_expert_parallel(const torch::Tensor& x,
+                                           int64_t layer_idx,
+                                           const distributed::ParallelGroup& tensor_group,
+                                           const distributed::ParallelGroup& expert_group);
   torch::Tensor full_attention_tensor_parallel(const torch::Tensor& x,
                                                int64_t layer_idx,
                                                const distributed::ParallelGroup& tensor_group);
@@ -95,6 +120,10 @@ class Qwen35TextModel {
   torch::Tensor rms_norm(const torch::Tensor& x, const torch::Tensor& weight) const;
   torch::Tensor rms_norm_gated(const torch::Tensor& x, const torch::Tensor& gate, const torch::Tensor& weight) const;
   torch::Tensor mlp(const torch::Tensor& x, int64_t layer_idx);
+  torch::Tensor mlp_expert_parallel(const torch::Tensor& x,
+                                    int64_t layer_idx,
+                                    const distributed::ParallelGroup& tensor_group,
+                                    const distributed::ParallelGroup& expert_group);
   torch::Tensor full_attention(const torch::Tensor& x, int64_t layer_idx);
   torch::Tensor full_attention_context_parallel(const torch::Tensor& x,
                                                 int64_t layer_idx,

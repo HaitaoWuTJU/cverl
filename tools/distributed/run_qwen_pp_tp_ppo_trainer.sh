@@ -7,13 +7,17 @@ DP_SIZE="${DP_SIZE:-1}"
 PP_SIZE="${PP_SIZE:-2}"
 CP_SIZE="${CP_SIZE:-1}"
 TP_SIZE="${TP_SIZE:-2}"
-WORLD_SIZE=$((DP_SIZE * PP_SIZE * CP_SIZE * TP_SIZE))
+EP_SIZE="${EP_SIZE:-1}"
+SP_SIZE="${SP_SIZE:-1}"
+WORLD_SIZE=$((DP_SIZE * PP_SIZE * CP_SIZE * TP_SIZE * EP_SIZE))
 LOCAL_WORLD_SIZE="${LOCAL_WORLD_SIZE:-${WORLD_SIZE}}"
 LAYERS="${LAYERS:-2}"
 PROMPT_LEN="${PROMPT_LEN:-2}"
 RESPONSE_LEN="${RESPONSE_LEN:-2}"
 MICRO_BATCHES="${MICRO_BATCHES:-${PP_SIZE}}"
+GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-1}"
 STEPS="${STEPS:-1}"
+TRAIN_MODE="${TRAIN_MODE:-ppo}"
 LR="${LR:-1e-8}"
 CLIP_RATIO="${CLIP_RATIO:-0.2}"
 MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
@@ -71,12 +75,16 @@ for ((rank = 0; rank < WORLD_SIZE; ++rank)); do
       --pp-size "${PP_SIZE}" \
       --cp-size "${CP_SIZE}" \
       --tp-size "${TP_SIZE}" \
+      --ep-size "${EP_SIZE}" \
+      --sp-size "${SP_SIZE}" \
       --device "${local_rank}" \
       --layers "${LAYERS}" \
       --prompt-len "${PROMPT_LEN}" \
       --response-len "${RESPONSE_LEN}" \
       --micro-batches "${MICRO_BATCHES}" \
+      --grad-accum-steps "${GRAD_ACCUM_STEPS}" \
       --steps "${STEPS}" \
+      --train-mode "${TRAIN_MODE}" \
       --lr "${LR}" \
       --clip-ratio "${CLIP_RATIO}" \
       --max-grad-norm "${MAX_GRAD_NORM}" \
