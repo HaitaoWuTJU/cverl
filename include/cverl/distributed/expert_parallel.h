@@ -14,6 +14,8 @@ struct ExpertParallelDispatchResult {
   torch::Tensor send_counts;
   torch::Tensor recv_counts;
   int64_t capacity = 0;
+  torch::Tensor send_order;
+  torch::Tensor payload_indices;
 };
 
 torch::Tensor expert_parallel_all_to_all_autograd(const torch::Tensor& input,

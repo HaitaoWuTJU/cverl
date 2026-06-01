@@ -431,28 +431,35 @@ void test_flat_sharded_adamw_matches_dense() {
   auto dense_p1 = torch::linspace(2.0, 3.0, 4, torch::TensorOptions().dtype(torch::kBFloat16));
   dense_p0.set_requires_grad(true);
   dense_p1.set_requires_grad(true);
-  auto sharded_p0 = dense_p0.detach().clone();
-  auto sharded_p1 = dense_p1.detach().clone();
-  sharded_p0.set_requires_grad(true);
-  sharded_p1.set_requires_grad(true);
+  auto rank0_p0 = dense_p0.detach().clone();
+  auto rank0_p1 = dense_p1.detach().clone();
+  auto rank1_p0 = dense_p0.detach().clone();
+  auto rank1_p1 = dense_p1.detach().clone();
+  rank0_p0.set_requires_grad(true);
+  rank0_p1.set_requires_grad(true);
+  rank1_p0.set_requires_grad(true);
+  rank1_p1.set_requires_grad(true);
 
   auto grad0 = torch::linspace(0.01, 0.07, 7, torch::TensorOptions().dtype(torch::kFloat32));
   auto grad1 = torch::linspace(-0.04, -0.01, 4, torch::TensorOptions().dtype(torch::kFloat32));
   dense_p0.mutable_grad() = grad0.to(dense_p0.scalar_type());
   dense_p1.mutable_grad() = grad1.to(dense_p1.scalar_type());
-  sharded_p0.mutable_grad() = grad0.to(sharded_p0.scalar_type());
-  sharded_p1.mutable_grad() = grad1.to(sharded_p1.scalar_type());
+  rank0_p0.mutable_grad() = grad0.to(rank0_p0.scalar_type());
+  rank0_p1.mutable_grad() = grad1.to(rank0_p1.scalar_type());
+  rank1_p0.mutable_grad() = grad0.to(rank1_p0.scalar_type());
+  rank1_p1.mutable_grad() = grad1.to(rank1_p1.scalar_type());
 
   std::vector<torch::Tensor> dense_params{dense_p0, dense_p1};
-  std::vector<torch::Tensor> sharded_params{sharded_p0, sharded_p1};
+  std::vector<torch::Tensor> rank0_params{rank0_p0, rank0_p1};
+  std::vector<torch::Tensor> rank1_params{rank1_p0, rank1_p1};
   cverl::torch_backend::Fp32MasterAdamW dense_optimizer(dense_params, opts);
   dense_optimizer.accumulate_model_grads();
   dense_optimizer.step();
 
-  auto param_rank0 = cverl::distributed::flatten_parameter_shard(sharded_params, 2, 0);
-  auto param_rank1 = cverl::distributed::flatten_parameter_shard(sharded_params, 2, 1);
-  auto grad_rank0 = cverl::distributed::flatten_gradient_shard(sharded_params, 2, 0);
-  auto grad_rank1 = cverl::distributed::flatten_gradient_shard(sharded_params, 2, 1);
+  auto param_rank0 = cverl::distributed::flatten_parameter_shard(rank0_params, 2, 0);
+  auto param_rank1 = cverl::distributed::flatten_parameter_shard(rank1_params, 2, 1);
+  auto grad_rank0 = cverl::distributed::flatten_gradient_shard(rank0_params, 2, 0);
+  auto grad_rank1 = cverl::distributed::flatten_gradient_shard(rank1_params, 2, 1);
   require(param_rank0.original_numel == grad_rank0.original_numel, "rank0 original numel metadata");
   require(param_rank0.padded_numel == grad_rank0.padded_numel, "rank0 padded numel metadata");
   require(param_rank1.original_numel == grad_rank1.original_numel, "rank1 original numel metadata");
@@ -463,17 +470,23 @@ void test_flat_sharded_adamw_matches_dense() {
   SliceCollectives comm0(0);
   SliceCollectives comm1(1);
   auto step0 = cverl::distributed::flat_sharded_adamw_step(
-      sharded_params, param_rank0, flat_rank0, comm0, {0, 1}, comm0, {0, 1}, 0.0, false, true, false, 4);
+      rank0_params, param_rank0, flat_rank0, comm0, {0, 1}, comm0, {0, 1}, 0.0, false, true, false, 4);
   auto step1 = cverl::distributed::flat_sharded_adamw_step(
-      sharded_params, param_rank1, flat_rank1, comm1, {0, 1}, comm1, {0, 1}, 0.0, false, true, false, 4);
+      rank1_params, param_rank1, flat_rank1, comm1, {0, 1}, comm1, {0, 1}, 0.0, false, true, false, 4);
   require(step0.gradient_shard.shard.numel() == param_rank0.shard.numel(), "rank0 flat step grad shard");
   require(step1.gradient_shard.shard.numel() == param_rank1.shard.numel(), "rank1 flat step grad shard");
   require(step0.grad_clip_scale == 1.0 && step1.grad_clip_scale == 1.0, "flat step unclipped");
   require(step0.local_grad_norm > 0.0 && step1.local_grad_norm > 0.0, "flat step grad norms");
   require(comm0.reduce_scatter_calls == 3 && comm1.reduce_scatter_calls == 3,
           "flat sharded AdamW bucketed step should reduce-scatter once per bucket per rank");
+  require(!rank0_p0.grad().defined() && !rank0_p1.grad().defined() &&
+              !rank1_p0.grad().defined() && !rank1_p1.grad().defined(),
+          "flat sharded AdamW should clear dense gradients on each rank after reduce-scatter");
   auto gathered =
       torch::cat({flat_rank0.parameter_shard(), flat_rank1.parameter_shard()}, 0).contiguous();
+  auto sharded_p0 = dense_p0.detach().clone();
+  auto sharded_p1 = dense_p1.detach().clone();
+  std::vector<torch::Tensor> sharded_params{sharded_p0, sharded_p1};
   cverl::distributed::apply_full_flat_parameters(gathered, param_rank0.original_numel, sharded_params);
 
   require_allclose(sharded_p0.to(torch::kFloat32), dense_p0.to(torch::kFloat32),
@@ -544,6 +557,8 @@ void test_flat_sharded_adamw_single_dp_skips_data_collectives() {
   require(comm0.reduce_scatter_calls == 0, "single-DP flat step should skip reduce-scatter");
   require(comm0.all_gather_calls == 0, "single-DP flat step should skip parameter all-gather");
   require(comm0.all_reduce_calls == 0, "single-DP flat step should skip norm all-reduce");
+  require(!p0.grad().defined() && !p1.grad().defined(),
+          "single-DP flat step should clear dense gradients after local shard construction");
 }
 
 void test_flat_sharded_adamw_no_master_keeps_model_dtype() {

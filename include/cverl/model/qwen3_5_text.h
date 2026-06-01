@@ -55,6 +55,10 @@ class Qwen35TextModel {
   torch::Tensor response_log_probs_tensor_parallel(const torch::Tensor& hidden,
                                                    const torch::Tensor& response_ids,
                                                    const distributed::ParallelGroup& tensor_group);
+  torch::Tensor response_nll_tensor_parallel(const torch::Tensor& hidden,
+                                             const torch::Tensor& response_ids,
+                                             const torch::Tensor& response_mask,
+                                             const distributed::ParallelGroup& tensor_group);
   torch::Tensor forward_hidden(const torch::Tensor& input_ids, int64_t max_layers = -1);
   torch::Tensor forward_logits(const torch::Tensor& input_ids, int64_t max_layers = -1);
   torch::Tensor forward_hidden_context_parallel(const torch::Tensor& input_ids,
@@ -115,6 +119,7 @@ class Qwen35TextModel {
   void set_weight_override(const std::string& name, torch::Tensor tensor);
 
  private:
+  torch::Tensor find_weight_override(const std::string& name) const;
   torch::Tensor weight(const std::string& name);
   torch::Tensor embed(const torch::Tensor& input_ids);
   torch::Tensor rms_norm(const torch::Tensor& x, const torch::Tensor& weight) const;

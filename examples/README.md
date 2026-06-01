@@ -27,6 +27,9 @@ Current examples:
 - `run_qwen3_30b_a3b_sft_pp8_h20.sh`: 8-card H20 GSM8K SFT entry point for
   `Qwen/Qwen3-30B-A3B`, defaulting to `PP=8,TP=1,DP=1,EP=1,SP=1`,
   bf16, and configurable `GRAD_ACCUM_STEPS`.
+- `run_qwen3_30b_a3b_sft_zero2_h20.sh`: 8-card H20 Qwen3-30B-A3B SFT entry
+  point for ZeRO Stage 2 first, defaulting to `DP=8,PP=1,TP=1,EP=1`,
+  flat DP sharded AdamW, bf16 gradient reduce-scatter, and seq=4096.
 - `run_qwen3_30b_a3b_moe_parallel_h20.sh`: 8-card H20 Qwen3 MoE regression
   launcher. It defaults to `DP=1,PP=2,CP=1,TP=2,EP=2,SP=1` and `TRAIN_MODE=sft`;
   set `TRAIN_MODE=ppo` for the PPO loss path, or set `CP_SIZE=2,TP_SIZE=1` to
@@ -61,6 +64,10 @@ NCCL_SOCKET_IFNAME=bond1 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 # Full 48-layer Qwen3-30B-A3B SFT smoke on 8 H20 GPUs.
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
   examples/run_qwen3_30b_a3b_sft_pp8_h20.sh
+
+# Full 48-layer Qwen3-30B-A3B SFT with DP ZeRO Stage 2, no EP/TP/PP.
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  examples/run_qwen3_30b_a3b_sft_zero2_h20.sh
 
 # Qwen3 MoE 8-card parallel regression: PP + TP + EP.
 NCCL_SOCKET_IFNAME=bond1 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \

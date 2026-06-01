@@ -1,4 +1,6 @@
 #include <array>
+#include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cmath>
 #include <filesystem>
@@ -142,6 +144,15 @@ void zero_model_gradients(const std::vector<torch::Tensor>& params) {
   }
 }
 
+void clear_model_gradients(const std::vector<torch::Tensor>& params) {
+  torch::NoGradGuard no_grad;
+  for (const auto& p : params) {
+    if (p.defined() && p.grad().defined()) {
+      p.mutable_grad() = torch::Tensor();
+    }
+  }
+}
+
 torch::Tensor grad_l2_norm_sq_tensor(const std::vector<torch::Tensor>& params, torch::Device fallback_device) {
   torch::Tensor total;
   for (const auto& p : params) {
@@ -272,6 +283,60 @@ bool moe_expert_index_from_weight_name(const std::string& name, int64_t* expert_
   return true;
 }
 
+std::string qwen_layer_prefix(const cverl::Qwen35TextConfig& cfg, int64_t layer_idx) {
+  const char* root = cfg.is_qwen3_moe() ? "model.layers." : "model.language_model.layers.";
+  return std::string(root) + std::to_string(layer_idx) + ".";
+}
+
+std::string qwen_moe_expert_weight_name(const cverl::Qwen35TextConfig& cfg,
+                                        int64_t layer_idx,
+                                        int64_t expert_idx,
+                                        const std::string& projection) {
+  return qwen_layer_prefix(cfg, layer_idx) + "mlp.experts." + std::to_string(expert_idx) + "." + projection +
+         ".weight";
+}
+
+std::string packed_moe_gate_up_weight_name(int64_t layer_idx) {
+  return "__cverl_packed_moe.layers." + std::to_string(layer_idx) + ".gate_up.weight";
+}
+
+std::string packed_moe_down_weight_name(int64_t layer_idx) {
+  return "__cverl_packed_moe.layers." + std::to_string(layer_idx) + ".down.weight";
+}
+
+bool packed_moe_layer_from_weight_name(const std::string& name, const std::string& suffix, int64_t* layer_index) {
+  const std::string prefix = "__cverl_packed_moe.layers.";
+  if (name.rfind(prefix, 0) != 0 || name.size() <= prefix.size() + suffix.size()) {
+    return false;
+  }
+  const size_t begin = prefix.size();
+  const size_t end = name.size() - suffix.size();
+  if (name.compare(end, suffix.size(), suffix) != 0 || end <= begin) {
+    return false;
+  }
+  for (size_t i = begin; i < end; ++i) {
+    if (name[i] < '0' || name[i] > '9') {
+      return false;
+    }
+  }
+  *layer_index = std::stoll(name.substr(begin, end - begin));
+  return true;
+}
+
+bool packed_moe_gate_up_layer_from_weight_name(const std::string& name, int64_t* layer_index) {
+  return packed_moe_layer_from_weight_name(name, ".gate_up.weight", layer_index);
+}
+
+bool packed_moe_down_layer_from_weight_name(const std::string& name, int64_t* layer_index) {
+  return packed_moe_layer_from_weight_name(name, ".down.weight", layer_index);
+}
+
+bool packed_moe_expert_parameter(const std::string& name) {
+  int64_t layer = -1;
+  return packed_moe_gate_up_layer_from_weight_name(name, &layer) ||
+         packed_moe_down_layer_from_weight_name(name, &layer);
+}
+
 bool ep_rank_owns_expert(int64_t expert, const cverl::Qwen35TextConfig& cfg, int64_t ep_rank, int64_t ep_size) {
   if (ep_size == 1) {
     return true;
@@ -295,14 +360,26 @@ std::vector<std::string> stage_required_weight_names(const cverl::Qwen35TextMode
                                                      int64_t ep_rank,
                                                      int64_t ep_size) {
   std::vector<std::string> out;
+  const bool pack_moe_experts = model.config().is_qwen3_moe() && ep_size > 1;
+  std::vector<uint8_t> packed_moe_layer_added(static_cast<size_t>(model.config().num_hidden_layers), 0);
   for (const auto& name : model.required_weight_names(max_layers)) {
     int64_t layer_index = -1;
     if (layer_index_from_weight_name(name, &layer_index)) {
       if (layer_index >= layer_begin && layer_index < layer_end) {
         int64_t expert_index = -1;
-        if (moe_expert_index_from_weight_name(name, &expert_index) &&
-            !ep_rank_owns_expert(expert_index, model.config(), ep_rank, ep_size)) {
-          continue;
+        if (moe_expert_index_from_weight_name(name, &expert_index)) {
+          if (pack_moe_experts) {
+            auto& added = packed_moe_layer_added.at(static_cast<size_t>(layer_index));
+            if (!added) {
+              out.push_back(packed_moe_gate_up_weight_name(layer_index));
+              out.push_back(packed_moe_down_weight_name(layer_index));
+              added = 1;
+            }
+            continue;
+          }
+          if (!ep_rank_owns_expert(expert_index, model.config(), ep_rank, ep_size)) {
+            continue;
+          }
         }
         out.push_back(name);
       }
@@ -415,6 +492,56 @@ torch::Tensor qwen_megatron_tp_shard(const std::string& name,
   return full.contiguous();
 }
 
+std::pair<int64_t, int64_t> local_expert_range(const cverl::Qwen35TextConfig& cfg, int64_t ep_rank, int64_t ep_size) {
+  if (!cfg.is_qwen3_moe() || cfg.num_experts <= 0 || cfg.num_experts % ep_size != 0) {
+    throw std::runtime_error("Qwen3 MoE expert count must be divisible by EP size");
+  }
+  const int64_t experts_per_rank = cfg.num_experts / ep_size;
+  return {ep_rank * experts_per_rank, (ep_rank + 1) * experts_per_rank};
+}
+
+torch::Tensor load_packed_moe_gate_up_weight(const cverl::Qwen35TextModel& model,
+                                             int64_t layer_idx,
+                                             int64_t ep_rank,
+                                             int64_t ep_size,
+                                             int64_t tp_rank,
+                                             int64_t tp_size,
+                                             torch::ScalarType dtype,
+                                             torch::Device device) {
+  const auto& cfg = model.config();
+  const auto range = local_expert_range(cfg, ep_rank, ep_size);
+  std::vector<torch::Tensor> weights;
+  weights.reserve(static_cast<size_t>(range.second - range.first));
+  for (int64_t expert = range.first; expert < range.second; ++expert) {
+    const std::string gate_name = qwen_moe_expert_weight_name(cfg, layer_idx, expert, "gate_proj");
+    const std::string up_name = qwen_moe_expert_weight_name(cfg, layer_idx, expert, "up_proj");
+    auto gate = qwen_megatron_tp_shard(gate_name, model.loader().load_tensor(gate_name).to(dtype), cfg, tp_rank, tp_size);
+    auto up = qwen_megatron_tp_shard(up_name, model.loader().load_tensor(up_name).to(dtype), cfg, tp_rank, tp_size);
+    weights.push_back(torch::cat({gate, up}, 0));
+  }
+  return torch::stack(weights, 0).to(torch::TensorOptions().device(device).dtype(dtype)).contiguous();
+}
+
+torch::Tensor load_packed_moe_down_weight(const cverl::Qwen35TextModel& model,
+                                          int64_t layer_idx,
+                                          int64_t ep_rank,
+                                          int64_t ep_size,
+                                          int64_t tp_rank,
+                                          int64_t tp_size,
+                                          torch::ScalarType dtype,
+                                          torch::Device device) {
+  const auto& cfg = model.config();
+  const auto range = local_expert_range(cfg, ep_rank, ep_size);
+  std::vector<torch::Tensor> weights;
+  weights.reserve(static_cast<size_t>(range.second - range.first));
+  for (int64_t expert = range.first; expert < range.second; ++expert) {
+    const std::string down_name = qwen_moe_expert_weight_name(cfg, layer_idx, expert, "down_proj");
+    weights.push_back(
+        qwen_megatron_tp_shard(down_name, model.loader().load_tensor(down_name).to(dtype), cfg, tp_rank, tp_size));
+  }
+  return torch::stack(weights, 0).to(torch::TensorOptions().device(device).dtype(dtype)).contiguous();
+}
+
 bool qwen_tp_replicated_parameter(const std::string& name) {
   if (name == "model.language_model.norm.weight" || name == "model.norm.weight") {
     return true;
@@ -431,6 +558,9 @@ bool qwen_tp_replicated_parameter(const std::string& name) {
 }
 
 bool qwen_ep_replicated_parameter(const std::string& name) {
+  if (packed_moe_expert_parameter(name)) {
+    return false;
+  }
   int64_t expert_index = -1;
   return !moe_expert_index_from_weight_name(name, &expert_index);
 }
@@ -1279,6 +1409,7 @@ void append_metrics_csv(const std::string& path,
                         int64_t prompt_len,
                         int64_t response_len,
                         int64_t rollout_rows,
+                        double step_time_s,
                         const std::string& dtype_name,
                         const std::string& dp_grad_comm_dtype,
                         const std::string& tp_grad_comm_dtype,
@@ -1309,7 +1440,7 @@ void append_metrics_csv(const std::string& path,
   std::ofstream out(path, std::ios::app);
   if (write_header) {
     out << "step,dp,pp,cp,tp,ep,sp,micro_batches,grad_accum_steps,effective_micro_batches,"
-        << "layers,prompt_len,response_len,rollout_rows,"
+        << "layers,prompt_len,response_len,rollout_rows,step_time_s,"
         << "dtype,dp_grad_comm_dtype,tp_grad_comm_dtype,master_weights,dp_shard_optimizer,"
         << "dp_flat_shard_optimizer,dp_grad_bucket_mb,tp_grad_bucket_mb,"
         << "mean_reward,success_rate,adv_abs_sum,loss_sum,kl_loss_sum,ppo_kl_sum,clipfrac_sum,"
@@ -1329,6 +1460,7 @@ void append_metrics_csv(const std::string& path,
       << prompt_len << ","
       << response_len << ","
       << rollout_rows << ","
+      << step_time_s << ","
       << dtype_name << ","
       << dp_grad_comm_dtype << ","
       << tp_grad_comm_dtype << ","
@@ -1969,11 +2101,22 @@ int main(int argc, char** argv) {
     std::vector<std::string> param_names;
     const auto rank_weight_names = stage_required_weight_names(
         model, layers, range.begin, range.end, peers.is_first_stage, peers.is_last_stage, info.expert_rank, ep_size);
+    torch::manual_seed(1234 + global_rank);
     for (const auto& name : rank_weight_names) {
-      auto full_tensor = model.loader().load_tensor(name).to(dtype);
-      auto tensor = qwen_megatron_tp_shard(name, full_tensor, model.config(), info.tensor_rank, tp_size)
-                        .to(torch::TensorOptions().device(device).dtype(dtype))
-                        .contiguous();
+      torch::Tensor tensor;
+      int64_t packed_layer = -1;
+      if (packed_moe_gate_up_layer_from_weight_name(name, &packed_layer)) {
+        tensor = load_packed_moe_gate_up_weight(
+            model, packed_layer, info.expert_rank, ep_size, info.tensor_rank, tp_size, dtype, device);
+      } else if (packed_moe_down_layer_from_weight_name(name, &packed_layer)) {
+        tensor = load_packed_moe_down_weight(
+            model, packed_layer, info.expert_rank, ep_size, info.tensor_rank, tp_size, dtype, device);
+      } else {
+        auto full_tensor = model.loader().load_tensor(name).to(dtype);
+        tensor = qwen_megatron_tp_shard(name, full_tensor, model.config(), info.tensor_rank, tp_size)
+                     .to(torch::TensorOptions().device(device).dtype(dtype))
+                     .contiguous();
+      }
       tensor.set_requires_grad(true);
       model.set_weight_override(name, tensor);
       params.push_back(tensor);
@@ -2054,6 +2197,9 @@ int main(int argc, char** argv) {
     bool trainer_ok = true;
 
     for (int64_t step = start_step; step < steps; ++step) {
+      full_comm.barrier();
+      torch::cuda::synchronize(device.index());
+      const auto step_start_time = std::chrono::steady_clock::now();
       for (auto& slot : stage_inputs) {
         slot = torch::Tensor();
       }
@@ -2195,7 +2341,6 @@ int main(int argc, char** argv) {
               scoring_hidden = scoring_hidden.narrow(1, 0, seq_len).contiguous();
             }
             auto response_hidden = scoring_hidden.slice(1, prompt_len - 1, prompt_len + response_len - 1);
-            auto log_probs = model.response_log_probs_tensor_parallel(response_hidden, response_ids, tp_group);
             torch::Tensor advantages;
             torch::Tensor response_mask;
             torch::Tensor old_log_probs;
@@ -2207,15 +2352,21 @@ int main(int argc, char** argv) {
                 old_log_probs = rollout_row(active_rollout->old_log_probs, idx, response_len);
               }
             } else {
-              advantages = torch::ones_like(log_probs) * advantage_scale;
-              response_mask = torch::ones_like(log_probs);
+              response_mask = torch::ones(response_ids.sizes(),
+                                          torch::TensorOptions().dtype(torch::kFloat32).device(response_ids.device()));
             }
+            auto metric_options = torch::TensorOptions().dtype(torch::kFloat32).device(response_hidden.device());
             torch::Tensor total_loss;
-            torch::Tensor ppo_kl_metric = torch::zeros({}, log_probs.options());
-            torch::Tensor clipfrac_metric = torch::zeros({}, log_probs.options());
+            torch::Tensor log_probs;
+            torch::Tensor ppo_kl_metric = torch::zeros({}, metric_options);
+            torch::Tensor clipfrac_metric = torch::zeros({}, metric_options);
             if (sft_mode) {
-              total_loss = -cverl::torch_backend::masked_mean(log_probs, response_mask);
+              total_loss = model.response_nll_tensor_parallel(response_hidden, response_ids, response_mask, tp_group);
             } else {
+              log_probs = model.response_log_probs_tensor_parallel(response_hidden, response_ids, tp_group);
+              if (!advantages.defined()) {
+                advantages = torch::ones_like(log_probs) * advantage_scale;
+              }
               if (!old_log_probs.defined()) {
                 old_log_probs = log_probs.detach();
               }
@@ -2237,6 +2388,9 @@ int main(int argc, char** argv) {
             if (kl_coef > 0.0) {
               if (active_rollout == nullptr || !active_rollout->ref_log_probs.defined()) {
                 throw std::runtime_error("--kl-coef > 0 requires ref_log_probs in rollout batch");
+              }
+              if (!log_probs.defined()) {
+                log_probs = model.response_log_probs_tensor_parallel(response_hidden, response_ids, tp_group);
               }
               const int64_t idx = batch_micro_batch % active_rollout->rows;
               auto ref_log_probs = rollout_row(active_rollout->ref_log_probs, idx, response_len);
@@ -2302,14 +2456,24 @@ int main(int argc, char** argv) {
         local_grad_norm = flat_step.local_grad_norm;
         flat_step_done = true;
       } else if (dp_flat_shard_optimizer) {
-        auto flat_grad = cverl::distributed::reduce_scatter_flat_gradient_shard(
-            params, dp_comm, dp_group.ranks, true, false, dp_grad_comm_dtype);
+        auto flat_grad = dp_grad_bucket_numel > 0
+                             ? cverl::distributed::reduce_scatter_flat_gradient_shard_bucketed(
+                                   params,
+                                   dp_comm,
+                                   dp_group.ranks,
+                                   true,
+                                   dp_grad_bucket_numel,
+                                   false,
+                                   dp_grad_comm_dtype)
+                             : cverl::distributed::reduce_scatter_flat_gradient_shard(
+                                   params, dp_comm, dp_group.ranks, true, false, dp_grad_comm_dtype);
         if (flat_grad.original_numel != flat_param_shard.original_numel ||
             flat_grad.padded_numel != flat_param_shard.padded_numel ||
             flat_grad.shard.numel() != flat_param_shard.shard.numel()) {
           throw std::runtime_error("flat DP optimizer parameter/gradient shard metadata mismatch");
         }
         flat_gradient_shard = flat_grad.shard;
+        clear_model_gradients(params);
       } else {
         cverl::distributed::data_parallel_sync_gradients(
             params, dp_comm, dp_group.ranks, true, dp_grad_bucket_bytes, dp_grad_comm_dtype);
@@ -2371,6 +2535,9 @@ int main(int argc, char** argv) {
                                                     dp_grad_bucket_bytes);
         }
       }
+      torch::cuda::synchronize(device.index());
+      const double local_step_time_s =
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - step_start_time).count();
       const double local_param_delta =
           (!measure_param_delta || skip_optimizer_step)
               ? 0.0
@@ -2438,7 +2605,7 @@ int main(int argc, char** argv) {
         full_comm.barrier();
       }
 
-      constexpr int64_t kMetricFields = 8;
+      constexpr int64_t kMetricFields = 9;
       auto local_metrics = torch::empty({kMetricFields}, metric_options);
       local_metrics.index_put_({0}, local_grad_norm);
       local_metrics.index_put_({1}, local_param_delta);
@@ -2448,6 +2615,7 @@ int main(int argc, char** argv) {
       local_metrics.index_put_({5}, clipfrac_sum_tensor);
       local_metrics.index_put_({6}, global_grad_norm);
       local_metrics.index_put_({7}, grad_clip_scale);
+      local_metrics.index_put_({8}, local_step_time_s);
       auto gathered_metrics =
           full_comm.all_gather(local_metrics.contiguous(), full_ranks, 0).cpu().view({world_size, kMetricFields});
 
@@ -2463,6 +2631,7 @@ int main(int argc, char** argv) {
         double total_param_delta = 0.0;
         double reported_global_grad_norm = 0.0;
         double reported_grad_clip_scale = 1.0;
+        double reported_step_time_s = 0.0;
         auto metrics = gathered_metrics.accessor<float, 2>();
         for (int64_t i = 0; i < world_size; ++i) {
           const double grad_value = static_cast<double>(metrics[i][0]);
@@ -2482,6 +2651,7 @@ int main(int argc, char** argv) {
             reported_global_grad_norm = static_cast<double>(metrics[i][6]);
             reported_grad_clip_scale = static_cast<double>(metrics[i][7]);
           }
+          reported_step_time_s = std::max(reported_step_time_s, static_cast<double>(metrics[i][8]));
         }
         if (!measure_param_delta) {
           all_updated = !skip_optimizer_step;
@@ -2501,6 +2671,7 @@ int main(int argc, char** argv) {
                            prompt_len,
                            response_len,
                            active_rollout != nullptr ? active_rollout->rows : 0,
+                           reported_step_time_s,
                            dtype_arg,
                            dp_grad_comm_dtype_arg,
                            tp_grad_comm_dtype_arg,
@@ -2534,6 +2705,7 @@ int main(int argc, char** argv) {
                   << " layers=" << layers
                   << " prompt_len=" << prompt_len
                   << " response_len=" << response_len
+                  << " step_time_s=" << reported_step_time_s
                   << " master_weights=" << (use_master_weights ? "true" : "false")
                   << " dp_shard_optimizer=" << (dp_shard_optimizer ? "true" : "false")
                   << " flat_checkpoint_save_model_params=" << (flat_checkpoint_save_model_params ? "true" : "false")

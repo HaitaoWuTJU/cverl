@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 #include <vector>
 
@@ -111,19 +112,9 @@ ExpertParallelDispatchResult expert_parallel_dispatch_equal_capacity(const torch
 
   const int64_t world = static_cast<int64_t>(group.size());
   const auto device = tokens.device();
-  std::vector<torch::Tensor> selected_tokens;
-  std::vector<torch::Tensor> payload_indices;
-  std::vector<int64_t> counts_host(static_cast<size_t>(world), 0);
-
-  int64_t local_capacity = 0;
-  for (int64_t dest = 0; dest < world; ++dest) {
-    auto positions = torch::nonzero(destination_ranks == dest).flatten().to(torch::TensorOptions().dtype(torch::kLong).device(device));
-    const int64_t count = positions.numel();
-    counts_host[static_cast<size_t>(dest)] = count;
-    local_capacity = std::max(local_capacity, count);
-  }
-
-  auto counts = torch::tensor(counts_host, torch::TensorOptions().dtype(torch::kInt64)).to(device).contiguous();
+  auto long_options = torch::TensorOptions().dtype(torch::kLong).device(device);
+  auto counts = destination_ranks.bincount(std::optional<torch::Tensor>{}, world).to(torch::kInt64).contiguous();
+  const int64_t local_capacity = counts.max().item<int64_t>();
   auto local_capacity_tensor =
       torch::full({1}, local_capacity, torch::TensorOptions().dtype(torch::kInt64).device(device));
   auto capacity_tensor = collectives.all_reduce(local_capacity_tensor, ReduceOp::Max, group).to(torch::kCPU).contiguous();
@@ -131,27 +122,21 @@ ExpertParallelDispatchResult expert_parallel_dispatch_equal_capacity(const torch
 
   auto recv_counts = collectives.all_to_all(counts.contiguous(), group, 0).contiguous();
   auto payload = torch::zeros({world * capacity, tokens.size(1)}, tokens.options());
-  if (capacity > 0) {
-    for (int64_t dest = 0; dest < world; ++dest) {
-      auto positions =
-          torch::nonzero(destination_ranks == dest).flatten().to(torch::TensorOptions().dtype(torch::kLong).device(device));
-      const int64_t count = positions.numel();
-      if (count == 0) {
-        continue;
-      }
-      selected_tokens.push_back(tokens.index_select(0, positions));
-      payload_indices.push_back(
-          torch::arange(dest * capacity, dest * capacity + count, torch::TensorOptions().dtype(torch::kLong).device(device)));
-    }
-    if (!selected_tokens.empty()) {
-      auto all_selected = torch::cat(selected_tokens, 0).contiguous();
-      auto all_indices = torch::cat(payload_indices, 0).contiguous();
-      payload = payload.index_add(0, all_indices, all_selected);
-    }
+  torch::Tensor send_order = torch::empty({0}, long_options);
+  torch::Tensor payload_indices = torch::empty({0}, long_options);
+  if (tokens.size(0) > 0 && capacity > 0) {
+    auto sorted = destination_ranks.sort(0, false);
+    auto sorted_destinations = std::get<0>(sorted).contiguous();
+    send_order = std::get<1>(sorted).contiguous();
+    auto exclusive_offsets = counts.cumsum(0) - counts;
+    auto route_offsets = torch::arange(0, tokens.size(0), long_options) -
+                         exclusive_offsets.index_select(0, sorted_destinations);
+    payload_indices = (sorted_destinations * capacity + route_offsets).contiguous();
+    payload = payload.index_add(0, payload_indices, tokens.index_select(0, send_order));
   }
 
   auto received = expert_parallel_all_to_all_autograd(payload.contiguous(), collectives, group, 0).contiguous();
-  return ExpertParallelDispatchResult{received, counts, recv_counts, capacity};
+  return ExpertParallelDispatchResult{received, counts, recv_counts, capacity, send_order, payload_indices};
 }
 
 }  // namespace cverl::distributed

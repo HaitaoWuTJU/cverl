@@ -7,12 +7,16 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <regex>
 #include <stdexcept>
 #include <tuple>
 
+#include <ATen/ops/_grouped_mm.h>
+#include <ATen/ops/scaled_dot_product_attention.h>
 #include <torch/nn/functional/conv.h>
 #include <torch/nn/functional/embedding.h>
+#include <torch/nn/functional/loss.h>
 #include <torch/csrc/autograd/custom_function.h>
 
 namespace cverl {
@@ -538,6 +542,14 @@ std::string lm_head_weight_name(const Qwen35TextConfig& cfg) {
   return (cfg.is_qwen3_moe() && !cfg.tie_word_embeddings) ? "lm_head.weight" : embed_weight_name(cfg);
 }
 
+std::string packed_moe_gate_up_weight_name(int64_t layer_idx) {
+  return "__cverl_packed_moe.layers." + std::to_string(layer_idx) + ".gate_up.weight";
+}
+
+std::string packed_moe_down_weight_name(int64_t layer_idx) {
+  return "__cverl_packed_moe.layers." + std::to_string(layer_idx) + ".down.weight";
+}
+
 }  // namespace
 
 Qwen35TextConfig load_qwen35_text_config(const std::string& model_dir) {
@@ -598,6 +610,14 @@ void Qwen35TextModel::to(torch::Device device) {
 
 void Qwen35TextModel::set_weight_override(const std::string& name, torch::Tensor tensor) {
   weights_[name] = std::move(tensor);
+}
+
+torch::Tensor Qwen35TextModel::find_weight_override(const std::string& name) const {
+  auto it = weights_.find(name);
+  if (it == weights_.end()) {
+    return torch::Tensor();
+  }
+  return it->second;
 }
 
 std::vector<std::string> Qwen35TextModel::required_weight_names(int64_t max_layers) const {
@@ -741,12 +761,14 @@ torch::Tensor Qwen35TextModel::mlp(const torch::Tensor& x, int64_t layer_idx) {
   if (config_.is_qwen3_moe()) {
     auto flat = x.reshape({-1, config_.hidden_size});
     auto router_logits = dense(flat, weight(p + "gate.weight")).to(torch::kFloat32);
-    auto routing = torch::softmax(router_logits, -1);
-    auto topk = routing.topk(config_.num_experts_per_tok, -1, true, false);
+    auto topk = router_logits.topk(config_.num_experts_per_tok, -1, true, false);
     auto topk_weights = std::get<0>(topk);
     auto topk_indices = std::get<1>(topk);
     if (config_.norm_topk_prob) {
-      topk_weights = topk_weights / topk_weights.sum(-1, true).clamp_min(1.0e-12);
+      topk_weights = torch::softmax(topk_weights, -1);
+    } else {
+      auto routing = torch::softmax(router_logits, -1);
+      topk_weights = routing.gather(-1, topk_indices);
     }
     auto out = torch::zeros_like(flat);
     for (int64_t expert = 0; expert < config_.num_experts; ++expert) {
@@ -785,12 +807,14 @@ torch::Tensor Qwen35TextModel::mlp_expert_parallel(const torch::Tensor& x,
   std::string p = layer_prefix(config_, layer_idx) + "mlp.";
   auto flat = x.reshape({-1, config_.hidden_size});
   auto router_logits = dense(flat, weight(p + "gate.weight")).to(torch::kFloat32);
-  auto routing = torch::softmax(router_logits, -1);
-  auto topk = routing.topk(config_.num_experts_per_tok, -1, true, false);
+  auto topk = router_logits.topk(config_.num_experts_per_tok, -1, true, false);
   auto topk_weights = std::get<0>(topk);
   auto topk_indices = std::get<1>(topk);
   if (config_.norm_topk_prob) {
-    topk_weights = topk_weights / topk_weights.sum(-1, true).clamp_min(1.0e-12);
+    topk_weights = torch::softmax(topk_weights, -1);
+  } else {
+    auto routing = torch::softmax(router_logits, -1);
+    topk_weights = routing.gather(-1, topk_indices);
   }
   if (config_.moe_intermediate_size % tensor_group.world_size != 0) {
     throw std::invalid_argument("Qwen3 MoE expert intermediate size must be divisible by TP size");
@@ -871,98 +895,86 @@ torch::Tensor Qwen35TextModel::mlp_expert_parallel(const torch::Tensor& x,
   auto source_token_payload = torch::full({metadata_size}, -1, long_options);
   auto expert_payload = torch::full({metadata_size}, -1, long_options);
   auto weight_payload = torch::zeros({metadata_size}, route_weights.options());
-  if (capacity > 0) {
-    for (int64_t dest = 0; dest < expert_group.world_size; ++dest) {
-      auto positions =
-          torch::nonzero(destination_ranks == dest).flatten().to(torch::TensorOptions().dtype(torch::kLong).device(flat.device()));
-      const int64_t count = positions.numel();
-      if (count == 0) {
-        continue;
-      }
-      auto payload_indices =
-          torch::arange(dest * capacity, dest * capacity + count, torch::TensorOptions().dtype(torch::kLong).device(flat.device()));
-      source_token_payload.index_put_({payload_indices}, token_indices.index_select(0, positions));
-      expert_payload.index_put_({payload_indices}, expert_indices.index_select(0, positions));
-      weight_payload = weight_payload.index_add(0, payload_indices, route_weights.index_select(0, positions));
-    }
+  if (dispatch.payload_indices.numel() > 0) {
+    source_token_payload.index_put_({dispatch.payload_indices}, token_indices.index_select(0, dispatch.send_order));
+    expert_payload.index_put_({dispatch.payload_indices}, expert_indices.index_select(0, dispatch.send_order));
+    weight_payload.index_put_({dispatch.payload_indices}, route_weights.index_select(0, dispatch.send_order));
   }
 
   auto received_experts = expert_group.collectives->all_to_all(expert_payload.contiguous(), expert_group.ranks, 0)
                               .contiguous();
   auto local_return = torch::zeros_like(dispatch.received_tokens);
-  int64_t local_expert_capacity = 0;
-  std::vector<torch::Tensor> local_expert_positions;
-  local_expert_positions.reserve(static_cast<size_t>(experts_per_rank));
-  for (int64_t expert = expert_begin; expert < expert_end; ++expert) {
-    auto positions = torch::nonzero(received_experts == expert).flatten().to(long_options);
-    local_expert_capacity = std::max<int64_t>(local_expert_capacity, positions.numel());
-    local_expert_positions.push_back(positions);
-  }
-  if (local_expert_capacity > 0) {
-    std::vector<torch::Tensor> packed_indices_parts;
-    std::vector<torch::Tensor> return_indices_parts;
-    packed_indices_parts.reserve(static_cast<size_t>(experts_per_rank));
-    return_indices_parts.reserve(static_cast<size_t>(experts_per_rank));
-    for (int64_t local_expert = 0; local_expert < experts_per_rank; ++local_expert) {
-      const auto& positions = local_expert_positions.at(static_cast<size_t>(local_expert));
-      const int64_t count = positions.numel();
-      if (count == 0) {
-        continue;
-      }
-      packed_indices_parts.push_back(
-          torch::arange(local_expert * local_expert_capacity,
-                        local_expert * local_expert_capacity + count,
-                        long_options));
-      return_indices_parts.push_back(positions);
+  auto local_mask = torch::logical_and(received_experts >= expert_begin, received_experts < expert_end);
+  auto return_indices = torch::nonzero(local_mask).flatten().to(long_options);
+  if (return_indices.numel() > 0) {
+    auto local_expert_ids = (received_experts.index_select(0, return_indices) - expert_begin).contiguous();
+    auto local_counts =
+        local_expert_ids.bincount(std::optional<torch::Tensor>{}, experts_per_rank).to(torch::kInt64).contiguous();
+    auto active_local_ids = torch::nonzero(local_counts > 0).flatten().to(long_options).contiguous();
+    const int64_t active_experts = active_local_ids.numel();
+    auto active_counts = local_counts.index_select(0, active_local_ids).contiguous();
+    auto active_slots_by_expert = torch::full({experts_per_rank}, -1, long_options);
+    active_slots_by_expert.index_put_({active_local_ids}, torch::arange(0, active_experts, long_options));
+    auto active_slot_ids = active_slots_by_expert.index_select(0, local_expert_ids).contiguous();
+    auto sorted_local = active_slot_ids.sort(0, false);
+    auto local_order = std::get<1>(sorted_local).contiguous();
+    return_indices = return_indices.index_select(0, local_order).contiguous();
+    auto sorted_tokens = dispatch.received_tokens.index_select(0, return_indices).contiguous();
+    auto grouped_offsets = active_counts.cumsum(0).to(torch::kInt32).contiguous();
+
+    torch::Tensor gate_up_stack;
+    torch::Tensor down_stack;
+    auto packed_gate_up = find_weight_override(packed_moe_gate_up_weight_name(layer_idx));
+    auto packed_down = find_weight_override(packed_moe_down_weight_name(layer_idx));
+    if (packed_gate_up.defined() != packed_down.defined()) {
+      throw std::invalid_argument("Qwen3 MoE packed expert overrides must provide gate_up and down together");
     }
-
-    auto packed_indices = torch::cat(packed_indices_parts, 0).contiguous();
-    auto return_indices = torch::cat(return_indices_parts, 0).contiguous();
-    auto packed_flat = torch::zeros({experts_per_rank * local_expert_capacity, config_.hidden_size},
-                                    dispatch.received_tokens.options());
-    packed_flat = packed_flat.index_add(0, packed_indices, dispatch.received_tokens.index_select(0, return_indices));
-    auto packed_tokens = packed_flat.view({experts_per_rank, local_expert_capacity, config_.hidden_size});
-
-    std::vector<torch::Tensor> gate_weights;
-    std::vector<torch::Tensor> up_weights;
-    std::vector<torch::Tensor> down_weights;
-    gate_weights.reserve(static_cast<size_t>(experts_per_rank));
-    up_weights.reserve(static_cast<size_t>(experts_per_rank));
-    down_weights.reserve(static_cast<size_t>(experts_per_rank));
-    for (int64_t expert = expert_begin; expert < expert_end; ++expert) {
-      std::string ep = p + "experts." + std::to_string(expert) + ".";
-      gate_weights.push_back(local_or_shard_dim(weight(ep + "gate_proj.weight"),
-                                                0,
-                                                config_.moe_intermediate_size,
-                                                tensor_group.rank,
-                                                tensor_group.world_size,
-                                                ep + "gate_proj.weight"));
-      up_weights.push_back(local_or_shard_dim(weight(ep + "up_proj.weight"),
+    if (packed_gate_up.defined()) {
+      gate_up_stack = packed_gate_up.index_select(0, active_local_ids).contiguous();
+      down_stack = packed_down.index_select(0, active_local_ids).contiguous();
+    } else {
+      std::vector<torch::Tensor> gate_up_weights;
+      std::vector<torch::Tensor> down_weights;
+      gate_up_weights.reserve(static_cast<size_t>(active_experts));
+      down_weights.reserve(static_cast<size_t>(active_experts));
+      auto active_local_ids_cpu = active_local_ids.to(torch::kCPU).contiguous();
+      auto active_local_ids_view = active_local_ids_cpu.accessor<int64_t, 1>();
+      for (int64_t slot = 0; slot < active_experts; ++slot) {
+        const int64_t expert = expert_begin + active_local_ids_view[slot];
+        std::string ep = p + "experts." + std::to_string(expert) + ".";
+        auto gate_weight = local_or_shard_dim(weight(ep + "gate_proj.weight"),
                                               0,
                                               config_.moe_intermediate_size,
                                               tensor_group.rank,
                                               tensor_group.world_size,
-                                              ep + "up_proj.weight"));
-      down_weights.push_back(local_or_shard_dim(weight(ep + "down_proj.weight"),
-                                                1,
-                                                config_.moe_intermediate_size,
-                                                tensor_group.rank,
-                                                tensor_group.world_size,
-                                                ep + "down_proj.weight"));
+                                              ep + "gate_proj.weight");
+        auto up_weight = local_or_shard_dim(weight(ep + "up_proj.weight"),
+                                            0,
+                                            config_.moe_intermediate_size,
+                                            tensor_group.rank,
+                                            tensor_group.world_size,
+                                            ep + "up_proj.weight");
+        gate_up_weights.push_back(torch::cat({gate_weight, up_weight}, 0));
+        down_weights.push_back(local_or_shard_dim(weight(ep + "down_proj.weight"),
+                                                  1,
+                                                  config_.moe_intermediate_size,
+                                                  tensor_group.rank,
+                                                  tensor_group.world_size,
+                                                  ep + "down_proj.weight"));
+      }
+      gate_up_stack = torch::stack(gate_up_weights, 0).contiguous();
+      down_stack = torch::stack(down_weights, 0).contiguous();
     }
-
-    auto gate_stack = torch::stack(gate_weights, 0).contiguous();
-    auto up_stack = torch::stack(up_weights, 0).contiguous();
-    auto down_stack = torch::stack(down_weights, 0).contiguous();
-    if (gate_stack.size(1) != intermediate_local || up_stack.size(1) != intermediate_local ||
-        down_stack.size(2) != intermediate_local) {
+    if (gate_up_stack.size(1) != 2 * intermediate_local || down_stack.size(2) != intermediate_local) {
       throw std::invalid_argument("Qwen3 MoE TP expert shard shape mismatch");
     }
-    auto gate = torch::bmm(packed_tokens, gate_stack.transpose(1, 2));
-    auto up = torch::bmm(packed_tokens, up_stack.transpose(1, 2));
-    auto expert_out = torch::bmm(torch::silu(gate) * up, down_stack.transpose(1, 2));
-    auto expert_out_flat = expert_out.reshape({experts_per_rank * local_expert_capacity, config_.hidden_size});
-    local_return = local_return.index_add(0, return_indices, expert_out_flat.index_select(0, packed_indices));
+    auto gate_up = at::_grouped_mm(sorted_tokens, gate_up_stack.transpose(1, 2).contiguous(), grouped_offsets);
+    auto gate_up_parts = gate_up.chunk(2, -1);
+    auto gate = gate_up_parts[0];
+    auto up = gate_up_parts[1];
+    auto expert_out =
+        at::_grouped_mm((torch::silu(gate) * up).contiguous(), down_stack.transpose(1, 2).contiguous(), grouped_offsets);
+    local_return = local_return.index_add(0, return_indices, expert_out);
   }
 
   auto returned = distributed::expert_parallel_all_to_all_autograd(
@@ -1053,13 +1065,15 @@ torch::Tensor Qwen35TextModel::full_attention(const torch::Tensor& x, int64_t la
   q = torch::cat(std::vector<torch::Tensor>{q_rot * cos + rotate_half(q_rot) * sin, q_pass}, -1);
   k = torch::cat(std::vector<torch::Tensor>{k_rot * cos + rotate_half(k_rot) * sin, k_pass}, -1);
 
-  k = repeat_kv(k, h / kvh);
-  v = repeat_kv(v, h / kvh);
-  auto attn = torch::matmul(q, k.transpose(2, 3)) * (1.0 / std::sqrt(static_cast<double>(d)));
-  auto mask = causal_mask(s, x.device());
-  attn = attn.masked_fill(mask.unsqueeze(0).unsqueeze(0), -1.0e9);
-  attn = torch::softmax(attn.to(torch::kFloat32), -1);
-  auto out = torch::matmul(attn, v.to(torch::kFloat32)).transpose(1, 2).contiguous().reshape({b, s, h * d});
+  auto context = at::scaled_dot_product_attention(q.contiguous(),
+                                                  k.contiguous(),
+                                                  v.contiguous(),
+                                                  std::nullopt,
+                                                  0.0,
+                                                  true,
+                                                  std::optional<double>(1.0 / std::sqrt(static_cast<double>(d))),
+                                                  true);
+  auto out = context.transpose(1, 2).contiguous().reshape({b, s, h * d});
   if (!config_.is_qwen3_moe()) {
     out = out * torch::sigmoid(gate.to(torch::kFloat32));
   }
@@ -1186,13 +1200,15 @@ torch::Tensor Qwen35TextModel::full_attention_tensor_parallel(const torch::Tenso
   q = torch::cat(std::vector<torch::Tensor>{q_rot * cos + rotate_half(q_rot) * sin, q_pass}, -1);
   k = torch::cat(std::vector<torch::Tensor>{k_rot * cos + rotate_half(k_rot) * sin, k_pass}, -1);
 
-  k = repeat_kv(k, h / kvh).contiguous();
-  v = repeat_kv(v, h / kvh).contiguous();
-  auto attn = torch::matmul(q, k.transpose(2, 3)) * (1.0 / std::sqrt(static_cast<double>(d)));
-  auto mask = causal_mask(s, x.device());
-  attn = attn.masked_fill(mask.unsqueeze(0).unsqueeze(0), -1.0e9);
-  attn = torch::softmax(attn.to(torch::kFloat32), -1);
-  auto local = torch::matmul(attn, v.to(torch::kFloat32)).transpose(1, 2).contiguous().reshape({b, s, h_local * d});
+  auto context = at::scaled_dot_product_attention(q.contiguous(),
+                                                  k.contiguous(),
+                                                  v.contiguous(),
+                                                  std::nullopt,
+                                                  0.0,
+                                                  true,
+                                                  std::optional<double>(1.0 / std::sqrt(static_cast<double>(d))),
+                                                  true);
+  auto local = context.transpose(1, 2).contiguous().reshape({b, s, h_local * d});
   if (!config_.is_qwen3_moe()) {
     local = local * torch::sigmoid(gate.to(torch::kFloat32));
   }
@@ -1580,7 +1596,8 @@ torch::Tensor Qwen35TextModel::response_log_probs_tensor_parallel(const torch::T
                                                                   const distributed::ParallelGroup& tensor_group) {
   auto emb = weight(lm_head_weight_name(config_));
   if (tensor_group.world_size == 1) {
-    return torch::log_softmax(torch::matmul(hidden.to(torch::kFloat32), emb.to(torch::kFloat32).transpose(0, 1)), -1)
+    auto logits = torch::matmul(hidden.to(emb.scalar_type()), emb.transpose(0, 1)).to(torch::kFloat32);
+    return torch::log_softmax(logits, -1)
         .gather(-1, response_ids.unsqueeze(-1))
         .squeeze(-1);
   }
@@ -1594,7 +1611,7 @@ torch::Tensor Qwen35TextModel::response_log_probs_tensor_parallel(const torch::T
   if (emb.size(0) != vocab_local) {
     emb = emb.narrow(0, tensor_group.rank * vocab_local, vocab_local).contiguous();
   }
-  auto local_logits = torch::matmul(hidden.to(torch::kFloat32), emb.to(torch::kFloat32).transpose(0, 1));
+  auto local_logits = torch::matmul(hidden.to(emb.scalar_type()), emb.transpose(0, 1)).to(torch::kFloat32);
   auto local_max = std::get<0>(local_logits.max(-1, true)).contiguous();
   auto global_max =
       tensor_group.collectives->all_reduce(local_max, distributed::ReduceOp::Max, tensor_group.ranks);
@@ -1610,6 +1627,27 @@ torch::Tensor Qwen35TextModel::response_log_probs_tensor_parallel(const torch::T
   local_target = local_target * mask.to(local_target.scalar_type());
   auto target = all_reduce_sum_preserve_local_grad(local_target.contiguous(), tensor_group);
   return target - global_max.squeeze(-1) - torch::log(global_exp_sum.squeeze(-1));
+}
+
+torch::Tensor Qwen35TextModel::response_nll_tensor_parallel(const torch::Tensor& hidden,
+                                                            const torch::Tensor& response_ids,
+                                                            const torch::Tensor& response_mask,
+                                                            const distributed::ParallelGroup& tensor_group) {
+  auto mask = response_mask.to(torch::TensorOptions().dtype(torch::kFloat32).device(hidden.device()));
+  if (tensor_group.world_size == 1) {
+    auto emb = weight(lm_head_weight_name(config_));
+    auto logits = torch::matmul(hidden.to(emb.scalar_type()), emb.transpose(0, 1));
+    namespace F = torch::nn::functional;
+    auto token_nll = F::cross_entropy(
+                         logits.reshape({-1, logits.size(-1)}),
+                         response_ids.reshape({-1}).to(torch::TensorOptions().dtype(torch::kLong).device(hidden.device())),
+                         F::CrossEntropyFuncOptions().reduction(torch::kNone))
+                         .reshape(response_ids.sizes())
+                         .to(torch::kFloat32);
+    return (token_nll * mask).sum() / mask.sum().clamp_min(1.0e-12);
+  }
+  auto log_probs = response_log_probs_tensor_parallel(hidden, response_ids, tensor_group);
+  return -(log_probs.to(torch::kFloat32) * mask).sum() / mask.sum().clamp_min(1.0e-12);
 }
 
 torch::Tensor Qwen35TextModel::forward_hidden_tensor_parallel(const torch::Tensor& input_ids,
