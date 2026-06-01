@@ -58,6 +58,8 @@ void Topology::validate() const {
   require_positive(spec_.parallel.tensor_parallel, "tensor_parallel");
   require_positive(spec_.parallel.pipeline_parallel, "pipeline_parallel");
   require_positive(spec_.parallel.context_parallel, "context_parallel");
+  require_positive(spec_.parallel.expert_parallel, "expert_parallel");
+  require_positive(spec_.parallel.sequence_parallel, "sequence_parallel");
   require_positive(spec_.parallel.micro_batches, "micro_batches");
 
   if (spec_.rank < 0 || spec_.rank >= spec_.world_size) {
@@ -68,16 +70,21 @@ void Topology::validate() const {
   }
   const int64_t expected_world =
       spec_.parallel.data_parallel * spec_.parallel.pipeline_parallel * spec_.parallel.context_parallel *
-      spec_.parallel.tensor_parallel;
+      spec_.parallel.tensor_parallel * spec_.parallel.expert_parallel;
   if (spec_.world_size != expected_world) {
     throw std::invalid_argument(
-        "world_size must equal data_parallel * pipeline_parallel * context_parallel * tensor_parallel");
+        "world_size must equal data_parallel * pipeline_parallel * context_parallel * tensor_parallel * "
+        "expert_parallel");
   }
   if (spec_.parallel.pipeline_parallel > 1 && spec_.parallel.micro_batches < spec_.parallel.pipeline_parallel) {
     throw std::invalid_argument("pipeline parallelism needs at least as many micro_batches as pipeline stages");
   }
   if (spec_.parallel.tensor_parallel > spec_.gpus_per_node) {
     throw std::invalid_argument("tensor_parallel should fit within one node for high-bandwidth TP collectives");
+  }
+  if (spec_.parallel.sequence_parallel > spec_.parallel.tensor_parallel ||
+      spec_.parallel.tensor_parallel % spec_.parallel.sequence_parallel != 0) {
+    throw std::invalid_argument("sequence_parallel must divide tensor_parallel and cannot exceed it");
   }
   if (spec_.local_world_size > spec_.gpus_per_node) {
     throw std::invalid_argument("local_world_size cannot exceed gpus_per_node");
@@ -87,15 +94,26 @@ void Topology::validate() const {
 int64_t Topology::global_rank(int64_t data_rank,
                               int64_t pipeline_rank,
                               int64_t context_rank,
-                              int64_t tensor_rank) const {
+                              int64_t tensor_rank,
+                              int64_t expert_rank) const {
   const auto& p = spec_.parallel;
   if (data_rank < 0 || data_rank >= p.data_parallel || pipeline_rank < 0 || pipeline_rank >= p.pipeline_parallel ||
-      context_rank < 0 || context_rank >= p.context_parallel || tensor_rank < 0 || tensor_rank >= p.tensor_parallel) {
+      context_rank < 0 || context_rank >= p.context_parallel || tensor_rank < 0 || tensor_rank >= p.tensor_parallel ||
+      expert_rank < 0 || expert_rank >= p.expert_parallel) {
     throw std::out_of_range("parallel rank coordinate out of range");
   }
-  return (((data_rank * p.pipeline_parallel) + pipeline_rank) * p.context_parallel + context_rank) *
-             p.tensor_parallel +
-         tensor_rank;
+  return ((((data_rank * p.pipeline_parallel) + pipeline_rank) * p.context_parallel + context_rank) *
+              p.tensor_parallel +
+          tensor_rank) *
+             p.expert_parallel +
+         expert_rank;
+}
+
+int64_t Topology::global_rank(int64_t data_rank,
+                              int64_t pipeline_rank,
+                              int64_t context_rank,
+                              int64_t tensor_rank) const {
+  return global_rank(data_rank, pipeline_rank, context_rank, tensor_rank, 0);
 }
 
 int64_t Topology::global_rank(int64_t data_rank, int64_t pipeline_rank, int64_t tensor_rank) const {
@@ -109,29 +127,41 @@ ParallelRankInfo Topology::rank_info(int64_t rank) const {
   const auto& p = spec_.parallel;
   ParallelRankInfo info;
   info.rank = rank;
-  info.tensor_rank = rank % p.tensor_parallel;
-  int64_t rem = rank / p.tensor_parallel;
+  info.expert_rank = rank % p.expert_parallel;
+  int64_t rem = rank / p.expert_parallel;
+  info.tensor_rank = rem % p.tensor_parallel;
+  info.sequence_rank = info.tensor_rank % p.sequence_parallel;
+  rem /= p.tensor_parallel;
   info.context_rank = rem % p.context_parallel;
   rem /= p.context_parallel;
   info.pipeline_rank = rem % p.pipeline_parallel;
   info.data_rank = rem / p.pipeline_parallel;
 
   for (int64_t d = 0; d < p.data_parallel; ++d) {
-    info.data_group.push_back(global_rank(d, info.pipeline_rank, info.context_rank, info.tensor_rank));
+    info.data_group.push_back(global_rank(d, info.pipeline_rank, info.context_rank, info.tensor_rank, info.expert_rank));
   }
   for (int64_t t = 0; t < p.tensor_parallel; ++t) {
-    info.tensor_group.push_back(global_rank(info.data_rank, info.pipeline_rank, info.context_rank, t));
+    info.tensor_group.push_back(global_rank(info.data_rank, info.pipeline_rank, info.context_rank, t, info.expert_rank));
   }
   for (int64_t pp = 0; pp < p.pipeline_parallel; ++pp) {
-    info.pipeline_group.push_back(global_rank(info.data_rank, pp, info.context_rank, info.tensor_rank));
+    info.pipeline_group.push_back(global_rank(info.data_rank, pp, info.context_rank, info.tensor_rank, info.expert_rank));
   }
   for (int64_t cp = 0; cp < p.context_parallel; ++cp) {
-    info.context_group.push_back(global_rank(info.data_rank, info.pipeline_rank, cp, info.tensor_rank));
+    info.context_group.push_back(global_rank(info.data_rank, info.pipeline_rank, cp, info.tensor_rank, info.expert_rank));
+  }
+  for (int64_t e = 0; e < p.expert_parallel; ++e) {
+    info.expert_group.push_back(global_rank(info.data_rank, info.pipeline_rank, info.context_rank, info.tensor_rank, e));
+  }
+  const int64_t sequence_block_begin = (info.tensor_rank / p.sequence_parallel) * p.sequence_parallel;
+  for (int64_t t = sequence_block_begin; t < sequence_block_begin + p.sequence_parallel; ++t) {
+    info.sequence_group.push_back(global_rank(info.data_rank, info.pipeline_rank, info.context_rank, t, info.expert_rank));
   }
   for (int64_t pp = 0; pp < p.pipeline_parallel; ++pp) {
     for (int64_t cp = 0; cp < p.context_parallel; ++cp) {
       for (int64_t t = 0; t < p.tensor_parallel; ++t) {
-        info.model_group.push_back(global_rank(info.data_rank, pp, cp, t));
+        for (int64_t e = 0; e < p.expert_parallel; ++e) {
+          info.model_group.push_back(global_rank(info.data_rank, pp, cp, t, e));
+        }
       }
     }
   }

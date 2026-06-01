@@ -54,6 +54,9 @@ class SendRecvCollectives final : public cverl::distributed::Collectives {
     const int64_t shard = input.size(0) / world_size_;
     return input.narrow(0, rank_ * shard, shard).contiguous();
   }
+  torch::Tensor all_to_all(const torch::Tensor& input, const std::vector<int64_t>&, int64_t) override {
+    return input;
+  }
   void send(const torch::Tensor&, int64_t) override { ++send_calls_; }
   torch::Tensor recv_like(const torch::Tensor& like, int64_t) override {
     if (recv_next_ >= recv_responses_.size()) {

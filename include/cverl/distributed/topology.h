@@ -18,6 +18,8 @@ struct ParallelDims {
   int64_t tensor_parallel = 1;
   int64_t pipeline_parallel = 1;
   int64_t context_parallel = 1;
+  int64_t expert_parallel = 1;
+  int64_t sequence_parallel = 1;
   int64_t micro_batches = 1;
 };
 
@@ -62,10 +64,14 @@ struct ParallelRankInfo {
   int64_t tensor_rank = 0;
   int64_t pipeline_rank = 0;
   int64_t context_rank = 0;
+  int64_t expert_rank = 0;
+  int64_t sequence_rank = 0;
   std::vector<int64_t> data_group;
   std::vector<int64_t> tensor_group;
   std::vector<int64_t> pipeline_group;
   std::vector<int64_t> context_group;
+  std::vector<int64_t> expert_group;
+  std::vector<int64_t> sequence_group;
   std::vector<int64_t> model_group;
 };
 
@@ -84,6 +90,11 @@ class Topology {
 
   ParallelRankInfo rank_info(int64_t rank) const;
   ParallelRankInfo local_rank_info() const { return rank_info(spec_.rank); }
+  int64_t global_rank(int64_t data_rank,
+                      int64_t pipeline_rank,
+                      int64_t context_rank,
+                      int64_t tensor_rank,
+                      int64_t expert_rank) const;
   int64_t global_rank(int64_t data_rank,
                       int64_t pipeline_rank,
                       int64_t context_rank,

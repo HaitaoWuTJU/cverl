@@ -143,6 +143,7 @@ add_library(cverl STATIC
   src/distributed/cp_attention_cuda_stub.cc
   src/distributed/context_parallel.cc
   src/distributed/optimizer_sharding.cc
+  src/distributed/expert_parallel.cc
   src/distributed/parallel_ops.cc
   src/distributed/pipeline.cc
   src/distributed/topology.cc

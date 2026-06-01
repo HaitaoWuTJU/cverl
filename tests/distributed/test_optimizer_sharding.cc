@@ -77,6 +77,12 @@ class SliceCollectives final : public cverl::distributed::Collectives {
     return input.narrow(0, rank_ * shard, shard).clone();
   }
 
+  torch::Tensor all_to_all(const torch::Tensor& input,
+                           const std::vector<int64_t>& /*group*/,
+                           int64_t /*dim*/) override {
+    return input.clone();
+  }
+
   void send(const torch::Tensor& /*input*/, int64_t /*peer*/) override {}
   torch::Tensor recv_like(const torch::Tensor& like, int64_t /*peer*/) override {
     return torch::empty_like(like);

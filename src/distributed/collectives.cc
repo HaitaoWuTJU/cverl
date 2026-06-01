@@ -53,6 +53,13 @@ torch::Tensor SingleProcessCollectives::reduce_scatter(const torch::Tensor& inpu
   return input;
 }
 
+torch::Tensor SingleProcessCollectives::all_to_all(const torch::Tensor& input,
+                                                   const std::vector<int64_t>& group,
+                                                   int64_t /*dim*/) {
+  require_single_rank_group(group);
+  return input;
+}
+
 void SingleProcessCollectives::send(const torch::Tensor& /*input*/, int64_t peer) {
   if (peer != 0) {
     throw std::invalid_argument("SingleProcessCollectives can only send to rank 0");

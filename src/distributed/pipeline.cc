@@ -11,11 +11,12 @@ PipelinePeers pipeline_peers(const Topology& topology, const ParallelRankInfo& i
   peers.is_first_stage = info.pipeline_rank == 0;
   peers.is_last_stage = info.pipeline_rank + 1 == p.pipeline_parallel;
   if (!peers.is_first_stage) {
-    peers.previous_rank =
-        topology.global_rank(info.data_rank, info.pipeline_rank - 1, info.context_rank, info.tensor_rank);
+    peers.previous_rank = topology.global_rank(
+        info.data_rank, info.pipeline_rank - 1, info.context_rank, info.tensor_rank, info.expert_rank);
   }
   if (!peers.is_last_stage) {
-    peers.next_rank = topology.global_rank(info.data_rank, info.pipeline_rank + 1, info.context_rank, info.tensor_rank);
+    peers.next_rank = topology.global_rank(
+        info.data_rank, info.pipeline_rank + 1, info.context_rank, info.tensor_rank, info.expert_rank);
   }
   return peers;
 }

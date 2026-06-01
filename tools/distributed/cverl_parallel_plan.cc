@@ -39,7 +39,7 @@ void print_vec(const char* name, const std::vector<int64_t>& values) {
 
 void usage(const char* argv0) {
   std::cerr << "usage: " << argv0
-            << " --dp D --tp T --pp P --cp C [--micro-batches M] [--rank R] [--world-size W]"
+            << " --dp D --tp T --pp P --cp C [--ep E] [--sp S] [--micro-batches M] [--rank R] [--world-size W]"
                " [--num-layers N] [--all-ranks] [--schedule]\n";
 }
 
@@ -57,6 +57,8 @@ int main(int argc, char** argv) {
     dims.tensor_parallel = arg_i64(argc, argv, "--tp", 1);
     dims.pipeline_parallel = arg_i64(argc, argv, "--pp", 1);
     dims.context_parallel = arg_i64(argc, argv, "--cp", 1);
+    dims.expert_parallel = arg_i64(argc, argv, "--ep", 1);
+    dims.sequence_parallel = arg_i64(argc, argv, "--sp", 1);
     dims.micro_batches = arg_i64(argc, argv, "--micro-batches", dims.pipeline_parallel);
 
     cverl::distributed::ClusterSpec spec = cverl::distributed::cluster_spec_from_env(dims);
@@ -70,7 +72,8 @@ int main(int argc, char** argv) {
     cverl::distributed::Topology topology(spec);
     std::cout << "world_size=" << topology.world_size() << "\n";
     std::cout << "parallel=dp" << dims.data_parallel << "_pp" << dims.pipeline_parallel << "_cp"
-              << dims.context_parallel << "_tp" << dims.tensor_parallel << "\n";
+              << dims.context_parallel << "_tp" << dims.tensor_parallel << "_ep" << dims.expert_parallel
+              << "_sp" << dims.sequence_parallel << "\n";
     std::cout << "micro_batches=" << dims.micro_batches << "\n";
 
     const bool all_ranks = has_flag(argc, argv, "--all-ranks");
@@ -81,11 +84,14 @@ int main(int argc, char** argv) {
       auto info = topology.rank_info(rank);
       auto peers = cverl::distributed::pipeline_peers(topology, info);
       std::cout << "rank=" << rank << " dp=" << info.data_rank << " pp=" << info.pipeline_rank
-                << " cp=" << info.context_rank << " tp=" << info.tensor_rank << "\n";
+                << " cp=" << info.context_rank << " tp=" << info.tensor_rank << " ep=" << info.expert_rank
+                << " sp=" << info.sequence_rank << "\n";
       print_vec("  data_group", info.data_group);
       print_vec("  tensor_group", info.tensor_group);
       print_vec("  pipeline_group", info.pipeline_group);
       print_vec("  context_group", info.context_group);
+      print_vec("  expert_group", info.expert_group);
+      print_vec("  sequence_group", info.sequence_group);
       print_vec("  model_group", info.model_group);
       std::cout << "  pp_prev=" << peers.previous_rank << " pp_next=" << peers.next_rank
                 << " pp_warmup_micro_batches=" << cverl::distributed::pipeline_warmup_micro_batches(topology, info)

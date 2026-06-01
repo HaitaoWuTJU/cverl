@@ -1,4 +1,5 @@
 #include "cverl/distributed/context_parallel.h"
+#include "cverl/distributed/expert_parallel.h"
 #include "cverl/distributed/nccl_collectives.h"
 #include "cverl/distributed/parallel_ops.h"
 #include "cverl/distributed/weight_sync.h"
@@ -42,6 +43,12 @@ std::vector<int64_t> full_group(int64_t world_size) {
     group.push_back(i);
   }
   return group;
+}
+
+void require(bool cond, const char* msg) {
+  if (!cond) {
+    throw std::runtime_error(msg);
+  }
 }
 
 void require_allclose(const torch::Tensor& actual, const torch::Tensor& expected, const char* msg) {
@@ -126,6 +133,49 @@ int main(int argc, char** argv) {
     require_allclose(gathered, expected_gather, "NCCL all_gather mismatch");
     require_throws([&]() { (void)comm.all_gather(gathered.contiguous(), group, 1); },
                    "NCCL all_gather should reject dim != 0");
+
+    auto a2a_input = torch::empty({world, 2},
+                                  torch::TensorOptions().device(torch::kCUDA, static_cast<int>(device)).dtype(torch::kFloat32));
+    for (int64_t dst = 0; dst < world; ++dst) {
+      a2a_input.index_put_({dst}, static_cast<float>(rank * 100 + dst));
+    }
+    auto a2a = comm.all_to_all(a2a_input.contiguous(), group, 0);
+    auto expected_a2a = torch::empty_like(a2a_input);
+    for (int64_t src = 0; src < world; ++src) {
+      expected_a2a.index_put_({src}, static_cast<float>(src * 100 + rank));
+    }
+    require_allclose(a2a, expected_a2a, "NCCL all_to_all mismatch");
+    require_throws([&]() { (void)comm.all_to_all(a2a_input.contiguous(), group, 1); },
+                   "NCCL all_to_all should reject dim != 0");
+
+    auto ep_tokens =
+        torch::empty({world, 2},
+                     torch::TensorOptions().device(torch::kCUDA, static_cast<int>(device)).dtype(torch::kFloat32));
+    for (int64_t dst = 0; dst < world; ++dst) {
+      ep_tokens.index_put_({dst}, static_cast<float>(rank * 100 + dst));
+    }
+    ep_tokens = ep_tokens.detach().set_requires_grad(true);
+    auto ep_destinations = torch::arange(0,
+                                         world,
+                                         torch::TensorOptions().device(torch::kCUDA, static_cast<int>(device))
+                                             .dtype(torch::kInt64));
+    auto dispatched = cverl::distributed::expert_parallel_dispatch_equal_capacity(
+        ep_tokens, ep_destinations.contiguous(), comm, group);
+    require(dispatched.capacity == 1, "EP dispatch capacity mismatch");
+    require_allclose(dispatched.send_counts,
+                     torch::ones({world}, torch::TensorOptions().device(ep_tokens.device()).dtype(torch::kInt64)),
+                     "EP dispatch send counts mismatch");
+    require_allclose(dispatched.recv_counts,
+                     torch::ones({world}, torch::TensorOptions().device(ep_tokens.device()).dtype(torch::kInt64)),
+                     "EP dispatch recv counts mismatch");
+    auto expected_ep = torch::empty(
+        {world, 2}, torch::TensorOptions().device(ep_tokens.device()).dtype(torch::kFloat32));
+    for (int64_t src = 0; src < world; ++src) {
+      expected_ep.index_put_({src}, static_cast<float>(src * 100 + rank));
+    }
+    require_allclose(dispatched.received_tokens, expected_ep, "EP dispatch all_to_all mismatch");
+    dispatched.received_tokens.sum().backward();
+    require_allclose(ep_tokens.grad(), torch::ones_like(ep_tokens), "EP dispatch all_to_all gradient mismatch");
 
     if (world >= 2) {
       const int64_t send_peer = (rank + 1) % world;

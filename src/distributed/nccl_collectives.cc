@@ -397,6 +397,51 @@ torch::Tensor NcclCollectives::reduce_scatter(const torch::Tensor& input,
   return out;
 }
 
+torch::Tensor NcclCollectives::all_to_all(const torch::Tensor& input,
+                                          const std::vector<int64_t>& group,
+                                          int64_t dim) {
+  require_cuda_contiguous(input, "all_to_all input");
+  auto comm = communicator_for_group(group);
+  if (dim != 0 || input.size(0) % static_cast<int64_t>(group.size()) != 0) {
+    throw std::invalid_argument("NCCL all_to_all currently requires dim=0 evenly divisible by group size");
+  }
+  const int64_t local_index = rank_index_in_group(group, rank_);
+  if (local_index < 0) {
+    throw std::invalid_argument("local NCCL rank is not a member of all_to_all group");
+  }
+  const int64_t chunk = input.size(0) / static_cast<int64_t>(group.size());
+  auto out = torch::empty_like(input);
+  if (chunk > 0) {
+    out.narrow(0, local_index * chunk, chunk).copy_(input.narrow(0, local_index * chunk, chunk));
+  }
+  wait_current_stream_before_nccl(stream_, device_index_);
+  check_nccl(ncclGroupStart(), "ncclGroupStart all_to_all");
+  for (int64_t peer_index = 0; peer_index < static_cast<int64_t>(group.size()); ++peer_index) {
+    if (peer_index == local_index || chunk == 0) {
+      continue;
+    }
+    auto send_slice = input.narrow(0, peer_index * chunk, chunk);
+    auto recv_slice = out.narrow(0, peer_index * chunk, chunk);
+    auto send_status = ncclSend(send_slice.data_ptr(),
+                                send_slice.numel(),
+                                nccl_dtype(input.scalar_type()),
+                                static_cast<int>(peer_index),
+                                comm,
+                                stream_);
+    auto recv_status = ncclRecv(recv_slice.data_ptr(),
+                                recv_slice.numel(),
+                                nccl_dtype(out.scalar_type()),
+                                static_cast<int>(peer_index),
+                                comm,
+                                stream_);
+    check_nccl(send_status, "ncclSend all_to_all");
+    check_nccl(recv_status, "ncclRecv all_to_all");
+  }
+  check_nccl(ncclGroupEnd(), "ncclGroupEnd all_to_all");
+  finish_nccl_op({input, out});
+  return out;
+}
+
 void NcclCollectives::send(const torch::Tensor& input, int64_t peer) {
   require_cuda_contiguous(input, "send input");
   wait_current_stream_before_nccl(stream_, device_index_);

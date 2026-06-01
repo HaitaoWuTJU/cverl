@@ -49,6 +49,13 @@ class CountingCollectives final : public cverl::distributed::Collectives {
     return input.clone();
   }
 
+  torch::Tensor all_to_all(const torch::Tensor& input,
+                           const std::vector<int64_t>& group,
+                           int64_t /*dim*/) override {
+    require_single_root(0, group);
+    return input.clone();
+  }
+
   void send(const torch::Tensor& /*input*/, int64_t peer) override {
     if (peer != 0) {
       throw std::invalid_argument("CountingCollectives peer must be 0");

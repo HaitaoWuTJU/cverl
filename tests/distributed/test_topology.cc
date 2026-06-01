@@ -121,6 +121,12 @@ class PrecomputedAllGatherCollectives final : public cverl::distributed::Collect
     return input.narrow(0, rank_ * (input.size(0) / world_size_), input.size(0) / world_size_).contiguous();
   }
 
+  torch::Tensor all_to_all(const torch::Tensor& input,
+                           const std::vector<int64_t>& /*group*/,
+                           int64_t /*dim*/) override {
+    return input;
+  }
+
   void send(const torch::Tensor& /*input*/, int64_t /*peer*/) override {}
   torch::Tensor recv_like(const torch::Tensor& like, int64_t /*peer*/) override { return torch::empty_like(like); }
   torch::Tensor send_recv(const torch::Tensor& /*input*/,
@@ -176,15 +182,45 @@ void test_rank_mapping() {
   require(info.pipeline_rank == 1, "pipeline rank");
   require(info.context_rank == 1, "context rank");
   require(info.tensor_rank == 1, "tensor rank");
+  require(info.expert_rank == 0, "expert rank");
+  require(info.sequence_rank == 0, "sequence rank");
   require_vec_eq(info.tensor_group, {12, 13, 14, 15}, "tensor group");
   require_vec_eq(info.pipeline_group, {5, 13}, "pipeline group");
   require_vec_eq(info.context_group, {9, 13}, "context group");
+  require_vec_eq(info.expert_group, {13}, "expert group");
+  require_vec_eq(info.sequence_group, {13}, "sequence group");
   require_vec_eq(info.data_group, {13, 29}, "data group");
   require_vec_eq(info.model_group,
                  {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
                  "model group");
   require(topology.global_rank(1, 1, 1, 1) == 29, "global rank");
   require(topology.global_rank(1, 1, 1) == 25, "legacy global rank uses context rank 0");
+}
+
+void test_expert_sequence_rank_mapping() {
+  auto spec = make_spec();
+  spec.parallel.expert_parallel = 2;
+  spec.parallel.sequence_parallel = 2;
+  spec.world_size = 64;
+  spec.rank = 27;
+  cverl::distributed::Topology topology(spec);
+  auto info = topology.local_rank_info();
+  require(info.data_rank == 0, "ep data rank");
+  require(info.pipeline_rank == 1, "ep pipeline rank");
+  require(info.context_rank == 1, "ep context rank");
+  require(info.tensor_rank == 1, "ep tensor rank");
+  require(info.expert_rank == 1, "ep expert rank");
+  require(info.sequence_rank == 1, "ep sequence rank");
+  require_vec_eq(info.tensor_group, {25, 27, 29, 31}, "ep tensor group");
+  require_vec_eq(info.pipeline_group, {11, 27}, "ep pipeline group");
+  require_vec_eq(info.context_group, {19, 27}, "ep context group");
+  require_vec_eq(info.expert_group, {26, 27}, "ep expert group");
+  require_vec_eq(info.sequence_group, {25, 27}, "ep sequence group");
+  require_vec_eq(info.data_group, {27, 59}, "ep data group");
+  require(info.model_group.size() == 32, "ep model group size");
+  require(info.model_group.front() == 0 && info.model_group.back() == 31, "ep model group range");
+  require(topology.global_rank(1, 1, 1, 1, 1) == 59, "ep global rank");
+  require(topology.global_rank(1, 1, 1, 1) == 58, "legacy global rank uses expert rank 0");
 }
 
 void test_nccl_env() {
@@ -244,6 +280,8 @@ void test_invalid_configs() {
   spec.parallel.data_parallel = 1;
   spec.parallel.pipeline_parallel = 1;
   spec.parallel.context_parallel = 1;
+  spec.parallel.expert_parallel = 1;
+  spec.parallel.sequence_parallel = 1;
   spec.world_size = 16;
   failed = false;
   try {
@@ -263,6 +301,16 @@ void test_invalid_configs() {
   }
   require(failed, "too few micro batches rejected");
 
+  spec = make_spec();
+  spec.parallel.sequence_parallel = 3;
+  failed = false;
+  try {
+    cverl::distributed::Topology topology(spec);
+  } catch (const std::invalid_argument&) {
+    failed = true;
+  }
+  require(failed, "invalid sequence parallel rejected");
+
   cverl::distributed::Topology topology(make_spec());
   require_throws([&]() { (void)topology.global_rank(2, 0, 0); }, "global rank out-of-range rejected");
   require_throws([&]() { (void)topology.global_rank(0, 0, 2, 0); }, "context rank out-of-range rejected");
@@ -280,6 +328,8 @@ void test_single_process_collectives() {
   require(torch::allclose(x, z), "single process all_gather");
   auto s = collectives.reduce_scatter(x, cverl::distributed::ReduceOp::Max, {0}, 0);
   require(torch::allclose(x, s), "single process reduce_scatter");
+  auto a2a = collectives.all_to_all(x, {0}, 0);
+  require(torch::allclose(x, a2a), "single process all_to_all");
 }
 
 void test_cluster_spec_from_env() {
@@ -295,6 +345,8 @@ void test_cluster_spec_from_env() {
   dims.tensor_parallel = 2;
   dims.pipeline_parallel = 1;
   dims.context_parallel = 1;
+  dims.expert_parallel = 1;
+  dims.sequence_parallel = 1;
   dims.micro_batches = 1;
   auto spec = cverl::distributed::cluster_spec_from_env(dims);
   require(spec.world_size == 4, "env world size");
@@ -690,6 +742,7 @@ void test_dtype_names() {
 int main() {
   try {
     test_rank_mapping();
+    test_expert_sequence_rank_mapping();
     test_nccl_env();
     test_pipeline_layer_ranges();
     test_invalid_configs();
