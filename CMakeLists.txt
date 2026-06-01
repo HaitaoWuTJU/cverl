@@ -464,6 +464,10 @@ if (CVERL_BUILD_TESTS)
   target_link_libraries(minimal_ppo_step PRIVATE cverl)
   target_compile_options(minimal_ppo_step PRIVATE ${TORCH_CXX_FLAGS})
 
+  add_executable(mnist_gpu_demo tools/torch/mnist_gpu_demo.cc)
+  target_link_libraries(mnist_gpu_demo PRIVATE cverl)
+  target_compile_options(mnist_gpu_demo PRIVATE ${TORCH_CXX_FLAGS})
+
   add_executable(toy_grpo_trainer tools/torch/toy_grpo_trainer.cc)
   target_link_libraries(toy_grpo_trainer PRIVATE cverl)
   target_compile_options(toy_grpo_trainer PRIVATE ${TORCH_CXX_FLAGS})
@@ -475,6 +479,10 @@ if (CVERL_BUILD_TESTS)
   add_executable(cverl_gsm8k_grpo_bench tools/bench/cverl_gsm8k_grpo_bench.cc)
   target_link_libraries(cverl_gsm8k_grpo_bench PRIVATE cverl)
   target_compile_options(cverl_gsm8k_grpo_bench PRIVATE ${TORCH_CXX_FLAGS})
+
+  add_executable(resnet152_cifar10_cpp_bench tools/bench/resnet152_cifar10_cpp_bench.cc)
+  target_link_libraries(resnet152_cifar10_cpp_bench PRIVATE cverl)
+  target_compile_options(resnet152_cifar10_cpp_bench PRIVATE ${TORCH_CXX_FLAGS})
 
   add_executable(cverl_parallel_plan tools/distributed/cverl_parallel_plan.cc)
   target_link_libraries(cverl_parallel_plan PRIVATE cverl)
